@@ -10,22 +10,57 @@ class RecommendDoctor:
 
         specialization = state.get("specialization")
         user_date_str = state.get("date")
+        doctor_name = state.get("doctor_name")
         user_time_str = state.get("time")  # expected "HH:MM"
+        print(state)
 
         now = datetime.now(PKT)
 
+        if not user_date_str and doctor_name:
+            doc_res = (
+                supabase.table("Doctors")
+                .select("Name, doctor_availability(days, start_time, end_time)")  # fixed syntax
+                .ilike("Name", f"%{doctor_name}%")
+                .execute()
+            )
+
+            if not doc_res.data:
+                state["response"] = f"No availability found for Dr. {doctor_name}."
+                return state
+
+            doc = doc_res.data[0]  # first doctor
+            avail = doc.get("doctor_availability", [])
+            
+            if avail:
+                slot = avail[0]  # first available slot
+                response = (
+                    f"{doc['Name']} is available on {slot['days']} "
+                    f"from {slot['start_time']} to {slot['end_time']}"
+                )
+            else:
+                response = f"No availability found for Dr. {doctor_name}."
+
+            state["response"] = response
+            return state
+
+        
         if not user_date_str:
             state["response"] = "Please provide a valid date."
             return state
 
         # --- Handle relative dates ---
-        if "tomorrow" in user_date_str.lower():
+        if "today" in user_date_str.lower():
+            print("inside today")
+            target_date = now
+            print(target_date)
+        elif "tomorrow" in user_date_str.lower():
             target_date = now + timedelta(days=1)
         elif "day after tomorrow" in user_date_str.lower():
             target_date = now + timedelta(days=2)
         else:
             try:
                 target_date = datetime.strptime(user_date_str, "%Y/%m/%d")
+                print(target_date)
             except ValueError:
                 state["response"] = "Please provide a valid date in YYYY/MM/DD format."
                 return state

@@ -32,6 +32,12 @@ class BookAppointment:
             return state
 
         # --- Step 2: Handle relative/explicit dates ---
+                # --- Handle relative dates ---
+        if "today" in user_date_str.lower():
+            print("inside today")
+            target_date = now
+            print(target_date)
+            
         if "tomorrow" in user_date_str.lower():
             target_date = now + timedelta(days=1)
         elif "day after tomorrow" in user_date_str.lower():

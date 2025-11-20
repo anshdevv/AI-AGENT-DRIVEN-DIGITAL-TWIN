@@ -16,6 +16,7 @@ class ChatState(TypedDict, total=False):
     specialization:str
     date:str
     time:str
+    context:list
 
 
 # --- 2. Create the graph ---

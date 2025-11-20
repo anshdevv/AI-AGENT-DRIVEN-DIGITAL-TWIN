@@ -17,13 +17,17 @@ app.add_middleware(
 graph = create_graph()
 compiled_graph = graph.compile()   # compile once at startup
 
+context=[]
 @app.post("/chat")
 def chat(user_input: str = Body(..., embed=True)):
     # Initialize the LangGraph state
-    state = {"user_input": user_input}
-
+    # state = {"user_input": user_input}
+    context.append({"user":user_input})
+    state={"user_input":user_input,"context":context}
     # Run the graph
     result = compiled_graph.invoke(state)
+    context.append({"bot":result.get("response", "No response generated.")})
+    # print(context
 
     # Send back the response to frontend
     return {"reply": result.get("response", "No response generated.")}
