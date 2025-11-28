@@ -3,98 +3,93 @@ from ..config import GOOGLE_API_KEY
 from .general import GeneralQuery
 from .rec_doc import RecommendDoctor
 from .bk_apt import BookAppointment
+import os
+import json
+import re
 
 llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=GOOGLE_API_KEY)
+def load_symptom_map():
+    path = "backend/rag/faq/symptoms_to_specialization.md"
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    return ""
 
 class IntentClassifier:
     def __call__(self, state):
+        if state.get("triage_active"):
+            state["intent"] = "medical_triage"
+            return state
+
+        # 2. If we are in the middle of Booking (and not done), stay there.
+        booking_step = state.get("booking_step")
+        if booking_step and booking_step != "done":
+            state["intent"] = "book_appointment"
+            return state
         user_input = state.get("user_input", "")
         context = state.get("context", [])
+        
+        # 1. Load the symptom map content
+        symptom_content = load_symptom_map()
 
-        # Ask Gemini explicitly for the intent
         prompt = f"""
 You are an intent classifier for a hospital chatbot.
 
-Your job:
+Your job is to classify the user's intent into one of these categories:
+- "book_appointment" (Only if user explicitly says "book", "schedule", or confirms a slot)
+- "recommend_doctor" (If user asks for a doctor by name, requests a specific specialization, or mentions a symptom)
+- "general_query" (timings, insurance, location, etc.)
 
-Classify the user's intent into one of these categories:
+### EXTRACTION RULES:
+1. **Symptoms:**
+   Use this mapping:
+   \"\"\"{symptom_content}\"\"\"
+   If the user mentions a symptom from this list (e.g. fever), set intent to "recommend_doctor" and set "specialization" to the corresponding doctor type.
+    1. If user mentions a symptom from the list (e.g. "dizziness"), map it to the "specialization" (e.g. "Neurologist").
+    2. ALSO extract the exact phrase into "symptom" (e.g. "dizziness").
+2. **Direct Requests:**
+   If the user explicitly asks for a specialist (e.g. "I need a Cardiologist", "skin doctor"), set intent to "recommend_doctor" and set "specialization" to that field.
 
-"book_appointment"
+3. **Doctor Name:**
+   If a doctor's name is mentioned, extract it into "doctor_name".
 
-"recommend_doctor"
+4. **Date/Time:**
+   Extract any date or time mentioned.
 
-"general_query"
-
-If the user is describing symptoms (e.g., pain, fever, rash, etc.),
-set intent = "general_query" and include a probable doctor specialization
-(e.g., "dentist", "cardiologist", "dermatologist", "ENT", "general physician").
-
-If the user wants to book an appointment, extract:
-
-The doctor's name (if mentioned)
-
-The preferred date and/or time (if mentioned)
-
-If the user asks for doctors regarding a particular specialization or mentions the name of a person with the title "doctor",
-set intent = "recommend_doctor".
-
-If the user asks about a doctor’s availability or timing (e.g., “what time is he available?”, “is Dr. Omer free tomorrow?”),
-keep the intent as "recommend_doctor".
-Only switch to "book_appointment" if the user explicitly requests or confirms booking
-(e.g., “yes book it”, “schedule it”, “confirm appointment”).
-
-If in the context it is mentioned that the user previously wanted an appointment for some day or time,
-use that information from the context and include it in the JSON fields for "date" and "time".
-
-Date and Time Formatting:
-
-"date": Use "YYYY/MM/DD" if explicit, else natural phrases like "tomorrow", "today", or "next Monday".
-
-"time": Use 24-hour format (morning=09:00, afternoon=14:00, evening=18:00).
-
-Return only valid JSON in this exact format:
-
-
+Return only valid JSON:
+{{
   "intent": "",
   "specialization": "",
   "doctor_name": "",
+  "symptom": "",         <-- The specific complaint
   "date": "",
   "time": ""
-
-
-
-Use empty strings "" for any missing fields.
-Do NOT include any explanations or text outside the JSON.
+}}
 
 User: "{user_input}"
 past context: "{context}"
-        """
+"""
         response = llm.invoke(prompt)
 
-        response = response.content.strip().lower()
-        import json
-        import re
-
-        # Remove code block markers and leading/trailing whitespace
-        clean_response = re.search(r"\{.*\}", response, re.DOTALL)
-        if clean_response:
-            clean_response = clean_response.group(0)
-        else:
-            print("failed cleaning json")
-
-        # print(clean_response)
-        result = json.loads(clean_response)
-        intent = result["intent"]
-        specialization = result.get("specialization")
+        content = response.content.strip()
+        match = re.search(r"\{.*\}", content, re.DOTALL)
+        clean_json = match.group(0) if match else "{}"
+        try:
+            result = json.loads(clean_json)
+        except:
+            result = {"intent": "general_query"}
+        intent =result.get("intent", "general_query")
+        specialization = result.get("specialization", "")
         date= result.get("date")
         time = result.get("time")
-        doctor_name = result.get("doctor_name")
+        doctor_name = result.get("doctor_name","")
 
         # doctor_name=result."doctor_name")
 
 
         state["intent"] = intent
         state["specialization"] = specialization
+        state["patient_complaint"] = result.get("symptom", "")
         if date!="":
             state["date"] = date
         if time!="":

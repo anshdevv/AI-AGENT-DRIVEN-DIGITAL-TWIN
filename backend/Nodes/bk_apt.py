@@ -1,203 +1,254 @@
-import json
-import re
+from backend.config import supabase
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from backend.config import supabase, GOOGLE_API_KEY
-from langchain_google_genai import ChatGoogleGenerativeAI
-
-# === Initialize ===
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=GOOGLE_API_KEY)
-PKT = ZoneInfo("Asia/Karachi")
+import re
 
 class BookAppointment:
     def __call__(self, state):
+        user_input = state.get("user_input", "").strip()
+        
+        # --- PHASE 1: REGISTRATION STATE MACHINE ---
+        # We determine "who" is booking before we process "what" they are booking.
+        
+        step = state.get("booking_step")
+        patient_data = state.get("patient_data", {})
+        
+        # Default start
+        if not step:
+            step = "ask_phone"
 
-        user_input = state.get("user_input", "")
-        patient_id = state.get("patient_id", 1)
+        # 1. Ask Phone
+        if step == "ask_phone":
+            # Check if phone is already in input (e.g. "Book for 0300123...")
+            phone_match = re.search(r"(\d{10,12})", user_input)
+            if phone_match:
+                # If found immediately, proceed to check
+                user_input = phone_match.group(0) 
+                step = "check_phone"
+            else:
+                state["response"] = "To secure your appointment, please provide your mobile number."
+                state["booking_step"] = "check_phone"
+                return state
 
-        # data = json.loads(clean_json.group())
-
-        doctor_name = state.get("doctor_name")
-        specialization = state.get("specialization")
-        user_date_str = state.get("date")
-        user_time_str = state.get("time")
-        print(state)
-
-        print(doctor_name, specialization, user_date_str, user_time_str)
-
-        now = datetime.now(PKT)
-
-        if not user_date_str:
-            state["response"] = "Please provide a valid date."
-            return state
-
-        # --- Step 2: Handle relative/explicit dates ---
-                # --- Handle relative dates ---
-        if "today" in user_date_str.lower():
-            print("inside today")
-            target_date = now
-            print(target_date)
+        # 2. Check Phone / Lookup
+        if step == "check_phone":
+            phone_match = re.search(r"(\d{10,12})", user_input)
+            if not phone_match:
+                state["response"] = "Please enter a valid 11-digit mobile number."
+                return state # Stay here
             
-        if "tomorrow" in user_date_str.lower():
-            target_date = now + timedelta(days=1)
-        elif "day after tomorrow" in user_date_str.lower():
-            target_date = now + timedelta(days=2)
-        else:
+            phone = phone_match.group(0)
+            
+            # DB Lookup
+            res = supabase.table("Patients").select("*").eq("phone", phone).execute()
+            
+            if res.data:
+                # User Found
+                patient = res.data[0]
+                state["patient_id"] = patient["id"]
+                state["patient_data"] = patient
+                # Proceed to Booking Logic
+                step = "attempt_booking"
+            else:
+                # New User
+                patient_data["phone"] = phone
+                state["patient_data"] = patient_data
+                state["response"] = "I don't see an account with this number. What is your Full Name?"
+                state["booking_step"] = "ask_name"
+                return state
+
+        # 3. Ask Name
+        if step == "ask_name":
+            patient_data["name"] = user_input
+            state["patient_data"] = patient_data
+            state["response"] = "Got it. And your Email Address?"
+            state["booking_step"] = "ask_email"
+            return state
+
+        # 4. Ask Email & Create
+        if step == "ask_email":
+            patient_data["email"] = user_input
+            
+            new_user = {
+                "Name": patient_data["name"],
+                "phone": patient_data["phone"],
+                "email": patient_data["email"]
+            }
             try:
-                target_date = datetime.strptime(user_date_str, "%Y/%m/%d")
+                res = supabase.table("Patients").insert(new_user).execute()
+                if res.data:
+                    state["patient_id"] = res.data[0]["id"]
+                    step = "attempt_booking"
+                else:
+                    state["response"] = "System error creating profile."
+                    return state
+            except Exception as e:
+                state["response"] = f"Database Error: {str(e)}"
+                return state
+
+        # --- PHASE 2: YOUR COMPLEX BOOKING LOGIC ---
+        # This only runs if step == "attempt_booking" (User is identified)
+        
+        if step == "attempt_booking":
+            PKT = ZoneInfo("Asia/Karachi")
+            now = datetime.now(PKT)
+            
+            # Retrieve extracted entities
+            doctor_name = state.get("doctor_name")
+            specialization = state.get("specialization")
+            user_date_str = state.get("date")
+            user_time_str = state.get("time")
+            patient_id = state.get("patient_id")
+
+            # --- DATE LOGIC ---
+            if not user_date_str:
+                state["response"] = f"Thanks {state.get('patient_data', {}).get('Name')}. What date would you like to book for?"
+                state["booking_step"] = "attempt_booking" # Stay here
+                return state
+
+            # Handle relative dates (Your logic)
+            if "today" in user_date_str.lower():
+                target_date = now
+            elif "tomorrow" in user_date_str.lower():
+                target_date = now + timedelta(days=1)
+            elif "day after tomorrow" in user_date_str.lower():
+                target_date = now + timedelta(days=2)
+            else:
+                try:
+                    target_date = datetime.strptime(user_date_str, "%Y/%m/%d")
+                except ValueError:
+                    state["response"] = "Please provide a valid date in YYYY/MM/DD format."
+                    return state
+
+            date = target_date.strftime("%Y/%m/%d")
+            weekday = target_date.strftime("%a").lower()
+
+            # --- TIME LOGIC ---
+            if not user_time_str:
+                state["response"] = "What time would you like? (HH:MM format)"
+                return state
+
+            try:
+                user_time = datetime.strptime(user_time_str, "%H:%M").time()
             except ValueError:
-                state["response"] = "Please provide a valid date in YYYY/MM/DD format."
+                state["response"] = "Please provide time in HH:MM (24-hour) format."
                 return state
 
-        date = target_date.strftime("%Y/%m/%d")
-        weekday = target_date.strftime("%a").lower()
+            # --- DOCTOR/SPECIALIZATION FINDING ---
+            candidate_doctors = []
+            
+            # Case A: Doctor Name provided
+            if doctor_name:
+                res = supabase.table("Doctors").select("id, Name, Specialization").ilike("Name", f"%{doctor_name}%").execute()
+                candidate_doctors = res.data
+                if not candidate_doctors:
+                    state["response"] = f"Doctor '{doctor_name}' not found."
+                    return state
+            
+            # Case B: Specialization provided
+            elif specialization:
+                res = supabase.table("Doctors").select("id, Name, Specialization").ilike("Specialization", f"%{specialization}%").execute()
+                candidate_doctors = res.data
+                if not candidate_doctors:
+                    state["response"] = f"No doctors found for {specialization}."
+                    return state
+            else:
+                 state["response"] = "Please specify which doctor or specialization you need."
+                 return state
 
-        if not user_time_str:
-            state["response"] = "Please provide a valid time in HH:MM (24-hour) format."
-            return state
-
-        # Convert time string to Python time object
-        try:
-            user_time = datetime.strptime(user_time_str, "%H:%M").time()
-        except ValueError:
-            state["response"] = "Please provide time in HH:MM (24-hour) format."
-            return state
-
-        # --- Step 3: If doctor not mentioned, find by specialization ---
-        if not doctor_name:
-            if not specialization:
-                state["response"] = "Please mention the doctor or your health concern (e.g., bones, heart, skin)."
-                return state
-
-            doctors_res = (
-                supabase.table("Doctors")
-                .select("*")
-                .ilike("Specialization", f"%{specialization}%")
-                .execute()
-            )
-
-            if not doctors_res.data:
-                state["response"] = f"No doctors found for specialization '{specialization}'."
-                return state
-
-            # === Day range handling logic ===
+            # --- AVAILABILITY CALCULATION (Your complex loop) ---
             day_order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
             def is_day_in_range(day_range, target):
                 parts = [p.strip().lower() for p in day_range.split('-')]
-                if len(parts) == 1:
-                    return parts[0] == target
+                if len(parts) == 1: return parts[0] == target
                 start, end = parts
                 s, e, t = day_order.index(start), day_order.index(end), day_order.index(target)
-                if s <= e:
-                    return s <= t <= e
-                else:
-                    return t >= s or t <= e  # wrap-around case
+                return s <= t <= e if s <= e else (t >= s or t <= e)
 
-            available_doctors = []
-
-            for doc in doctors_res.data:
-                avail_res = (
-                    supabase.table("doctor_availability")
-                    .select("*")
-                    .eq("doctor_id", doc["id"])
-                    .execute()
-                )
-
+            chosen_doctor = None
+            
+            # Check slots for candidates
+            for doc in candidate_doctors:
+                avail_res = supabase.table("doctor_availability").select("*").eq("doctor_id", doc["id"]).execute()
+                
                 for slot in avail_res.data:
                     if not is_day_in_range(slot["days"], weekday):
                         continue
-
+                        
                     start_t = datetime.strptime(slot["start_time"], "%H:%M:%S").time()
                     end_t = datetime.strptime(slot["end_time"], "%H:%M:%S").time()
 
                     if start_t <= user_time <= end_t:
-                        available_doctors.append(doc)
-                        break
+                        chosen_doctor = doc
+                        break # Found a valid doctor/slot
+                
+                if chosen_doctor:
+                    break # Stop looking at other doctors
 
-            if not available_doctors:
-                state["response"] = f"No {specialization} doctors are available on {date} at {user_time_str}."
+            if not chosen_doctor:
+                state["response"] = f"Sorry, no doctors are available on {weekday} at {user_time_str}."
                 return state
 
-            doctor_list = "\n".join([
-                f"- Dr. {d['Name']} ({d.get('Experience', 0)} yrs exp)"
-                for d in available_doctors
-            ])
+            # --- FINAL BOOKING ---
+            appointment = {
+                "patient_id": patient_id,
+                "appointment_date": date,
+                "time": user_time_str,
+                "doctor_id": chosen_doctor["id"],
+            }
+            
+            try:
+                supabase.table("appointments").insert(appointment).execute()
+                
+                state["response"] = (
+                    f"✅ Appointment Confirmed!\n"
+                    f"Doctor: Dr. {chosen_doctor['Name']}\n"
+                    f"Date: {date} ({weekday})\n"
+                    f"Time: {user_time_str}\n\n"
+                    "I just need to ask a few quick medical questions to prepare the doctor."
+                )
+                
+                # --- PHASE 3: TRIGGER TRIAGE ---
+                state["booking_step"] = "done"
+                state["triage_active"] = True
+                
+                raw_complaint = state.get("patient_complaint", "").lower()
+            
+                # 2. Logic to pick the correct Protocol File (.md)
+                if raw_complaint:
+                    # Map specific words to file names
+                    if "cough" in raw_complaint or "cold" in raw_complaint or "throat" in raw_complaint:
+                        state["triage_symptom"] = "cough"
+                    elif "chest" in raw_complaint or "heart" in raw_complaint:
+                        state["triage_symptom"] = "chest_pain"
+                    elif "stomach" in raw_complaint or "belly" in raw_complaint or "abdominal" in raw_complaint:
+                        state["triage_symptom"] = "stomach_pain"
+                    elif "head" in raw_complaint or "dizzy" in raw_complaint:
+                        state["triage_symptom"] = "headache"
+                    elif "rash" in raw_complaint or "itch" in raw_complaint or "skin" in raw_complaint:
+                        state["triage_symptom"] = "rash"
+                    elif "fever" in raw_complaint or "temperature" in raw_complaint:
+                        state["triage_symptom"] = "fever"
+                    else:
+                        # We have a complaint (e.g. "leg pain") but no specific file.
+                        state["triage_symptom"] = "general"
+                
+                else:
+                    # 3. Fallback: User didn't state a symptom (e.g. just said "Book Dr. Ali")
+                    # Infer category from the Doctor's Specialization
+                    spec = chosen_doctor.get("Specialization", "").lower()
+                    
+                    if "physician" in spec: state["triage_symptom"] = "fever" # Generic default
+                    elif "cardiologist" in spec: state["triage_symptom"] = "chest_pain"
+                    elif "dermatologist" in spec: state["triage_symptom"] = "rash"
+                    elif "neurologist" in spec: state["triage_symptom"] = "headache"
+                    else: state["triage_symptom"] = "general"
 
-            state["response"] = (
-                f"Available {specialization} doctors on {date} at {user_time_str}:\n"
-                f"{doctor_list}\n\n"
-                "Please tell me which doctor you’d like to book an appointment with."
-            )
+            # Note: We keep 'patient_complaint' in the state so Triage.py can read it
+            except Exception as e:
+                state["response"] = f"Booking Failed: {str(e)}"
+            
             return state
-
-        # --- Step 4: Doctor mentioned: lookup directly ---
-        doctor_res = (
-            supabase.table("Doctors")
-            .select("id, Name")
-            .ilike("Name", f"%{doctor_name}%")
-            .execute()
-        )
-        print(doctor_res.data)
-
-        if not doctor_res.data:
-            state["response"] = f"Doctor '{doctor_name}' not found."
-            return state
-
-        doctor = doctor_res.data[0]
-        doctor_id = doctor["id"]
-
-        # === Step 5: Check availability (with range + time handling) ===
-        avail_res = (
-            supabase.table("doctor_availability")
-            .select("*")
-            .eq("doctor_id", doctor_id)
-            .execute()
-        )
-
-        day_order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-
-        def is_day_in_range(day_range, target):
-            parts = [p.strip().lower() for p in day_range.split('-')]
-            if len(parts) == 1:
-                return parts[0] == target
-            start, end = parts
-            s, e, t = day_order.index(start), day_order.index(end), day_order.index(target)
-            if s <= e:
-                return s <= t <= e
-            else:
-                return t >= s or t <= e
-
-        available = False
-        for slot in avail_res.data:
-            if not is_day_in_range(slot["days"], weekday):
-                continue
-
-            start_t = datetime.strptime(slot["start_time"], "%H:%M:%S").time()
-            end_t = datetime.strptime(slot["end_time"], "%H:%M:%S").time()
-
-            if start_t <= user_time <= end_t:
-                available = True
-                break
-
-        if not available:
-            state["response"] = f"{doctor['Name']} is not available on {weekday} at {user_time_str}."
-            return state
-
-        # --- Step 6: Book appointment ---
-        appointment = {
-            "patient_id": patient_id,
-            "appointment_date": date,
-            "time": user_time_str,
-            "doctor_id": doctor_id,
-        }
-        supabase.table("appointments").insert(appointment).execute()
-
-        state["response"] = (
-            f"✅ Appointment booked successfully!\n"
-            f"Doctor: {doctor['Name']}\n"
-            f"Date: {date}\n"
-            f"Time: {user_time_str} (PKT)"
-        )
 
         return state

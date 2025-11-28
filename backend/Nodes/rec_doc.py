@@ -1,163 +1,169 @@
 from backend.config import supabase
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 class RecommendDoctor:
     def __call__(self, state):
-
+        # --- 1. SETUP & INPUTS ---
         user_input = state.get("user_input", "").lower()
         PKT = ZoneInfo("Asia/Karachi")
-
-        specialization = state.get("specialization")
-        user_date_str = state.get("date")
-        doctor_name = state.get("doctor_name")
-        user_time_str = state.get("time")  # expected "HH:MM"
-        print(state)
-
         now = datetime.now(PKT)
 
-        if not user_date_str and doctor_name:
-            doc_res = (
-                supabase.table("Doctors")
-                .select("Name, doctor_availability(days, start_time, end_time)")  # fixed syntax
-                .ilike("Name", f"%{doctor_name}%")
-                .execute()
-            )
-
-            if not doc_res.data:
-                state["response"] = f"No availability found for Dr. {doctor_name}."
-                return state
-
-            doc = doc_res.data[0]  # first doctor
-            avail = doc.get("doctor_availability", [])
-            
-            if avail:
-                slot = avail[0]  # first available slot
-                response = (
-                    f"{doc['Name']} is available on {slot['days']} "
-                    f"from {slot['start_time']} to {slot['end_time']}"
-                )
-            else:
-                response = f"No availability found for Dr. {doctor_name}."
-
-            state["response"] = response
-            return state
-
+        specialization = state.get("specialization")
+        doctor_name = state.get("doctor_name")
         
-        if not user_date_str:
-            state["response"] = "Please provide a valid date."
-            return state
+        # Date and Time inputs
+        user_date_str = state.get("date")
+        user_time_str = state.get("time")  # expected "HH:MM"
 
-        # --- Handle relative dates ---
-        if "today" in user_date_str.lower():
-            print("inside today")
-            target_date = now
-            print(target_date)
-        elif "tomorrow" in user_date_str.lower():
-            target_date = now + timedelta(days=1)
-        elif "day after tomorrow" in user_date_str.lower():
-            target_date = now + timedelta(days=2)
-        else:
-            try:
-                target_date = datetime.strptime(user_date_str, "%Y/%m/%d")
-                print(target_date)
-            except ValueError:
-                state["response"] = "Please provide a valid date in YYYY/MM/DD format."
-                return state
+        print(f"State: {state}")
 
-        date = target_date.strftime("%Y/%m/%d")
+        # --- 2. EMPATHY LOGIC ---
+        # If we inferred a specialization from symptoms but user didn't ask for a specific doctor
+        intro_text = ""
+        if specialization and not doctor_name:
+             intro_text = f"Oh, I'm sorry to hear that. For symptoms like {user_input}, you should consult a {specialization}."
+
+        # --- 3. INTELLIGENT DATE PARSING ---
+        # FIX: Do not stop if date is missing. Default to TODAY.
+        target_date = now # Default
+        date_source = "today" # For the final message
+
+        if user_date_str:
+            if "today" in user_date_str.lower():
+                target_date = now
+                date_source = "today"
+            elif "tomorrow" in user_date_str.lower():
+                target_date = now + timedelta(days=1)
+                date_source = "tomorrow"
+            elif "day after tomorrow" in user_date_str.lower():
+                target_date = now + timedelta(days=2)
+                date_source = user_date_str
+            else:
+                try:
+                    target_date = datetime.strptime(user_date_str, "%Y/%m/%d")
+                    date_source = user_date_str
+                except ValueError:
+                    state["response"] = "Please provide a valid date in YYYY/MM/DD format."
+                    return state
+
+        # Calculate database lookup values
+        date_display = target_date.strftime("%Y/%m/%d")
         weekday = target_date.strftime("%a").lower()  # mon, tue, wed...
 
-        if not specialization:
-            state["response"] = "Please specify the specialization you are looking for."
-            return state
+        # --- 4. FETCH CANDIDATE DOCTORS ---
+        candidate_doctors = []
 
         try:
-            # === Step 1: Get doctors by specialization ===
-            doctors_res = (
-                supabase.table("Doctors")
-                .select("*")
-                .ilike("Specialization", f"%{specialization}%")
-                .execute()
-            )
+            if doctor_name:
+                # Scenario A: User asked for a specific doctor
+                res = (supabase.table("Doctors")
+                       .select("*")
+                       .ilike("Name", f"%{doctor_name}%")
+                       .execute())
+                candidate_doctors = res.data
+                if not candidate_doctors:
+                    state["response"] = f"Doctor '{doctor_name}' not found."
+                    return state
 
-            if not doctors_res.data:
-                state["response"] = f"Sorry, I couldn’t find any available {specialization}s right now."
+            elif specialization:
+                # Scenario B: User has symptoms/specialization
+                res = (supabase.table("Doctors")
+                       .select("*")
+                       .ilike("Specialization", f"%{specialization}%")
+                       .execute())
+                candidate_doctors = res.data
+                if not candidate_doctors:
+                    prefix = intro_text + " " if intro_text else ""
+                    state["response"] = f"{prefix}Sorry, I couldn’t find any {specialization}s available."
+                    return state
+            else:
+                # Scenario C: No name, no specialization
+                state["response"] = "Please specify a doctor name or describe your symptoms."
                 return state
 
+            # --- 5. FILTER BY AVAILABILITY ---
+            # Helper function for days like "mon-wed"
             day_order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-
             def is_day_in_range(day_range, target):
-                """Return True if target day (e.g. 'wed') falls in a textual range like 'tue-thu'."""
                 parts = [p.strip().lower() for p in day_range.split('-')]
-                if len(parts) == 1:
-                    return parts[0] == target
+                if len(parts) == 1: return parts[0] == target
                 start, end = parts
                 s, e, t = day_order.index(start), day_order.index(end), day_order.index(target)
-                if s <= e:
-                    return s <= t <= e
-                else:
-                    # wrap-around e.g. sat-mon
-                    return t >= s or t <= e
+                return s <= t <= e if s <= e else (t >= s or t <= e)
 
-            available_doctors = []
-
-            # Convert user time string → datetime.time
-            user_time = None
+            # Parse user time if provided
+            user_time_obj = None
             if user_time_str:
                 try:
-                    user_time = datetime.strptime(user_time_str, "%H:%M").time()
+                    user_time_obj = datetime.strptime(user_time_str, "%H:%M").time()
                 except ValueError:
                     state["response"] = "Please provide time in HH:MM (24-hour) format."
                     return state
 
-            for doc in doctors_res.data:
-                avail_res = (
-                    supabase.table("doctor_availability")
-                    .select("*")
-                    .eq("doctor_id", doc["id"])
-                    .execute()
-                )
+            available_doctors = []
 
-                for slot in avail_res.data:
+            for doc in candidate_doctors:
+                # Fetch slots for this doctor
+                slots = (supabase.table("doctor_availability")
+                         .select("*")
+                         .eq("doctor_id", doc["id"])
+                         .execute()).data
+                
+                doc_is_free = False
+                valid_slot_str = ""
+
+                for slot in slots:
                     days_text = slot["days"].strip().lower()
-
+                    
+                    # Check Day
                     if not is_day_in_range(days_text, weekday):
                         continue
 
-                    if user_time:
-                        # Convert Supabase TIME strings to Python time objects
-                        start_t = datetime.strptime(slot["start_time"], "%H:%M:%S").time()
-                        end_t = datetime.strptime(slot["end_time"], "%H:%M:%S").time()
-                        if not (start_t <= user_time <= end_t):
-                            continue
-
+                    # Check Time (if user provided one)
+                    start_t = datetime.strptime(slot["start_time"], "%H:%M:%S").time()
+                    end_t = datetime.strptime(slot["end_time"], "%H:%M:%S").time()
+                    
+                    if user_time_obj:
+                        if start_t <= user_time_obj <= end_t:
+                            doc_is_free = True
+                            valid_slot_str = f"{start_t.strftime('%H:%M')} - {end_t.strftime('%H:%M')}"
+                            break
+                    else:
+                        # If no specific time requested, they are available if they work today
+                        doc_is_free = True
+                        valid_slot_str = f"{start_t.strftime('%H:%M')} - {end_t.strftime('%H:%M')}"
+                        break # Found a valid slot for today
+                
+                if doc_is_free:
+                    # Append doctor with the specific slot info for display
+                    doc['display_slot'] = valid_slot_str
                     available_doctors.append(doc)
-                    break  # found one matching slot, no need to check others
 
+            # --- 6. CONSTRUCT RESPONSE ---
             if not available_doctors:
-                state["response"] = (
-                    f"No {specialization} doctors are available"
-                    + (f" on {date} at {user_time_str}" if user_time_str else "")
-                    + "."
-                )
+                prefix = intro_text + " " if intro_text else ""
+                time_msg = f" at {user_time_str}" if user_time_str else ""
+                state["response"] = f"{prefix}No doctors found available on {date_source} ({weekday}){time_msg}."
                 return state
 
-            # === Step 3: Prepare response ===
-            doctor_list = "\n".join([
-                f"- Dr. {d['Name']} ({d.get('Qualification', 'N/A')}, {d.get('Experience', 0)} yrs exp, Room {d.get('room', 'N/A')})"
-                for d in available_doctors
-            ])
+            # Create the list
+            list_text = ""
+            for d in available_doctors:
+                list_text += f"- Dr. {d['Name']} ({d.get('Experience', 0)} yrs exp) | Time: {d['display_slot']}\n"
 
+            header = intro_text if intro_text else f"Here are the doctors available for {date_source} ({weekday}):"
+            
             state["response"] = (
-                f"I recommend consulting a {specialization}.\n"
-                f"Here are some available doctors"
-                + (f" on {date} at {user_time_str}" if user_time_str else "")
-                + f":\n{doctor_list}\n"
-                f"Would you like to book an appointment with one?"
+                f"{header}\n\n"
+                f"{list_text}\n"
+                f"Would you like to book an appointment with any of them?"
             )
+            
+            # Automatically fill date in state for the next step (Booking)
+            state["date"] = date_display
 
         except Exception as e:
-            state["response"] = f"Error fetching doctor data: {e}"
+            state["response"] = f"System Error: {str(e)}"
 
         return state
