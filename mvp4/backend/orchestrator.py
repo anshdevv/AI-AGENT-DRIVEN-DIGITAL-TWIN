@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -61,6 +62,12 @@ DOCTOR_PROFILE_PHRASES = {
     "profile of",
 }
 AVAILABILITY_QUERY_WORDS = {"available", "availability", "slot", "slots", "free", "open", "today", "tomorrow"}
+DOCTOR_NAME_STOP_WORDS = (
+    DOCTOR_INFO_WORDS
+    | BOOKING_WORDS
+    | AVAILABILITY_QUERY_WORDS
+    | {"doctor", "doctors", "specialist", "specialists", "profile", "about", "please", "now"}
+)
 ALTERNATIVE_PROVIDER_WORDS = {"another", "other", "anyother", "else", "different"}
 FAQ_WORDS = {
     "timing",
@@ -127,8 +134,13 @@ SPECIALIZATION_HINTS = {
     "dermatologist": "Dermatologist",
     "skin specialist": "Dermatologist",
     "neurologist": "Neurologist",
+    "pediatrician": "Pediatrician",
+    "paediatrician": "Pediatrician",
+    "child specialist": "Pediatrician",
     "orthopedic": "Orthopedic",
     "orthopaedic": "Orthopedic",
+    "orthopeadic": "Orthopedic",
+    "orthopaedist": "Orthopedic",
     "urologist": "Urologist",
     "endocrinologist": "Endocrinologist",
     "gynecologist": "Gynecologist",
@@ -141,6 +153,26 @@ SPECIALIZATION_HINTS = {
     "general physician": "General Physician",
     "physician": "General Physician",
 }
+WEEKDAY_ALIASES = {
+    "mon": "monday",
+    "monday": "monday",
+    "tue": "tuesday",
+    "tues": "tuesday",
+    "tuesday": "tuesday",
+    "wed": "wednesday",
+    "wednesday": "wednesday",
+    "thu": "thursday",
+    "thur": "thursday",
+    "thurs": "thursday",
+    "thursday": "thursday",
+    "fri": "friday",
+    "friday": "friday",
+    "sat": "saturday",
+    "saturday": "saturday",
+    "sun": "sunday",
+    "sunday": "sunday",
+}
+WEEKDAY_ORDER = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 ORDINAL_MAP = {
     "first": 0,
     "1st": 0,
@@ -229,7 +261,19 @@ class HybridIntentClassifier:
 
     @staticmethod
     def _contains_any_token(lowered: str, options: set[str]) -> bool:
-        return any(token in lowered for token in options)
+        normalized = " ".join(WORD_RE.findall(lowered))
+        token_set = set(normalized.split())
+        for option in options:
+            option_tokens = WORD_RE.findall(option.lower())
+            if not option_tokens:
+                continue
+            if len(option_tokens) == 1:
+                if option_tokens[0] in token_set:
+                    return True
+                continue
+            if " ".join(option_tokens) in normalized:
+                return True
+        return False
 
     @staticmethod
     def _is_greeting(lowered: str) -> bool:
@@ -249,6 +293,10 @@ class HybridIntentClassifier:
         if self._looks_like_alternative_provider_request(lowered, entities, state):
             return False
 
+        if entities.get("specialization") and not entities.get("doctor_name"):
+            if any(word in lowered for word in AVAILABILITY_QUERY_WORDS | {"which", "what", "doctors"}):
+                return False
+
         asks_profile = any(phrase in lowered for phrase in DOCTOR_PROFILE_PHRASES)
         asks_schedule = any(word in lowered for word in DOCTOR_INFO_WORDS)
         has_doctor_context = bool(state.get("slots", {}).get("doctor_name") or state.get("doctor_profile"))
@@ -264,6 +312,15 @@ class HybridIntentClassifier:
     def _looks_like_recommendation(self, lowered: str, entities: dict[str, Any], state: ConversationState) -> bool:
         if self._looks_like_alternative_provider_request(lowered, entities, state):
             return True
+        has_provider_context = bool(
+            state.get("slots", {}).get("specialization")
+            or state.get("candidate_doctors")
+            or state.get("slots", {}).get("doctor_name")
+            or state.get("doctor_profile")
+        )
+        if has_provider_context and self._contains_any_token(lowered, AVAILABILITY_QUERY_WORDS):
+            if "doctor" in lowered or "available" in lowered or "schedule" in lowered:
+                return True
         if entities.get("symptom") or entities.get("specialization"):
             return True
         if "which doctor" in lowered or "what doctor" in lowered or "specialist" in lowered:
@@ -306,9 +363,22 @@ class HybridIntentClassifier:
 
     @staticmethod
     def _llm_backup(message: str, state: ConversationState) -> IntentDecision | None:
+        history = list(state.get("history", []) or [])
+        recent_turns = history[-6:]
+        history_text = "\n".join(
+            f"- {item.get('role', 'unknown')}: {str(item.get('content', '')).strip()}"
+            for item in recent_turns
+            if str(item.get("content", "")).strip()
+        ) or "- no prior turns"
         result = llm.complete_json(
             f"""
 Classify the user's latest healthcare concierge message.
+
+You MUST read the conversation context first, not just the latest message.
+You MUST detect whether the user is continuing the current topic or changing topics.
+If the user refers to "the doctor", "this doctor", "she", "he", "same doctor", or asks about availability/schedule,
+resolve that against the active doctor or booking context in the state.
+If the user changes topics, choose the new intent instead of staying on the old one.
 
 Allowed intents:
 - greeting
@@ -328,6 +398,11 @@ Conversation state:
 - triage_status: {state.get("triage_state", {}).get("status", "idle")}
 - slots: {state.get("slots", {})}
 - extracted_entities: {state.get("current_entities", {})}
+- candidate_doctors: {state.get("candidate_doctors", [])}
+- active_doctor_profile: {state.get("doctor_profile")}
+
+Recent conversation:
+{history_text}
 
 User message:
 {message}
@@ -381,6 +456,28 @@ class MedicalConversationDirector:
 
         doctor_name = current_entities.get("doctor_name")
         current_profile = state.get("doctor_profile")
+        explicit_specialization = current_entities.get("specialization")
+        specialization_changed = bool(
+            explicit_specialization
+            and slots.get("specialization")
+            and self._normalize_doctor_key(str(explicit_specialization)) != self._normalize_doctor_key(str(slots.get("specialization")))
+        )
+        doctor_changed = bool(
+            doctor_name
+            and slots.get("doctor_name")
+            and self._normalize_doctor_key(str(doctor_name)) != self._normalize_doctor_key(str(slots.get("doctor_name")))
+        )
+        if specialization_changed or doctor_changed:
+            candidate_doctors = []
+            current_profile = None
+            for key in ("symptom", "doctor_name", "doctor_id", "date", "time"):
+                merged_slots.pop(key, None)
+            if explicit_specialization:
+                merged_slots["specialization"] = explicit_specialization
+            if doctor_name:
+                merged_slots["doctor_name"] = doctor_name
+            if current_entities.get("doctor_id"):
+                merged_slots["doctor_id"] = current_entities.get("doctor_id")
         if doctor_name and current_profile and doctor_name.lower() != str(current_profile.get("Name", "")).lower():
             current_profile = None
 
@@ -443,15 +540,27 @@ class MedicalConversationDirector:
     def greeting_agent(self, state: ConversationState) -> dict[str, Any]:
         return self._reply(
             state,
-            reply=(
-                "I can help with symptoms-to-specialty guidance, doctor information, appointment booking, "
-                "and a safe pre-visit triage. Tell me what you need, and we'll take it step by step."
-            ),
+            reply="I can help with doctor matching, schedules, booking, and a short intake. Tell me what you need.",
             action="greeting",
         )
 
     def faq_agent(self, state: ConversationState) -> dict[str, Any]:
         query = str(state.get("current_message", "")).strip()
+        lowered_query = query.lower()
+        current_entities = dict(state.get("current_entities", {}) or {})
+        slots = dict(state.get("slots", {}) or {})
+        has_doctor_context = bool(slots.get("doctor_name") or state.get("doctor_profile"))
+        has_provider_context = bool(
+            has_doctor_context
+            or slots.get("specialization")
+            or state.get("candidate_doctors")
+        )
+        if self._message_requests_availability(lowered_query, current_entities) or "schedule" in lowered_query:
+            if has_doctor_context:
+                return self.doctor_info_agent(state)
+            if has_provider_context:
+                return self.recommend_doctor_agent(state)
+
         tool_result = self.tools.call_tool("search_knowledge", {"query": query})
         tool_events = [self._tool_event("search_knowledge", {"query": query}, tool_result)]
 
@@ -476,11 +585,29 @@ class MedicalConversationDirector:
         context_text = "\n\n".join(f"{item['source']}:\n{item['content']}" for item in top_matches)
         reply = None
         if llm.enabled:
+            history = list(state.get("history", []) or [])
+            recent_turns = history[-4:]
+            history_text = "\n".join(
+                f"- {item.get('role', 'unknown')}: {str(item.get('content', '')).strip()}"
+                for item in recent_turns
+                if str(item.get("content", "")).strip()
+            ) or "- no prior turns"
             reply = llm.complete(
                 f"""
 You are a warm hospital concierge assistant.
+You MUST read the recent conversation context before answering.
+You MUST notice when the user is continuing the current topic versus changing topics.
 Answer the user using only the knowledge below.
-Keep it concise, natural, and safe. Do not invent facts.
+If the knowledge does not answer the user's question, do not invent facts.
+If the user is asking about a doctor-specific schedule or availability, do not answer with generic hospital FAQ.
+
+Recent conversation:
+{history_text}
+
+Structured context:
+- slots: {slots}
+- extracted_entities: {current_entities}
+- active_doctor_profile: {state.get("doctor_profile")}
 
 Knowledge:
 {context_text}
@@ -532,10 +659,7 @@ User:
     def clarify_agent(self, state: ConversationState) -> dict[str, Any]:
         return self._reply(
             state,
-            reply=(
-                "I can help in three ways: suggest the right specialist from symptoms, share a doctor's info or "
-                "schedule, or book an appointment and do a quick safe triage. Tell me which one you'd like."
-            ),
+            reply="I can suggest the right specialist, share a doctor's schedule, or book an appointment. Tell me which one you need.",
             action="clarify",
         )
 
@@ -594,8 +718,12 @@ User:
                 availability_result = self.tools.call_tool("find_provider_availability", availability_args)
                 tool_events.append(self._tool_event("find_provider_availability", availability_args, availability_result))
                 if not availability_result.ok:
-                    availability_summaries = []
-                    break
+                    return self._reply(
+                        state,
+                        reply=self._format_datetime_error_reply(availability_result.error),
+                        action="availability_error",
+                        tool_events=tool_events,
+                    )
 
                 requested_date_label = self._format_requested_date_label(
                     requested_date,
@@ -665,10 +793,12 @@ User:
         current_entities = dict(state.get("current_entities", {}) or {})
         booking_state = dict(state.get("booking_state", {}) or {})
         lowered_message = str(state.get("current_message", "")).lower()
-        symptom = current_entities.get("symptom") or slots.get("symptom") or str(state.get("current_message", ""))
+        symptom = current_entities.get("symptom") or slots.get("symptom")
         specialization = current_entities.get("specialization") or slots.get("specialization")
         doctor_name = current_entities.get("doctor_name") or slots.get("doctor_name")
         symptom_match = current_entities.get("symptom_match")
+        explicit_specialization_requested = bool(current_entities.get("specialization"))
+        symptom_guided_request = bool(symptom and not explicit_specialization_requested)
         wants_alternative = self._message_requests_alternative_provider(lowered_message)
         wants_availability = self._message_requests_availability(lowered_message, current_entities)
 
@@ -696,7 +826,10 @@ User:
         if not tool_result.ok:
             reply = "I couldn't complete the doctor lookup right now."
             if specialization:
-                reply += f" Based on the symptoms, {specialization} is still the right department to check."
+                if symptom_guided_request:
+                    reply += f" Based on the symptoms, {specialization} is still the right department to check."
+                else:
+                    reply += f" I understood that you're looking for a {specialization}."
             reply += " If you'd like, we can keep going and I can collect booking details for a human follow-up."
             return self._reply(
                 state,
@@ -708,6 +841,10 @@ User:
         providers = tool_result.data.get("providers", [])
         resolved_specialization = tool_result.data.get("specialization") or specialization
         resolved_match = tool_result.data.get("symptom_match") or symptom_match or {}
+        supported_specializations = tool_result.data.get("supported_specializations") or self.tools.get_supported_specializations()
+        requested_specialization_supported = bool(
+            tool_result.data.get("requested_specialization_supported", True)
+        )
         updated_slots = dict(slots)
         if resolved_specialization:
             updated_slots["specialization"] = resolved_specialization
@@ -721,11 +858,35 @@ User:
         )
 
         if not providers:
+            supported_text = self._supported_departments_text(supported_specializations)
+            if resolved_specialization and not requested_specialization_supported:
+                reply = f"I can't auto-book {resolved_specialization} yet. I currently support {supported_text}."
+                if symptom_guided_request:
+                    reply = f"That symptom route is not in the live roster yet. I currently support {supported_text}."
+                return {
+                    "reply": reply,
+                    "action": "recommendation_unsupported_specialty",
+                    "metadata": {
+                        "specialization": resolved_specialization,
+                        "supported_specializations": supported_specializations,
+                    },
+                    "tool_events": tool_events,
+                    "slots": updated_slots,
+                    "candidate_doctors": [],
+                    "next_agent": "finalize_turn",
+                }
             if resolved_specialization:
-                reply = (
-                    f"Based on what you described, {resolved_specialization} looks like the right specialty. "
-                    "I couldn't fetch matching doctor records just now, but I can still help collect details for booking."
-                )
+                if symptom_guided_request:
+                    reply = (
+                        f"Based on what you described, {resolved_specialization} looks like the right specialty, "
+                        f"but I couldn't find any {resolved_specialization} doctors in the current database."
+                    )
+                else:
+                    reply = (
+                        f"I understood that you're looking for a {resolved_specialization}, "
+                        f"but I couldn't find any {resolved_specialization} doctors in the current database."
+                    )
+                reply += " If you'd like, I can help with a related specialty or collect details for manual follow-up."
             else:
                 reply = "I need a little more symptom detail before I can suggest the right specialist."
             return {
@@ -750,7 +911,7 @@ User:
             if not availability_result.ok:
                 return self._reply(
                     state,
-                    reply="I couldn't check doctor availability right now. Please try again in a moment.",
+                    reply=self._format_datetime_error_reply(availability_result.error),
                     action="availability_error",
                     tool_events=tool_events,
                 )
@@ -803,10 +964,13 @@ User:
 
         visible_providers = providers[:4]
         provider_lines = [self._format_provider_line(item) for item in visible_providers]
-        match_phrases = resolved_match.get("matches", [])
+        match_phrases = resolved_match.get("matches", []) if symptom_guided_request else []
         intro = "Here are doctors who fit your request:"
         if resolved_specialization:
-            intro = f"Based on the symptoms, {resolved_specialization} is the right specialty. Here are suitable doctors:"
+            if symptom_guided_request:
+                intro = f"Based on the symptoms, {resolved_specialization} is the right specialty. Here are suitable doctors:"
+            else:
+                intro = f"Here are {resolved_specialization} doctors I found:"
         if booking_state.get("status") == "needs_provider":
             intro += " Pick one and I'll continue the booking."
         else:
@@ -866,7 +1030,7 @@ User:
             booking_state["status"] = "collect_phone"
             return {
                 "booking_state": booking_state,
-                "reply": "To book the appointment, please share your mobile number first.",
+                "reply": "Please share your mobile number to continue.",
                 "action": "collect_phone",
                 "next_agent": "finalize_turn",
             }
@@ -895,7 +1059,7 @@ User:
                     booking_state["status"] = "collect_name"
                     return {
                         "booking_state": booking_state,
-                        "reply": "I couldn't find a patient profile for that number. Please share your full name so I can create one.",
+                        "reply": "I couldn't find a patient profile for that number. Please send your full name.",
                         "action": "collect_name",
                         "tool_events": tool_events,
                         "next_agent": "finalize_turn",
@@ -915,9 +1079,10 @@ User:
 
         if not slots.get("time"):
             booking_state["status"] = "collect_details"
+            date_label = self._humanize_date_reference(slots.get("date"))
             return {
                 "booking_state": booking_state,
-                "reply": "What time works best for you? For example, 14:30 or 2:30 PM.",
+                "reply": f"{date_label} noted. What time works best? For example, 14:30 or 2:30 PM.",
                 "action": "collect_time",
                 "tool_events": tool_events,
                 "next_agent": "finalize_turn",
@@ -932,20 +1097,27 @@ User:
         availability = self.tools.call_tool("find_provider_availability", availability_args)
         tool_events.append(self._tool_event("find_provider_availability", availability_args, availability))
         if not availability.ok:
-            return self._reply(
-                state,
-                reply="I couldn't check availability right now. Please try again shortly.",
-                action="availability_error",
-                tool_events=tool_events,
-            )
+            booking_state["status"] = "collect_details"
+            return {
+                "booking_state": booking_state,
+                "reply": self._format_datetime_error_reply(availability.error),
+                "action": "availability_error",
+                "tool_events": tool_events,
+                "next_agent": "finalize_turn",
+            }
 
         available = availability.data.get("available", [])
         if not available:
+            alternative_args = dict(availability_args)
+            alternative_args["time"] = None
+            alternatives = self.tools.call_tool("find_provider_availability", alternative_args)
+            tool_events.append(self._tool_event("find_provider_availability", alternative_args, alternatives))
+            alternative_text = self._format_alternative_slots_reply(alternatives.data.get("available", []))
             return self._reply(
                 state,
                 reply=(
                     f"I couldn't find an open slot for {slots.get('doctor_name')} on {availability.data.get('date')} at {slots.get('time')}. "
-                    "If you'd like, send another time and I'll try again."
+                    f"{alternative_text}"
                 ),
                 action="availability_empty",
                 tool_events=tool_events,
@@ -969,6 +1141,16 @@ User:
             )
 
         appointment = created.data.get("appointment") or {}
+        error_code = created.data.get("error_code")
+        if error_code or not appointment:
+            booking_state["status"] = "collect_details"
+            return {
+                "booking_state": booking_state,
+                "reply": self._format_booking_error_reply(created.data),
+                "action": "booking_error",
+                "tool_events": tool_events,
+                "next_agent": "finalize_turn",
+            }
         booking_state.update(
             {
                 "status": "completed",
@@ -985,7 +1167,7 @@ User:
 
         triage_state = {
             "status": "pending_start",
-            "appointment_id": appointment.get("apt_id"),
+            "appointment_id": appointment.get("id"),
             "doctor_name": chosen["doctor"].get("Name"),
             "specialization": chosen["doctor"].get("Specialization"),
             "answers": [],
@@ -998,7 +1180,7 @@ User:
             "booking_state": booking_state,
             "triage_state": triage_state,
             "slots": updated_slots,
-            "metadata": {"appointment_id": appointment.get("apt_id")},
+            "metadata": {"appointment_id": appointment.get("id")},
             "tool_events": tool_events,
             "reply": "",
             "action": "booking_created",
@@ -1137,7 +1319,9 @@ User:
 
         doctor_match = DOCTOR_RE.search(message)
         if doctor_match:
-            entities["doctor_name"] = re.sub(r"\s+", " ", doctor_match.group(1).replace(".", " ")).strip()
+            cleaned_doctor_name = self._clean_doctor_name_candidate(doctor_match.group(1))
+            if cleaned_doctor_name:
+                entities["doctor_name"] = cleaned_doctor_name
 
         candidate = self._resolve_candidate_reference(message, state)
         if candidate:
@@ -1162,14 +1346,15 @@ User:
         if explicit_specialization:
             entities["specialization"] = explicit_specialization
 
-        symptom_match_result = self.tools.call_tool("match_symptoms_to_specialization", {"symptom": message})
-        if symptom_match_result.ok and symptom_match_result.data.get("specialization"):
-            entities["symptom_match"] = symptom_match_result.data
-            if self._looks_like_symptom_message(lowered):
+        is_symptom_message = self._looks_like_symptom_message(lowered)
+        if is_symptom_message:
+            symptom_match_result = self.tools.call_tool("match_symptoms_to_specialization", {"symptom": message})
+            if symptom_match_result.ok and symptom_match_result.data.get("specialization"):
+                entities["symptom_match"] = symptom_match_result.data
                 entities.setdefault("specialization", symptom_match_result.data.get("specialization"))
                 entities["symptom"] = message.strip()
 
-        if not entities.get("symptom") and self._looks_like_symptom_message(lowered):
+        if not entities.get("symptom") and is_symptom_message:
             entities["symptom"] = message.strip()
 
         return entities
@@ -1192,14 +1377,66 @@ User:
             return "tomorrow"
         if "today" in lowered:
             return "today"
+        for phrase, canonical in sorted(WEEKDAY_ALIASES.items(), key=lambda item: -len(item[0])):
+            if re.search(rf"\b{re.escape(phrase)}\b", lowered):
+                return canonical
+        return None
+
+    def _extract_specialization(self, lowered: str) -> str | None:
+        normalized = " ".join(WORD_RE.findall(lowered))
+        token_set = set(normalized.split())
+
+        rag_specializations = sorted(
+            {specialization for _, specialization in self.tools.symptom_map if specialization},
+            key=lambda item: (-len(WORD_RE.findall(item.lower())), -len(item)),
+        )
+        for specialization in rag_specializations:
+            if self._message_contains_term(normalized, token_set, specialization):
+                return specialization
+
+        ordered_aliases = sorted(
+            SPECIALIZATION_HINTS.items(),
+            key=lambda item: (-len(WORD_RE.findall(item[0].lower())), -len(item[0])),
+        )
+        for phrase, specialization in ordered_aliases:
+            if self._message_contains_term(normalized, token_set, phrase):
+                return specialization
+        for phrase, specialization in ordered_aliases:
+            if self._message_fuzzy_contains_term(normalized.split(), phrase):
+                return specialization
         return None
 
     @staticmethod
-    def _extract_specialization(lowered: str) -> str | None:
-        for phrase, specialization in SPECIALIZATION_HINTS.items():
-            if phrase in lowered:
-                return specialization
-        return None
+    def _message_contains_term(normalized: str, token_set: set[str], phrase: str) -> bool:
+        phrase_tokens = WORD_RE.findall(phrase.lower())
+        if not phrase_tokens:
+            return False
+        if len(phrase_tokens) == 1:
+            return phrase_tokens[0] in token_set
+        return " ".join(phrase_tokens) in normalized
+
+    @staticmethod
+    def _message_fuzzy_contains_term(message_tokens: list[str], phrase: str) -> bool:
+        phrase_tokens = WORD_RE.findall(phrase.lower())
+        if not phrase_tokens:
+            return False
+        if len(phrase_tokens) == 1:
+            target = phrase_tokens[0]
+            if len(target) < 6:
+                return False
+            return any(
+                len(token) >= 6 and SequenceMatcher(None, token, target).ratio() >= 0.84
+                for token in message_tokens
+            )
+        window = len(phrase_tokens)
+        if len(message_tokens) < window:
+            return False
+        phrase_text = " ".join(phrase_tokens)
+        for index in range(len(message_tokens) - window + 1):
+            candidate = " ".join(message_tokens[index : index + window])
+            if SequenceMatcher(None, candidate, phrase_text).ratio() >= 0.9:
+                return True
+        return False
 
     @staticmethod
     def _looks_like_symptom_message(lowered: str) -> bool:
@@ -1260,6 +1497,15 @@ User:
         return bool(NAMEISH_RE.match(message.strip()))
 
     @staticmethod
+    def _clean_doctor_name_candidate(raw_name: str) -> str:
+        tokens = [token for token in WORD_RE.findall(raw_name.lower()) if token]
+        while tokens and tokens[-1] in DOCTOR_NAME_STOP_WORDS:
+            tokens.pop()
+        if not tokens:
+            return ""
+        return " ".join(token.capitalize() for token in tokens[:4])
+
+    @staticmethod
     def _choose_available_doctor(available: list[dict[str, Any]], target_name: str | None) -> dict[str, Any]:
         if not target_name:
             return available[0]
@@ -1287,14 +1533,51 @@ User:
         experience_text = MedicalConversationDirector._format_experience(doctor.get("Experience"))
         display_slots = list(entry.get("display_slots") or [])
         if display_slots:
-            slot_text = ", ".join(str(slot).strip() for slot in display_slots if str(slot).strip())
+            visible_slots = [str(slot).strip() for slot in display_slots if str(slot).strip()][:4]
+            more_count = max(int(entry.get("slot_count") or len(display_slots)) - len(visible_slots), 0)
+            slot_text = ", ".join(visible_slots)
+            if more_count:
+                slot_text += f" (+{more_count} more)"
         else:
             slot_text = str(entry.get("display_slot") or "time available").strip()
         details: list[str] = [specialization]
         if experience_text:
             details.append(experience_text)
-        details.append(slot_text)
+        details.append(f"Slots: {slot_text}")
         return f"- {name} ({', '.join(details)})"
+
+    def _supported_departments_text(self, supported_specializations: list[str] | None = None) -> str:
+        departments = supported_specializations or self.tools.get_supported_specializations()
+        return ", ".join(departments)
+
+    def _format_datetime_error_reply(self, error: str | None) -> str:
+        lowered_error = str(error or "").lower()
+        if "date must" in lowered_error:
+            return "Please send the date as today, tomorrow, a weekday, or YYYY-MM-DD."
+        if "time must" in lowered_error:
+            return "Please send the time as HH:MM or with AM/PM."
+        return "I couldn't check that date and time. Please try again."
+
+    def _format_alternative_slots_reply(self, available_entries: list[dict[str, Any]]) -> str:
+        if not available_entries:
+            return "Send another time and I'll check again."
+        chosen = available_entries[0]
+        doctor_name = self._display_provider_name(str(chosen.get("doctor", {}).get("Name", "the doctor")))
+        slots = list(chosen.get("display_slots") or [])
+        visible = ", ".join(slots[:4]) if slots else str(chosen.get("display_slot") or "").strip()
+        if not visible:
+            return "Send another time and I'll check again."
+        return f"Closest open times with {doctor_name} are {visible}. Send one of those if you'd like."
+
+    def _format_booking_error_reply(self, booking_result: dict[str, Any]) -> str:
+        error_code = str(booking_result.get("error_code") or "").strip().lower()
+        if error_code == "invalid_datetime":
+            return self._format_datetime_error_reply(booking_result.get("message"))
+        if error_code == "schedule_unavailable":
+            return "That doctor does not have a loaded schedule for the requested day yet."
+        if error_code == "slot_unavailable":
+            return "That time is no longer available. Send another time and I'll recheck."
+        return "I couldn't complete the booking just now. Please try again."
 
     @staticmethod
     def _message_requests_availability(lowered: str, entities: dict[str, Any]) -> bool:
@@ -1323,6 +1606,12 @@ User:
                 matches.append((match.start(), label))
             masked = pattern.sub(lambda found: " " * len(found.group(0)), masked)
 
+        for phrase, canonical in sorted(WEEKDAY_ALIASES.items(), key=lambda item: -len(item[0])):
+            pattern = re.compile(rf"\b{re.escape(phrase)}\b")
+            for match in pattern.finditer(masked):
+                matches.append((match.start(), canonical))
+            masked = pattern.sub(lambda found: " " * len(found.group(0)), masked)
+
         for match in DATE_RE.finditer(message):
             matches.append((match.start(), match.group(0)))
 
@@ -1344,9 +1633,21 @@ User:
             return resolved_date or "the requested date"
 
         lowered = cleaned.lower()
-        if resolved_date and lowered in {"today", "tomorrow", "day after tomorrow"}:
-            return f"{lowered.capitalize()} ({resolved_date})"
+        if resolved_date and lowered in {"today", "tomorrow", "day after tomorrow", *WEEKDAY_ORDER}:
+            return f"{MedicalConversationDirector._humanize_date_reference(lowered)} ({resolved_date})"
         return resolved_date or cleaned
+
+    @staticmethod
+    def _humanize_date_reference(date_value: str | None) -> str:
+        cleaned = str(date_value or "").strip()
+        if not cleaned:
+            return "that date"
+        lowered = cleaned.lower()
+        if lowered in WEEKDAY_ALIASES:
+            return WEEKDAY_ALIASES[lowered].capitalize()
+        if lowered in {"today", "tomorrow", "day after tomorrow"}:
+            return lowered.capitalize()
+        return cleaned
 
     @staticmethod
     def _message_requests_alternative_provider(lowered: str) -> bool:

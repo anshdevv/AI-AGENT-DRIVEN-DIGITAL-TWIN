@@ -21,8 +21,8 @@ class DomainConfig:
 
 HEALTHCARE_DOMAIN = DomainConfig(
     name="healthcare",
-    greeting="I'm here to help with hospital information, doctor recommendations, appointments, and a quick pre-visit intake whenever you need it.",
-    fallback="I'm here to help with appointments, doctor recommendations, hospital information, and pre-visit intake. Let me know what you need, and I'll guide you through it.",
+    greeting="I can help with doctors, schedules, appointments, and a short intake.",
+    fallback="I can help with doctors, schedules, appointments, and a short intake. Tell me what you need.",
     escalation_message="If you'd prefer, I can help hand this over to a human representative. If this is an emergency, please contact your local emergency services right away.",
     faq_dir=RAG_DIR / "faq",
     symptom_map_path=RAG_DIR / "mapping" / "symptoms_to_specialization.md",

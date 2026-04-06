@@ -28,6 +28,7 @@ The assistant does **not** prescribe medication or handle emergency advice beyon
 - FAQ RAG: `backend/rag/faq`
 - symptom-to-specialization map: `backend/rag/mapping/symptoms_to_specialization.md`
 - triage question flows: `backend/rag/question_flows`
+- doctor schedule seed data: `backend/seeds/doctor_availability_seed.json`
 
 Key MCP tools:
 
@@ -47,6 +48,30 @@ Key MCP tools:
 - `POST /mcp`
 
 All three user channels share the same backend session state.
+
+## Booking Data
+
+- `doctor_availability` is the source of truth for bookable clinic hours.
+- `slots` are created only when an appointment is reserved.
+- Load the starter schedule with:
+
+```bash
+venv\Scripts\python.exe -m backend.seed_doctor_availability
+```
+
+Current live roster support is limited to:
+
+- Cardiologist
+- Dermatologist
+- Neurologist
+- Pediatrician
+- Orthopedic
+- Gynecologist
+
+## Legacy Code
+
+`backend/orchestrator.py` is the live booking and triage path used by the API.
+The files under `backend/Nodes/` are legacy reference code and are not used by `/chat`, `/voice/message`, or `/ws/call/{session_id}`.
 
 ## Voice
 

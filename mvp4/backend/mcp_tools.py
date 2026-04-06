@@ -82,6 +82,44 @@ SPECIALIZATION_ALIASES: dict[str, list[list[str]]] = {
         ["blurry", "vision"],
     ],
 }
+WEEKDAY_ALIASES = {
+    "mon": "monday",
+    "monday": "monday",
+    "tue": "tuesday",
+    "tues": "tuesday",
+    "tuesday": "tuesday",
+    "wed": "wednesday",
+    "wednesday": "wednesday",
+    "thu": "thursday",
+    "thur": "thursday",
+    "thurs": "thursday",
+    "thursday": "thursday",
+    "fri": "friday",
+    "friday": "friday",
+    "sat": "saturday",
+    "saturday": "saturday",
+    "sun": "sunday",
+    "sunday": "sunday",
+}
+WEEKDAY_ORDER = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+KNOWN_SUPABASE_TABLES = [
+    "doctors",
+    "patients",
+    "doctor_availability",
+    "slots",
+    "appointments",
+    "appointment_events",
+]
+SUPPORTED_SPECIALIZATIONS_FALLBACK = [
+    "Cardiologist",
+    "Dermatologist",
+    "Neurologist",
+    "Pediatrician",
+    "Orthopedic",
+    "Gynecologist",
+]
+APPROVED_TRIAGE_FLOW_BY_KEY: dict[str, str] = {}
+GENERAL_TRIAGE_FLOW = "general_intake.md"
 
 
 @dataclass(slots=True)
@@ -110,6 +148,37 @@ class CustomerServiceTools:
                 "name": "search_knowledge",
                 "description": "Search FAQ and policy content for customer support answers.",
                 "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+            {
+                "name": "list_database_tables",
+                "description": "List the Supabase tables this assistant can inspect for context.",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "query_database_table",
+                "description": "Read rows from a Supabase table with optional filters for context-aware assistance.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "table_name": {"type": "string"},
+                        "columns": {"type": "string"},
+                        "limit": {"type": "number"},
+                        "filters": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "column": {"type": "string"},
+                                    "op": {"type": "string"},
+                                    "value": {},
+                                },
+                            },
+                        },
+                        "order_by": {"type": "string"},
+                        "ascending": {"type": "boolean"},
+                    },
+                    "required": ["table_name"],
+                },
             },
             {
                 "name": "match_symptoms_to_specialization",
@@ -224,6 +293,8 @@ class CustomerServiceTools:
         args = arguments or {}
         handlers = {
             "search_knowledge": self.search_knowledge,
+            "list_database_tables": self.list_database_tables,
+            "query_database_table": self.query_database_table,
             "match_symptoms_to_specialization": self.match_symptoms_to_specialization,
             "lookup_customer_profile": self.lookup_customer_profile,
             "register_customer_profile": self.register_customer_profile,
@@ -244,6 +315,54 @@ class CustomerServiceTools:
             return ToolCallResult(ok=True, data=handler(**args))
         except Exception as exc:
             return ToolCallResult(ok=False, data={}, error=str(exc))
+
+    def list_database_tables(self) -> dict[str, Any]:
+        return {
+            "tables": list(KNOWN_SUPABASE_TABLES),
+            "read_only": True,
+            "supports_arbitrary_table_query": True,
+        }
+
+    def query_database_table(
+        self,
+        table_name: str,
+        columns: str = "*",
+        limit: int = 20,
+        filters: list[dict[str, Any]] | None = None,
+        order_by: str | None = None,
+        ascending: bool = True,
+    ) -> dict[str, Any]:
+        if not supabase:
+            raise RuntimeError("Supabase is not configured.")
+
+        table_name = str(table_name).strip()
+        if not table_name:
+            raise ValueError("table_name is required.")
+
+        safe_limit = max(1, min(int(limit), 100))
+        query = supabase.table(table_name).select(columns or "*")
+
+        for filter_item in filters or []:
+            column = str(filter_item.get("column") or "").strip()
+            op = str(filter_item.get("op") or "eq").strip().lower()
+            value = filter_item.get("value")
+            if not column:
+                continue
+            query = self._apply_query_filter(query, column, op, value)
+
+        if order_by:
+            query = query.order(str(order_by).strip(), desc=not ascending)
+
+        response = query.limit(safe_limit).execute()
+        rows = response.data or []
+        columns_seen = sorted({key for row in rows if isinstance(row, dict) for key in row.keys()})
+        return {
+            "table_name": table_name,
+            "rows": rows,
+            "columns": columns_seen,
+            "count": len(rows),
+            "read_only": True,
+        }
 
     def _load_symptom_map(self) -> list[tuple[list[list[str]], str]]:
         path = self.domain.symptom_map_path
@@ -338,7 +457,7 @@ class CustomerServiceTools:
     def lookup_customer_profile(self, phone: str) -> dict[str, Any]:
         if not supabase:
             return {"profile": None}
-        response = supabase.table("Patient").select("*").eq("phone", phone).limit(1).execute()
+        response = supabase.table("patients").select("*").eq("phone", phone).limit(1).execute()
         profile = response.data[0] if response.data else None
         return {"profile": profile}
 
@@ -351,12 +470,8 @@ class CustomerServiceTools:
     ) -> dict[str, Any]:
         if not supabase:
             raise RuntimeError("Supabase is not configured.")
-        payload = {"Name": name, "phone": phone}
-        if gender:
-            payload["Gender"] = gender
-        if age is not None:
-            payload["age"] = age
-        response = supabase.table("Patient").insert(payload).execute()
+        payload = {"name": name, "phone": phone}
+        response = supabase.table("patients").insert(payload).execute()
         profile = response.data[0] if response.data else None
         return {"profile": profile}
 
@@ -367,22 +482,35 @@ class CustomerServiceTools:
         doctor_name: str | None = None,
     ) -> dict[str, Any]:
         if not supabase:
-            return {"providers": [], "specialization": specialization, "symptom_match": None}
+            return {
+                "providers": [],
+                "specialization": specialization,
+                "symptom_match": None,
+                "supported_specializations": list(SUPPORTED_SPECIALIZATIONS_FALLBACK),
+                "requested_specialization_supported": bool(not specialization),
+            }
 
         symptom_match = self.match_symptoms_to_specialization(symptom or "") if symptom else None
         inferred_specialization = specialization or (symptom_match or {}).get("specialization") or ""
+        supported_specializations = self.get_supported_specializations()
         if doctor_name:
-            response = supabase.table("Doctors").select("*").ilike("Name", f"%{doctor_name}%").execute()
+            response = supabase.table("doctors").select("*").ilike("name", f"%{doctor_name}%").execute()
             providers = response.data or []
         elif inferred_specialization:
             providers = self._lookup_providers_by_specialization(inferred_specialization)
         else:
             providers = []
 
+        providers = [self._normalize_doctor_record(provider) for provider in providers]
         return {
             "providers": providers,
             "specialization": inferred_specialization,
             "symptom_match": symptom_match,
+            "supported_specializations": supported_specializations,
+            "requested_specialization_supported": self._specialization_is_supported(
+                inferred_specialization,
+                supported_specializations,
+            ),
         }
 
     def get_doctor_profile(
@@ -409,53 +537,51 @@ class CustomerServiceTools:
         )
         providers = provider_result["providers"]
         target_date = self._parse_date(date)
-        target_weekday = target_date.strftime("%a").lower()
+        target_weekday = self._day_of_week_from_date(target_date)
         target_time = self._parse_time(time) if time else None
         available: list[dict[str, Any]] = []
 
         for provider in providers:
             if not supabase:
                 continue
-            slots_response = (
-                supabase.table("doctor_availability")
-                .select("*")
-                .eq("doctor_id", provider["id"])
-                .execute()
+            schedule_rows = self._get_schedule_rows(provider["id"], target_weekday)
+            if not schedule_rows:
+                continue
+
+            matching_slots = self._build_bookable_slots(
+                doctor_id=provider["id"],
+                target_date=target_date,
+                schedule_rows=schedule_rows,
             )
-            matching_slots: list[dict[str, Any]] = []
-            for slot in slots_response.data or []:
-                if not self._weekday_matches(slot.get("days", ""), target_weekday):
-                    continue
+            if target_time is not None:
+                matching_slots = [
+                    slot
+                    for slot in matching_slots
+                    if self._slot_starts_at(slot, target_time)
+                ]
 
-                start_time = datetime.strptime(slot["start_time"], "%H:%M:%S").time()
-                end_time = datetime.strptime(slot["end_time"], "%H:%M:%S").time()
-                if target_time and not (start_time <= target_time <= end_time):
-                    continue
-
-                matching_slots.append(
-                    {
-                        "slot": slot,
-                        "display_slot": f"{start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}",
-                    }
-                )
             if matching_slots:
+                display_slots = [self._format_slot_start(slot) for slot in matching_slots[:6]]
                 available.append(
                     {
                         "doctor": provider,
-                        "slot": matching_slots[0]["slot"],
-                        "slots": [entry["slot"] for entry in matching_slots],
-                        "display_slot": matching_slots[0]["display_slot"],
-                        "display_slots": [entry["display_slot"] for entry in matching_slots],
+                        "slot": matching_slots[0],
+                        "slots": matching_slots,
+                        "display_slot": display_slots[0],
+                        "display_slots": display_slots,
+                        "slot_count": len(matching_slots),
                     }
                 )
 
         return {
             "available": available,
             "date": target_date.strftime("%Y-%m-%d"),
-            "weekday": target_weekday,
+            "weekday": str(target_weekday),
             "specialization": provider_result["specialization"],
+            "supported_specializations": provider_result.get("supported_specializations", []),
+            "requested_specialization_supported": provider_result.get("requested_specialization_supported", True),
         }
-
+    
     def get_doctor_schedule(
         self,
         doctor_id: int | None = None,
@@ -466,16 +592,17 @@ class CustomerServiceTools:
 
         doctor: dict[str, Any] | None = None
         if doctor_id is not None:
-            response = supabase.table("Doctors").select("*").eq("id", doctor_id).limit(1).execute()
+            response = supabase.table("doctors").select("*").eq("id", doctor_id).limit(1).execute()
             doctor = response.data[0] if response.data else None
         elif doctor_name:
-            response = supabase.table("Doctors").select("*").ilike("Name", f"%{doctor_name}%").execute()
+            response = supabase.table("doctors").select("*").ilike("name", f"%{doctor_name}%").execute()
             if response.data:
                 doctor = self._pick_best_name_match(doctor_name, response.data)
 
         if not doctor:
             return {"doctor": None, "schedule": []}
 
+        doctor = self._normalize_doctor_record(doctor)
         slots_response = (
             supabase.table("doctor_availability")
             .select("*")
@@ -484,7 +611,7 @@ class CustomerServiceTools:
         )
         schedule = [
             {
-                "days": slot.get("days", ""),
+                "days": self._day_of_week_name(slot.get("day_of_week")),
                 "start_time": self._format_db_time(slot.get("start_time", "")),
                 "end_time": self._format_db_time(slot.get("end_time", "")),
             }
@@ -509,25 +636,118 @@ class CustomerServiceTools:
     def create_booking(self, patient_id: int, doctor_id: int, date: str, time: str) -> dict[str, Any]:
         if not supabase:
             raise RuntimeError("Supabase is not configured.")
-        payload = {
-            "patient_id": patient_id,
+        try:
+            target_date = self._parse_date(date)
+            target_time = self._parse_time(time)
+        except ValueError as exc:
+            return {
+                "appointment": None,
+                "slot": None,
+                "error_code": "invalid_datetime",
+                "message": str(exc),
+            }
+
+        weekday = self._day_of_week_from_date(target_date)
+        schedule_rows = self._get_schedule_rows(doctor_id, weekday)
+        if not schedule_rows:
+            return {
+                "appointment": None,
+                "slot": None,
+                "error_code": "schedule_unavailable",
+                "message": "No schedule is loaded for that doctor on the requested day.",
+            }
+
+        bookable_slots = self._build_bookable_slots(
+            doctor_id=doctor_id,
+            target_date=target_date,
+            schedule_rows=schedule_rows,
+        )
+        chosen_slot = next(
+            (slot for slot in bookable_slots if self._slot_starts_at(slot, target_time)),
+            None,
+        )
+        if not chosen_slot:
+            return {
+                "appointment": None,
+                "slot": None,
+                "error_code": "slot_unavailable",
+                "message": "The requested time is no longer open.",
+            }
+
+        created_slot = supabase.table("slots").insert(
+            {
+                "doctor_id": doctor_id,
+                "start_time": chosen_slot["start_time"],
+                "end_time": chosen_slot["end_time"],
+                "status": "booked",
+            }
+        ).execute()
+        slot_record = created_slot.data[0] if created_slot.data else None
+        if not slot_record:
+            return {
+                "appointment": None,
+                "slot": None,
+                "error_code": "slot_create_failed",
+                "message": "The slot could not be reserved.",
+            }
+
+        appointment_payload = {
+            "slot_id": slot_record["id"],
             "doctor_id": doctor_id,
-            "appointment_date": date,
-            "time": time,
+            "patient_id": patient_id,
+            "status": "booked",
         }
-        response = supabase.table("appointments").insert(payload).execute()
+        response = supabase.table("appointments").insert(appointment_payload).execute()
         appointment = response.data[0] if response.data else None
-        return {"appointment": appointment}
+        if not appointment:
+            supabase.table("slots").update({"status": "available"}).eq("id", slot_record["id"]).execute()
+            return {
+                "appointment": None,
+                "slot": slot_record,
+                "error_code": "appointment_create_failed",
+                "message": "The appointment row could not be created.",
+            }
+
+        try:
+            supabase.table("appointment_events").insert(
+                {"appointment_id": appointment["id"], "event_type": "created"}
+            ).execute()
+        except Exception:
+            pass
+
+        return {
+            "appointment": appointment,
+            "slot": slot_record,
+            "error_code": None,
+        }
 
     def get_recent_case_notes(self, patient_id: int) -> dict[str, Any]:
-        return {"notes": []}
+        if not supabase:
+            return {"notes": []}
+        response = (
+            supabase.table("appointments")
+            .select("id, notes, doctor_id, created_at")
+            .eq("patient_id", patient_id)
+            .neq("notes", None)
+            .order("created_at", desc=True)
+            .limit(5)
+            .execute()
+        )
+        return {"notes": response.data or []}
 
     def save_case_notes(self, appointment_id: int, notes: str) -> dict[str, Any]:
+        if not supabase:
+            raise RuntimeError("Supabase is not configured.")
+        response = (
+            supabase.table("appointments")
+            .update({"notes": notes})
+            .eq("id", appointment_id)
+            .execute()
+        )
         return {
-            "appointment": None,
-            "stored": False,
+            "appointment": response.data[0] if response.data else None,
+            "stored": bool(response.data),
             "summary": notes,
-            "reason": "The current appointments schema does not include a notes column.",
         }
 
     def _lookup_providers_by_specialization(self, specialization: str) -> list[dict[str, Any]]:
@@ -537,24 +757,29 @@ class CustomerServiceTools:
         providers_by_id: dict[Any, dict[str, Any]] = {}
         for option in self._split_specialization_options(specialization):
             response = (
-                supabase.table("Doctors")
+                supabase.table("doctors")
                 .select("*")
-                .ilike("Specialization", f"%{option}%")
+                .ilike("specialization", f"%{option}%")
                 .execute()
             )
             for provider in response.data or []:
+                provider_specialization = str(provider.get("specialization", ""))
+                if not self._specialization_matches(provider_specialization, option):
+                    continue
                 providers_by_id[provider.get("id")] = provider
-        return list(providers_by_id.values())
+        return [self._normalize_doctor_record(provider) for provider in providers_by_id.values()]
 
     def _pick_question_flow_path(self, symptom: str, specialization: str) -> Path:
-        lowered = f"{symptom} {specialization}".lower()
-        if "stomach" in lowered or "gastro" in lowered or "abdominal" in lowered:
-            return self.domain.question_flow_dir / "stomach_pain.md"
-        if "head" in lowered or "neuro" in lowered or "dizziness" in lowered:
-            return self.domain.question_flow_dir / "headache.md"
-        if "cough" in lowered or "ent" in lowered or "cold" in lowered:
-            return self.domain.question_flow_dir / "cough.md"
-        return self.domain.question_flow_dir / "fever.md"
+        normalized = self._normalize_text(f"{symptom} {specialization}")
+        token_set = set(self._extract_words(f"{symptom} {specialization}"))
+        approved_key = None
+        for key in APPROVED_TRIAGE_FLOW_BY_KEY:
+            if self._contains_term(normalized, token_set, key):
+                approved_key = key
+                break
+        if approved_key:
+            return self.domain.question_flow_dir / APPROVED_TRIAGE_FLOW_BY_KEY[approved_key]
+        return self.domain.question_flow_dir / GENERAL_TRIAGE_FLOW
 
     @staticmethod
     def _parse_question_flow(path: Path) -> dict[str, list[str]]:
@@ -605,18 +830,22 @@ class CustomerServiceTools:
             return now + timedelta(days=1)
         if lowered == "day after tomorrow":
             return now + timedelta(days=2)
+        if lowered in WEEKDAY_ALIASES:
+            target_day = WEEKDAY_ALIASES[lowered]
+            delta = (WEEKDAY_ORDER.index(target_day) - now.weekday()) % 7
+            return now + timedelta(days=delta)
         for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%d/%m/%Y"):
             try:
                 parsed = datetime.strptime(raw_value, fmt)
                 return parsed.replace(tzinfo=PKT)
             except ValueError:
                 continue
-        return now
+        raise ValueError("Date must be today, tomorrow, a weekday, or look like 2026-04-06.")
 
     @staticmethod
     def _parse_time(raw_value: str):
         cleaned = raw_value.strip().lower()
-        for fmt in ("%H:%M", "%I:%M %p", "%I:%M%p", "%I %p"):
+        for fmt in ("%H:%M", "%I:%M %p", "%I:%M%p", "%I %p", "%I%p"):
             try:
                 return datetime.strptime(cleaned.upper(), fmt).time()
             except ValueError:
@@ -684,6 +913,21 @@ class CustomerServiceTools:
         options = re.split(r"/|\bor\b", specialization, flags=re.IGNORECASE)
         return [option.strip() for option in options if option.strip()]
 
+    def get_supported_specializations(self) -> list[str]:
+        if not supabase:
+            return list(SUPPORTED_SPECIALIZATIONS_FALLBACK)
+
+        try:
+            response = supabase.table("doctors").select("specialization").execute()
+        except Exception:
+            return list(SUPPORTED_SPECIALIZATIONS_FALLBACK)
+
+        raw_values = [str(row.get("specialization", "")).strip() for row in (response.data or [])]
+        discovered = {value for value in raw_values if value}
+        ordered = [item for item in SUPPORTED_SPECIALIZATIONS_FALLBACK if item in discovered]
+        extras = sorted(discovered - set(ordered))
+        return ordered + extras if ordered or extras else list(SUPPORTED_SPECIALIZATIONS_FALLBACK)
+
     @staticmethod
     def _format_db_time(raw_value: str) -> str:
         if not raw_value:
@@ -692,6 +936,172 @@ class CustomerServiceTools:
             return datetime.strptime(raw_value, "%H:%M:%S").strftime("%H:%M")
         except ValueError:
             return raw_value
+
+    @staticmethod
+    def _normalize_doctor_record(provider: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(provider)
+        if "name" in provider and "Name" not in normalized:
+            normalized["Name"] = provider["name"]
+        if "Name" in provider and "name" not in normalized:
+            normalized["name"] = provider["Name"]
+        if "specialization" in provider and "Specialization" not in normalized:
+            normalized["Specialization"] = provider["specialization"]
+        if "Specialization" in provider and "specialization" not in normalized:
+            normalized["specialization"] = provider["Specialization"]
+        if "experience_years" in provider:
+            normalized["Experience"] = f"{provider['experience_years']} years"
+            normalized["experience_years"] = provider["experience_years"]
+        elif "Experience" in provider and "experience_years" not in normalized:
+            try:
+                normalized["experience_years"] = int("".join(WORD_RE.findall(str(provider["Experience"]))))
+            except Exception:
+                normalized["experience_years"] = None
+        if "consultation_fee" in provider and "consultation_fee" not in normalized:
+            normalized["consultation_fee"] = provider["consultation_fee"]
+        return normalized
+
+    @staticmethod
+    def _specialization_is_supported(specialization: str, supported_specializations: list[str]) -> bool:
+        if not specialization:
+            return True
+        supported = {item.lower() for item in supported_specializations}
+        for option in CustomerServiceTools._split_specialization_options(specialization):
+            if option.lower() in supported:
+                return True
+        return False
+
+    @staticmethod
+    def _slot_starts_at(slot: dict[str, Any], target_time: datetime.time) -> bool:
+        slot_start = datetime.fromisoformat(str(slot["start_time"])).timetz().replace(tzinfo=None)
+        return slot_start == target_time
+
+    @staticmethod
+    def _format_slot_start(slot: dict[str, Any]) -> str:
+        return datetime.fromisoformat(str(slot["start_time"])).strftime("%H:%M")
+
+    @staticmethod
+    def _is_blocking_slot(slot: dict[str, Any], active_appointment_slot_ids: set[int]) -> bool:
+        status = str(slot.get("status", "")).strip().lower()
+        if slot.get("id") in active_appointment_slot_ids:
+            return True
+        return status in {"booked", "confirmed", "held"}
+
+    @staticmethod
+    def _slot_overlaps(
+        slot_start: datetime,
+        slot_end: datetime,
+        blocked_start: datetime,
+        blocked_end: datetime,
+    ) -> bool:
+        return slot_start < blocked_end and blocked_start < slot_end
+
+    def _get_schedule_rows(self, doctor_id: int, weekday: int) -> list[dict[str, Any]]:
+        if not supabase:
+            return []
+        response = (
+            supabase.table("doctor_availability")
+            .select("*")
+            .eq("doctor_id", doctor_id)
+            .eq("day_of_week", weekday)
+            .execute()
+        )
+        return sorted(
+            list(response.data or []),
+            key=lambda row: (
+                str(row.get("start_time", "")),
+                str(row.get("end_time", "")),
+            ),
+        )
+
+    def _build_bookable_slots(
+        self,
+        *,
+        doctor_id: int,
+        target_date: datetime,
+        schedule_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not supabase:
+            return []
+
+        day_start = datetime.combine(target_date.date(), datetime.min.time()).replace(tzinfo=PKT)
+        day_end = day_start + timedelta(days=1)
+        slot_response = (
+            supabase.table("slots")
+            .select("*")
+            .eq("doctor_id", doctor_id)
+            .gte("start_time", day_start.isoformat())
+            .lt("start_time", day_end.isoformat())
+            .execute()
+        )
+        appointment_response = (
+            supabase.table("appointments")
+            .select("slot_id, status")
+            .eq("doctor_id", doctor_id)
+            .execute()
+        )
+        active_appointment_slot_ids = {
+            int(item["slot_id"])
+            for item in (appointment_response.data or [])
+            if item.get("slot_id") is not None
+            and str(item.get("status", "")).strip().lower() not in {"cancelled", "canceled", "no_show"}
+        }
+
+        blocked_windows = []
+        for slot in slot_response.data or []:
+            if not self._is_blocking_slot(slot, active_appointment_slot_ids):
+                continue
+            blocked_windows.append(
+                (
+                    datetime.fromisoformat(str(slot["start_time"])),
+                    datetime.fromisoformat(str(slot["end_time"])),
+                )
+            )
+
+        bookable_slots: list[dict[str, Any]] = []
+        for schedule_row in schedule_rows:
+            duration_minutes = int(schedule_row.get("slot_duration_minutes") or 15)
+            start_time = datetime.strptime(str(schedule_row["start_time"]), "%H:%M:%S").time()
+            end_time = datetime.strptime(str(schedule_row["end_time"]), "%H:%M:%S").time()
+            slot_start = datetime.combine(target_date.date(), start_time).replace(tzinfo=PKT)
+            schedule_end = datetime.combine(target_date.date(), end_time).replace(tzinfo=PKT)
+
+            while slot_start + timedelta(minutes=duration_minutes) <= schedule_end:
+                slot_end = slot_start + timedelta(minutes=duration_minutes)
+                if any(
+                    self._slot_overlaps(slot_start, slot_end, blocked_start, blocked_end)
+                    for blocked_start, blocked_end in blocked_windows
+                ):
+                    slot_start = slot_end
+                    continue
+
+                bookable_slots.append(
+                    {
+                        "doctor_id": doctor_id,
+                        "start_time": slot_start.isoformat(),
+                        "end_time": slot_end.isoformat(),
+                        "slot_duration_minutes": duration_minutes,
+                        "source_schedule_id": schedule_row.get("id"),
+                        "status": "available",
+                    }
+                )
+                slot_start = slot_end
+
+        return bookable_slots
+
+    @staticmethod
+    def _day_of_week_from_date(value: datetime) -> int:
+        # In the schema, 0=Sunday
+        return (value.weekday() + 1) % 7
+
+    @staticmethod
+    def _day_of_week_name(value: int | None) -> str:
+        if value is None:
+            return ""
+        try:
+            names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+            return names[int(value) % 7]
+        except Exception:
+            return str(value)
 
     @staticmethod
     def _pick_best_name_match(query: str, doctors: list[dict[str, Any]]) -> dict[str, Any]:
@@ -705,3 +1115,47 @@ class CustomerServiceTools:
                 best_score = score
                 best_doctor = doctor
         return best_doctor
+
+    @staticmethod
+    def _apply_query_filter(query: Any, column: str, op: str, value: Any) -> Any:
+        if op == "eq":
+            return query.eq(column, value)
+        if op == "neq":
+            return query.neq(column, value)
+        if op == "ilike":
+            return query.ilike(column, value)
+        if op == "like":
+            return query.like(column, value)
+        if op == "gte":
+            return query.gte(column, value)
+        if op == "lte":
+            return query.lte(column, value)
+        if op == "gt":
+            return query.gt(column, value)
+        if op == "lt":
+            return query.lt(column, value)
+        if op == "in":
+            values = value if isinstance(value, list) else [value]
+            return query.in_(column, values)
+        raise ValueError(f"Unsupported filter op: {op}")
+
+    @staticmethod
+    def _specialization_matches(provider_specialization: str, requested_option: str) -> bool:
+        provider_tokens = WORD_RE.findall(provider_specialization.lower())
+        requested_tokens = WORD_RE.findall(requested_option.lower())
+        if not provider_tokens or not requested_tokens:
+            return False
+
+        provider_text = " ".join(provider_tokens)
+        if len(requested_tokens) == 1:
+            return requested_tokens[0] in set(provider_tokens)
+        return " ".join(requested_tokens) in provider_text
+
+    @staticmethod
+    def _contains_term(normalized_text: str, token_set: set[str], term: str) -> bool:
+        term_tokens = WORD_RE.findall(term.lower())
+        if not term_tokens:
+            return False
+        if len(term_tokens) == 1:
+            return term_tokens[0] in token_set
+        return " ".join(term_tokens) in normalized_text

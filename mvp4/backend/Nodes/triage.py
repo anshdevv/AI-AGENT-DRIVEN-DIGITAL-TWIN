@@ -23,7 +23,7 @@ class MedicalTriage:
         
         # 2. STATE RETRIEVAL: These come from bk_apt.py (Booking Node)
         patient_data = state.get("patient_data", {})
-        patient_name = patient_data.get("Name", "Unknown")
+        patient_name = patient_data.get("name", "Unknown")
         patient_id = state.get("patient_id") # If None, we can't check DB history
         
         # Current Q&A for *this* session
@@ -36,18 +36,19 @@ class MedicalTriage:
                 # Query Supabase: Get notes from previous appointments
                 # filtering out empty notes
                 res = (supabase.table("appointments")
-                       .select("appointment_date, notes, Doctor:Doctors(Name, Specialization)")
+                       .select("notes, doctor_id, created_at")
                        .eq("patient_id", patient_id)
-                       .neq("notes", "null") # filtered where notes exist
-                       .order("appointment_date", desc=True)
-                       .limit(5) # context window limit
+                       .neq("notes", None)
+                       .order("created_at", desc=True)
+                       .limit(5)
                        .execute())
                 
                 if res.data:
                     lines = []
                     for appt in res.data:
-                        date = appt.get("appointment_date", "Unknown Date")
-                        doc = appt.get("Doctor", {}).get("Name", "Unknown Doc")
+                        created_at = appt.get("created_at")
+                        date = created_at.split("T")[0] if isinstance(created_at, str) else "Unknown Date"
+                        doc = f"Doctor {appt.get('doctor_id', 'Unknown')}"
                         notes = appt.get("notes", "No notes")
                         if notes:
                             lines.append(f"- [{date}] Saw Dr. {doc}: {notes}")

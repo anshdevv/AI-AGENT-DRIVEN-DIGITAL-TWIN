@@ -58,9 +58,9 @@ class RecommendDoctor:
         try:
             if doctor_name:
                 # Scenario A: User asked for a specific doctor
-                res = (supabase.table("Doctors")
+                res = (supabase.table("doctors")
                        .select("*")
-                       .ilike("Name", f"%{doctor_name}%")
+                       .ilike("name", f"%{doctor_name}%")
                        .execute())
                 candidate_doctors = res.data
                 if not candidate_doctors:
@@ -69,9 +69,9 @@ class RecommendDoctor:
 
             elif specialization:
                 # Scenario B: User has symptoms/specialization
-                res = (supabase.table("Doctors")
+                res = (supabase.table("doctors")
                        .select("*")
-                       .ilike("Specialization", f"%{specialization}%")
+                       .ilike("specialization", f"%{specialization}%")
                        .execute())
                 candidate_doctors = res.data
                 if not candidate_doctors:
@@ -83,15 +83,8 @@ class RecommendDoctor:
                 state["response"] = "Please specify a doctor name or describe your symptoms."
                 return state
 
-            # --- 5. FILTER BY AVAILABILITY ---
-            # Helper function for days like "mon-wed"
-            day_order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-            def is_day_in_range(day_range, target):
-                parts = [p.strip().lower() for p in day_range.split('-')]
-                if len(parts) == 1: return parts[0] == target
-                start, end = parts
-                s, e, t = day_order.index(start), day_order.index(end), day_order.index(target)
-                return s <= t <= e if s <= e else (t >= s or t <= e)
+            day_map = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+            day_int = day_map.get(weekday)
 
             # Parse user time if provided
             user_time_obj = None
@@ -109,24 +102,20 @@ class RecommendDoctor:
                 slots = (supabase.table("doctor_availability")
                          .select("*")
                          .eq("doctor_id", doc["id"])
-                         .execute()).data
+                         .execute()).data or []
                 
                 doc_is_free = False
                 valid_slot_str = ""
 
                 for slot in slots:
-                    days_text = slot["days"].strip().lower()
-                    
-                    # Check Day
-                    if not is_day_in_range(days_text, weekday):
+                    if slot.get("day_of_week") != day_int:
                         continue
 
-                    # Check Time (if user provided one)
                     start_t = datetime.strptime(slot["start_time"], "%H:%M:%S").time()
                     end_t = datetime.strptime(slot["end_time"], "%H:%M:%S").time()
                     
                     if user_time_obj:
-                        if start_t <= user_time_obj <= end_t:
+                        if start_t <= user_time_obj < end_t:
                             doc_is_free = True
                             valid_slot_str = f"{start_t.strftime('%H:%M')} - {end_t.strftime('%H:%M')}"
                             break
@@ -151,7 +140,7 @@ class RecommendDoctor:
             # Create the list
             list_text = ""
             for d in available_doctors:
-                list_text += f"- Dr. {d['Name']} ({d.get('Experience', 0)} yrs exp) | Time: {d['display_slot']} | Days:{d['days']}\n"
+                list_text += f"- Dr. {d['name']} ({d.get('experience_years', 0)} yrs exp) | Time: {d['display_slot']} | Day: {weekday}\n"
 
             header = intro_text if intro_text else f"Here are the doctors available for {date_source} ({weekday}):"
             

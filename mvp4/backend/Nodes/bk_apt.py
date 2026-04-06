@@ -43,7 +43,7 @@ class BookAppointment:
             
             # DB Lookup
             print("\nLooking up phone in DB:", phone)
-            res = supabase.table("Patient").select("*").eq("phone", phone).execute()
+            res = supabase.table("patients").select("*").eq("phone", phone).execute()
             
             if res.data:
                 # User Found
@@ -76,12 +76,12 @@ class BookAppointment:
             patient_data["email"] = user_input
             
             new_user = {
-                "Name": patient_data["name"],
+                "name": patient_data["name"],
                 "phone": patient_data["phone"],
-               # "email": patient_data["email"]
+                "email": patient_data.get("email"),
             }
             try:
-                res = supabase.table("Patient").insert(new_user).execute()
+                res = supabase.table("patients").insert(new_user).execute()
                 if res.data:
                     state["patient_id"] = res.data[0]["id"]
                     step = "attempt_booking"
@@ -89,7 +89,7 @@ class BookAppointment:
                     state["response"] = "System error creating profile."
                     return state
             except Exception as e:
-                print("Error occured after getting email and inserting in Patient table")
+                print("Error occured after getting email and inserting in patients table")
                 state["response"] = f"Database Error: {str(e)}"
                 return state
 
@@ -150,7 +150,7 @@ class BookAppointment:
             
             # Case A: Doctor Name provided
             if doctor_name:
-                res = supabase.table("Doctors").select("id, Name, Specialization").ilike("Name", f"%{doctor_name}%").execute()
+                res = supabase.table("doctors").select("id, name, specialization").ilike("name", f"%{doctor_name}%").execute()
                 candidate_doctors = res.data
                 if not candidate_doctors:
                     state["response"] = f"Doctor '{doctor_name}' not found."
@@ -158,7 +158,7 @@ class BookAppointment:
             
             # Case B: Specialization provided
             elif specialization:
-                res = supabase.table("Doctors").select("id, Name, Specialization").ilike("Specialization", f"%{specialization}%").execute()
+                res = supabase.table("doctors").select("id, name, specialization").ilike("specialization", f"%{specialization}%").execute()
                 candidate_doctors = res.data
                 if not candidate_doctors:
                     state["response"] = f"No doctors found for {specialization}."
@@ -168,53 +168,67 @@ class BookAppointment:
                  return state
 
             # --- AVAILABILITY CALCULATION (Your complex loop) ---
-            day_order = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-
-            def is_day_in_range(day_range, target):
-                parts = [p.strip().lower() for p in day_range.split('-')]
-                if len(parts) == 1: return parts[0] == target
-                start, end = parts
-                s, e, t = day_order.index(start), day_order.index(end), day_order.index(target)
-                return s <= t <= e if s <= e else (t >= s or t <= e)
-
+            day_map = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+            day_int = day_map.get(weekday, None)
             chosen_doctor = None
+            chosen_slot = None
             
             # Check slots for candidates
             for doc in candidate_doctors:
                 avail_res = supabase.table("doctor_availability").select("*").eq("doctor_id", doc["id"]).execute()
                 
-                for slot in avail_res.data:
-                    if not is_day_in_range(slot["days"], weekday):
+                for slot in avail_res.data or []:
+                    if slot.get("day_of_week") != day_int:
                         continue
                         
                     start_t = datetime.strptime(slot["start_time"], "%H:%M:%S").time()
                     end_t = datetime.strptime(slot["end_time"], "%H:%M:%S").time()
 
-                    if start_t <= user_time <= end_t:
+                    if start_t <= user_time < end_t:
                         chosen_doctor = doc
+                        chosen_slot = slot
                         break # Found a valid doctor/slot
                 
                 if chosen_doctor:
                     break # Stop looking at other doctors
 
-            if not chosen_doctor:
+            if not chosen_doctor or not chosen_slot:
                 state["response"] = f"Sorry, no doctors are available on {weekday} at {user_time_str}."
                 return state
 
             # --- FINAL BOOKING ---
+            duration_minutes = int(chosen_slot.get("slot_duration_minutes") or 15)
+            start_dt = datetime.strptime(f"{date} {user_time_str}", "%Y/%m/%d %H:%M")
+            end_dt = start_dt + timedelta(minutes=duration_minutes)
+            slot_payload = {
+                "doctor_id": chosen_doctor["id"],
+                "start_time": start_dt.isoformat(),
+                "end_time": end_dt.isoformat(),
+                "status": "booked",
+            }
+            slot_res = supabase.table("slots").insert(slot_payload).execute()
+            slot_id = slot_res.data[0]["id"] if slot_res.data else None
+            if not slot_id:
+                state["response"] = "Could not reserve a time slot for that appointment. Please try a different time."
+                return state
+
             appointment = {
                 "patient_id": patient_id,
-                "appointment_date": date,
-                "time": user_time_str,
                 "doctor_id": chosen_doctor["id"],
+                "slot_id": slot_id,
+                "status": "booked",
             }
-            
             try:
-                supabase.table("appointments").insert(appointment).execute()
+                appointment_res = supabase.table("appointments").insert(appointment).execute()
+                appointment_id = appointment_res.data[0]["id"] if appointment_res.data else None
+                if appointment_id:
+                    supabase.table("appointment_events").insert(
+                        {"appointment_id": appointment_id, "event_type": "created"}
+                    ).execute()
                 
                 state["response"] = (
                     f"✅ Appointment Confirmed!\n"
-                    f"Doctor: Dr. {chosen_doctor['Name']}\n"
+                    f"Doctor: Dr. {chosen_doctor['name']}\n"
                     f"Date: {date} ({weekday})\n"
                     f"Time: {user_time_str}\n\n"
                     "I just need to ask a few quick medical questions to prepare the doctor."
