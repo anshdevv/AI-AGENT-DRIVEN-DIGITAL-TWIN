@@ -1,0 +1,17 @@
+# --- Core API ---
+fastapi==0.110.0
+uvicorn==0.29.0
+pydantic==2.6.4
+python-dotenv==1.0.1
+
+# --- Database ---
+supabase==2.4.1
+
+# --- LangGraph & LLM Routing ---
+langchain==0.1.13
+langchain-openai==0.1.1  # We use this to connect to OpenRouter
+langgraph==0.1.17
+
+# --- Voice & Audio ---
+groq==0.4.2
+elevenlabs==1.0.0
