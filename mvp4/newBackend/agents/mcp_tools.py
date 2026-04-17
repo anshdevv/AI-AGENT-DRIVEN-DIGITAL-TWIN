@@ -148,12 +148,14 @@ class SymptomEvidence:
 
 def _parse_date(raw_value: str | None) -> datetime:
     now = datetime.now(PKT)
+    print(now)
     if not raw_value:
         return now
     lowered = raw_value.strip().lower()
     if lowered == "today":
         return now
     if lowered == "tomorrow":
+        print(now + timedelta(days=1))
         return now + timedelta(days=1)
     if lowered == "day after tomorrow":
         return now + timedelta(days=2)

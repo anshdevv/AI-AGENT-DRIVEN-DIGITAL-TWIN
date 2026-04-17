@@ -46,8 +46,8 @@ class Settings:
     groq_api_key: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY", "").strip())
     elevenlabs_api_key: str = field(default_factory=lambda: os.getenv("ELEVENLABS_API_KEY", os.getenv("ElevenLabs", "")).strip())
     
-    # Models
-    action_model: str = field(default_factory=lambda: os.getenv("ACTION_MODEL", "tngtech/deepseek-r1t2-chimera:free"))
+    # Models (UPDATED TO DEFAULT TO QWEN 14B)
+    action_model: str = field(default_factory=lambda: os.getenv("ACTION_MODEL", "Qwen/Qwen2.5-14B-Instruct"))
     
     # App Settings
     app_domain: str = field(default_factory=lambda: os.getenv("APP_DOMAIN", "healthcare").strip() or "healthcare")
