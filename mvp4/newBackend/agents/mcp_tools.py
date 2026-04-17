@@ -749,7 +749,8 @@ def find_provider_availability(
     print(f"🛠️ [Tool] find_provider_availability: spec={specialization}, doctor={doctor_name}, date={date}, time={time}")
     if not supabase:
         return "Database not connected."
-
+    print(doctor_name, specialization)
+    
     # Resolve providers
     if doctor_name:
         response = supabase.table("doctors").select("*").ilike("name", f"%{doctor_name}%").execute()
