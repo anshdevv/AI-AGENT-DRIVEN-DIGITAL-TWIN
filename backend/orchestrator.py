@@ -1803,6 +1803,7 @@ class CustomerServiceOrchestrator:
         self.knowledge_base = KnowledgeBase(self.domain)
         self.tools = CustomerServiceTools(self.domain, self.knowledge_base)
         self.director = MedicalConversationDirector(self.tools, self.domain, self.knowledge_base)
+        self.session_cache: dict[str, dict[str, Any]] = {}
         checkpointer = InMemorySaver() if InMemorySaver is not None else None
         self.graph = create_conversation_graph(self.director, checkpointer=checkpointer)
 
@@ -1825,6 +1826,7 @@ class CustomerServiceOrchestrator:
             },
             config={"configurable": {"thread_id": session_id}},
         )
+        self.session_cache[session_id] = dict(result_state or {})
         session_state = self._to_session_state(session_id, result_state)
         return OrchestratorResult(
             session_id=session_id,
@@ -1834,6 +1836,15 @@ class CustomerServiceOrchestrator:
             state=session_state,
             metadata=dict(result_state.get("metadata", {}) or {}),
         )
+
+    def get_session_state(self, session_id: str) -> dict[str, Any]:
+        try:
+            snapshot = self.graph.get_state({"configurable": {"thread_id": session_id}})
+            if isinstance(snapshot.values, dict) and snapshot.values:
+                return dict(snapshot.values)
+        except Exception:
+            pass
+        return dict(self.session_cache.get(session_id, {}))
 
     @staticmethod
     def _to_session_state(session_id: str, state: ConversationState) -> SessionState:

@@ -1,9 +1,22 @@
 # agents/triage_agent.py
+import os
+import sys
 import spacy
+from pathlib import Path
 from typing import Any, Dict
 from langchain_core.messages import SystemMessage, AIMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-from agents.llm_config import get_llm
+# Ensure workspace root is importable
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
+
+try:
+    from backend.settings import settings
+except ModuleNotFoundError:
+    from config import settings
+
 from rag.engine import MedicalRAG
 
 # Load NER model
@@ -63,13 +76,12 @@ def execute_triage_step(state: Dict[str, Any]) -> Dict[str, Any]:
     search_terms = [symptom] + extracted_entities
     rag_context = rag_db.retrieve(search_terms)
 
-    # 4. LLM Evaluation
-# In agents/triage_agent.py (inside execute_triage_step)
-    
-    # 4. LLM Evaluation
-    llm = get_llm(
-        temperature=0.1, 
-        custom_model="hjogidasani/medical-triage-llama-3.1-8b"
+    # 4. LLM Evaluation using Google AI Studio with MedGemma
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.0-flash",
+        api_key=settings.google_api_key,
+        temperature=0.1,
+        top_p=0.9,
     )
     
     sys_prompt = SystemMessage(content=f"""

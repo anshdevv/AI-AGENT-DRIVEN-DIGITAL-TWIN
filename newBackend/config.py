@@ -44,6 +44,7 @@ class Settings:
     # LLMs & AI APIs
     huggingface_api_key: str = field(default_factory=lambda: os.getenv("HUGGINGFACE_API_KEY", "").strip())
     groq_api_key: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY", "").strip())
+    google_api_key: str = field(default_factory=lambda: os.getenv("GOOGLE_API_KEY", "").strip())
     elevenlabs_api_key: str = field(default_factory=lambda: os.getenv("ELEVENLABS_API_KEY", os.getenv("ElevenLabs", "")).strip())
     
     # Models

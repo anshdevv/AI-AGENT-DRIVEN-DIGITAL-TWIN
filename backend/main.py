@@ -14,11 +14,13 @@ if __package__ in (None, ""):
     if str(workspace_root) not in sys.path:
         sys.path.insert(0, str(workspace_root))
 
+    from backend.dashboard import get_session_dashboard
     from backend.mcp_server import router as mcp_router
     from backend.orchestrator import orchestrator
     from backend.settings import settings
     from backend.voice_service import voice_service
 else:
+    from .dashboard import get_session_dashboard
     from .mcp_server import router as mcp_router
     from .orchestrator import orchestrator
     from .settings import settings
@@ -61,6 +63,11 @@ def health() -> dict:
     }
 
 
+@app.get("/dashboard/{session_id}")
+def dashboard(session_id: str) -> dict:
+    return get_session_dashboard(orchestrator, session_id)
+
+
 @app.post("/chat")
 def chat(request: ChatRequest) -> dict:
     session_id = request.session_id or str(uuid.uuid4())
@@ -91,6 +98,7 @@ async def voice_message(request: VoiceRequest) -> dict:
         "reply": result.reply,
         "intent": result.intent,
         "action": result.action,
+        "metadata": result.metadata,
         "audio_base64": audio_reply,
     }
 
@@ -132,6 +140,7 @@ async def call_socket(websocket: WebSocket, session_id: str) -> None:
                     "text": result.reply,
                     "intent": result.intent,
                     "action": result.action,
+                    "metadata": result.metadata,
                     "audio_base64": audio_reply,
                 }
             )
