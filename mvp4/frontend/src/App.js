@@ -37,7 +37,7 @@ function blobToBase64(blob) {
 
 function speakResponse(text, audioBase64) {
   if (audioBase64) {
-    const audio = new Audio(`data:audio/wav;base64,${audioBase64}`);
+    const audio = new Audio(`data:audio/mp3;base64,${audioBase64}`);
     audio.play().catch(() => {});
     return;
   }
@@ -220,7 +220,16 @@ function App() {
       setCallActive(true);
       setCallStatus("Live call connected");
       appendMessage("bot", "Live call connected. Start speaking when you're ready.", "call");
-      startCallRecognition();
+      const introAudio = new Audio("/intro.mp3");
+      introAudio.play().then(() => {
+          // PRO TIP: Wait for the intro to finish playing before turning on the microphone!
+          introAudio.onended = () => {
+              startCallRecognition();
+          };
+          }).catch((error) => {
+          console.log("Browser blocked auto-play, starting mic anyway.", error);
+          startCallRecognition(); // Fallback if audio fails
+      });
     };
 
     socket.onmessage = (event) => {

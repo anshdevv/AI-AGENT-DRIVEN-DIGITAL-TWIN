@@ -1291,6 +1291,29 @@ User:
 
     def finalize_turn(self, state: ConversationState) -> dict[str, Any]:
         reply = str(state.get("reply") or self.domain.fallback).strip()
+        current_message = str(state.get("current_message", "")).strip()
+
+        # --- NEW BILINGUAL AUTO-TRANSLATOR ---
+        # If the user spoke Urdu, translate the hardcoded English reply into Urdu!
+        if llm.enabled and current_message and reply:
+            translated_reply = llm.complete(
+                f"""
+                You are a translation assistant for a hospital concierge.
+                The system wants to say: "{reply}"
+                The user just asked: "{current_message}"
+                
+                If the user is speaking Urdu or Roman Urdu, translate the system's message into native Urdu script. 
+                If the user is speaking English, leave the system's message exactly as it is in English.
+                Return ONLY the final text, no quotes or extra commentary.
+                """,
+                model=settings.action_model,
+                temperature=0.1,
+                max_tokens=250,
+            )
+            if translated_reply:
+                reply = translated_reply
+        # ---------------------------------------
+
         return {
             "history": [
                 {

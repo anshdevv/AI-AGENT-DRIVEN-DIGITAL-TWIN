@@ -2,23 +2,35 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+
+# 1. Get the absolute path to the directory where settings.py lives (the backend folder)
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / ".env"
+
+print("\n" + "="*50)
+print("🔍 SETTINGS DEBUG START")
+print(f"📍 Current Working Dir: {os.getcwd()}")
+print(f"📄 Looking for .env at: {ENV_PATH}")
+print(f"❓ Does .env exist?:    {ENV_PATH.exists()}")
 
 try:
     from dotenv import load_dotenv
-except Exception:  # pragma: no cover - optional runtime dependency
-    def load_dotenv() -> None:
+    print("📦 python-dotenv:       Installed successfully.")
+    # 2. Force it to load from the exact path we found above
+    load_dotenv(dotenv_path=ENV_PATH)
+    print("✅ load_dotenv():       Executed.")
+except ImportError:  # Changed to ImportError to be more specific
+    print("❌ python-dotenv:       NOT INSTALLED! Run: pip install python-dotenv")
+    def load_dotenv(**kwargs) -> None:
         return None
-
-
-load_dotenv()
-
+    load_dotenv()
 
 def _split_csv(raw_value: str | None, default: list[str]) -> list[str]:
     if not raw_value:
         return default
     values = [item.strip() for item in raw_value.split(",")]
     return [item for item in values if item]
-
 
 @dataclass(slots=True)
 class Settings:
@@ -56,5 +68,11 @@ class Settings:
     def has_groq(self) -> bool:
         return bool(self.groq_api_key)
 
-
 settings = Settings()
+
+print("-" * 50)
+print(f"🔑 Supabase URL loaded? {bool(settings.supabase_url)}")
+print(f"🔑 Supabase Key loaded? {bool(settings.supabase_key)}")
+print(f"🔑 Google Key loaded?   {bool(settings.google_api_key)}")
+print(f"🛠️  has_supabase:        {settings.has_supabase}")
+print("=" * 50 + "\n")
