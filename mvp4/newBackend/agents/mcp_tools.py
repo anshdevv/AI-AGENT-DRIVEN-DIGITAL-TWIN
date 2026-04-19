@@ -538,6 +538,9 @@ def _parse_question_flow(path: Path) -> dict[str, list[str]]:
 # LANGCHAIN TOOLS — @tool decorated, all using the helpers above
 # =====================================================================
 
+# Make sure to import this at the top of mcp_tools.py if it's not there!
+from langchain_community.chat_models import ChatOllama
+
 @tool
 def recommend_specialist_tool(symptom: str) -> str:
     """
@@ -551,8 +554,9 @@ def recommend_specialist_tool(symptom: str) -> str:
     supported_specializations = _get_supported_specializations()
 
     try:
-        # Strict temperature 0 for deterministic, safe routing
-        llm = get_llm(temperature=0.0)
+        # 🧠 USE LOCAL MEDGEMMA INSTEAD OF THE MAIN API
+        llm = ChatOllama(model="medgemma:4b", temperature=0.0)
+        
         sys_prompt = SystemMessage(content=f"""
         You are a medical routing assistant for a hospital.
         Map the patient's symptom to the correct department.
@@ -568,13 +572,12 @@ def recommend_specialist_tool(symptom: str) -> str:
         user_prompt = HumanMessage(content=f"Patient symptom: {symptom}")
         specialist = llm.invoke([sys_prompt, user_prompt]).content.strip()
         
-        print(f"   ↳ LLM matched '{symptom}' to: {specialist}")
+        print(f"   ↳ MedGemma matched '{symptom}' to: {specialist}")
         return f"Recommended specialist: {specialist}"
         
     except Exception as e:
-        print(f"   ↳ LLM error: {e}. Falling back to: General Physician")
+        print(f"   ↳ MedGemma error: {e}. Falling back to: General Physician")
         return "Recommended specialist: General Physician"
-
 
 @tool
 def search_knowledge(query: str) -> str:
@@ -724,7 +727,7 @@ def get_doctor_profile(doctor_name: str | None = None, doctor_id: int | None = N
     ]
 
     lines = [
-        f"Dr. {doctor.get('name')} | {doctor.get('specialization')}",
+        f"Dr. {doctor.get('name')} (ID: {doctor.get('id')}) | {doctor.get('specialization')}",
         f"Fee: {doctor.get('consultation_fee', 'N/A')} | Experience: {doctor.get('experience_years', 'N/A')} yrs",
         "Schedule:",
     ]
@@ -983,13 +986,48 @@ def save_case_notes(appointment_id: int, notes: str) -> str:
     except Exception as e:
         return f"Error saving notes: {e}"
 
+@tool
+def get_doctors_by_specialization(specialization: str) -> str:
+    """
+    Get a list of doctors based on their medical specialization (e.g., 'Cardiologist', 'Dermatologist').
+    Use this when a user asks "Who are your cardiologists?" or "Do you have a pediatrician?".
+    """
+    print(f"🛠️ [Tool] get_doctors_by_specialization: '{specialization}'")
+    if not supabase:
+        return "Database not connected."
 
+    # Fix the plural bug (e.g., "Cardiologists" -> "Cardiologist")
+    clean_spec = specialization.strip()
+    if clean_spec.lower().endswith('s'):
+        clean_spec = clean_spec[:-1]
+
+    try:
+        response = (
+            supabase.table("doctors")
+            .select("id, name, specialization, experience_years, consultation_fee")
+            .ilike("specialization", f"%{clean_spec}%")
+            .execute()
+        )
+        
+        doctors = response.data or []
+        if not doctors:
+            return f"No doctors found for specialization: {specialization}."
+
+        lines = [f"Doctors specializing in {specialization}:"]
+        for d in doctors:
+            lines.append(f"  - Dr. {d.get('name')} (ID: {d.get('id')}) | {d.get('experience_years', 'N/A')} yrs exp | Fee: Rs. {d.get('consultation_fee', 'N/A')}")
+        
+        return "\n".join(lines)
+        
+    except Exception as e:
+        return f"Database error while searching for doctors: {e}"
 # =====================================================================
 # TOOL LIST — import this in your orchestrator
 # =====================================================================
 
 ALL_TOOLS = [
     recommend_specialist_tool,
+    get_doctors_by_specialization, # <--- ADD IT HERE
     search_knowledge,
     list_database_tables,
     query_database_table,
