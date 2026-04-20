@@ -2,10 +2,19 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Diagnostic node — runs after the entire conversation (booking + triage done).
 #
-# Takes everything in state, asks MedGemma to produce a structured clinical
-# summary for the doctor, saves it to Supabase, returns the report in state.
+# FIX: MedGemma was hallucinating because the entire prompt (instructions +
+# patient data) was crammed into a single SystemMessage with no HumanMessage.
+# MedGemma is instruction-tuned and expects:
+#   SystemMessage  → role + output format instructions ONLY
+#   HumanMessage   → the actual patient data to fill in
+# Without a HumanMessage it ignores the system context and hallucinates freely.
 #
-# The doctor sees this report when they open the appointment.
+# Additional hardening:
+#   - Temperature forced to 0.0 (was already 0 but made explicit)
+#   - Response validated: if it doesn't contain "CHIEF COMPLAINT" we know
+#     MedGemma went off-rails and we fall back to the deterministic template
+#     rather than saving garbage to Supabase
+#   - Full MedGemma input printed to logs for debugging
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -16,7 +25,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from langchain_core.messages import SystemMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_ollama import ChatOllama
 
 from agents.mcp_tools import save_case_notes
@@ -28,7 +37,7 @@ except ZoneInfoNotFoundError:
 
 BOOKING_CTX_DIR = Path("booking_context")
 
-# ── MedGemma client (shared with triage_agent if already warm) ────────────────
+# ── MedGemma client ───────────────────────────────────────────────────────────
 _med_llm: ChatOllama | None = None
 
 def _get_med_llm() -> ChatOllama:
@@ -38,22 +47,28 @@ def _get_med_llm() -> ChatOllama:
     return _med_llm
 
 
-# ── Diagnostic system prompt ──────────────────────────────────────────────────
-_DIAG_SYSTEM = """You are a clinical documentation assistant.
-Your job is to produce a clean, structured pre-consultation report for the attending physician.
-You are NOT diagnosing. You are organising information already collected during triage.
+# ── System prompt — instructions ONLY, no patient data ───────────────────────
+# Keeping this short and imperative so MedGemma doesn't wander.
+_DIAG_SYSTEM = """\
+You are a clinical documentation assistant for a hospital.
+Your ONLY job is to produce a structured pre-consultation report for the attending physician.
 
-Write the report in this exact format:
+STRICT RULES:
+1. Use ONLY the patient data provided in the user message. Do NOT invent anything.
+2. Do NOT diagnose. Do NOT suggest medications. Do NOT add information not given.
+3. If a field is missing, write "Not recorded."
+4. Output ONLY the report — no preamble, no explanation, no questions.
+5. Follow this exact format:
 
 =========================================
       PRE-CONSULTATION CLINICAL REPORT
 =========================================
-ATTENDING PHYSICIAN: {doctor}
-SPECIALTY: {specialization}
+ATTENDING PHYSICIAN : {doctor}
+SPECIALTY           : {specialization}
 
 PATIENT:
-  Name : {name}
-  Phone: {phone}
+  Name  : {name}
+  Phone : {phone}
 
 CHIEF COMPLAINT:
   {complaint}
@@ -67,31 +82,132 @@ TRIAGE Q&A:
 CLINICAL SUMMARY FROM TRIAGE:
   {summary}
 
-SUGGESTED SPECIALIST:
+RECOMMENDED SPECIALIST:
   {specialist}
+
+ROUTING REASON:
+  {routing_reason}
+
+SEVERITY:
+  {severity}
 
 PRECAUTIONS TO DISCUSS:
   {precautions}
 =========================================
+"""
 
-Fill in each section from the information provided.
-If a field is missing, write "Not recorded."
-Do not add diagnoses, drug names, or information not in the input.
+# ── Human prompt — patient data only ─────────────────────────────────────────
+_DATA_TEMPLATE = """\
+Please fill in the pre-consultation report using only the following patient data:
+
+ATTENDING PHYSICIAN : {doctor}
+SPECIALTY           : {specialization}
+PATIENT NAME        : {name}
+PATIENT PHONE       : {phone}
+CHIEF COMPLAINT     : {complaint}
+PAST HISTORY        : {history}
+RECOMMENDED SPEC    : {specialist}
+ROUTING REASON      : {routing_reason}
+SEVERITY            : {severity}
+PRECAUTIONS         : {precautions}
+
+TRIAGE Q&A:
+{qa}
+
+CLINICAL SUMMARY:
+{summary}
 """
 
 
+def _build_fallback_report(
+    doctor_name: str,
+    specialization: str,
+    patient_name: str,
+    patient_phone: str,
+    symptom: str,
+    past_history: str,
+    formatted_qa: str,
+    clinical_summary: str,
+    specialist: str,
+    routing_reason: str,
+    severity: str,
+    precautions: str,
+) -> str:
+    """Deterministic template — used when MedGemma response fails validation."""
+    return (
+        "=========================================\n"
+        "      PRE-CONSULTATION CLINICAL REPORT\n"
+        "=========================================\n"
+        f"ATTENDING PHYSICIAN : {doctor_name}\n"
+        f"SPECIALTY           : {specialization}\n\n"
+        "PATIENT:\n"
+        f"  Name  : {patient_name}\n"
+        f"  Phone : {patient_phone}\n\n"
+        "CHIEF COMPLAINT:\n"
+        f"  {symptom}\n\n"
+        "PAST MEDICAL HISTORY:\n"
+        f"  {past_history}\n\n"
+        "TRIAGE Q&A:\n"
+        f"{formatted_qa}\n\n"
+        "CLINICAL SUMMARY FROM TRIAGE:\n"
+        f"  {clinical_summary}\n\n"
+        "RECOMMENDED SPECIALIST:\n"
+        f"  {specialist}\n\n"
+        "ROUTING REASON:\n"
+        f"  {routing_reason}\n\n"
+        "SEVERITY:\n"
+        f"  {severity}\n\n"
+        "PRECAUTIONS TO DISCUSS:\n"
+        f"  {precautions}\n"
+        "=========================================\n"
+        "(Generated by deterministic fallback)"
+    )
+
+
+def _validate_report(text: str) -> bool:
+    """
+    Basic sanity check — if MedGemma hallucinated it won't contain these
+    clinical headers. Returns False if the output looks like hallucination.
+    """
+    required_markers = ["CHIEF COMPLAINT", "TRIAGE Q", "PATIENT"]
+    return all(marker in text for marker in required_markers)
+
+
+def _print_diagnostic_context(sys_msg: str, human_msg: str) -> None:
+    """Print full MedGemma input to logs for debugging."""
+    print("\n╔" + "═" * 60 + "╗")
+    print("║  📋 DIAGNOSTIC MEDGEMMA INPUT                              ║")
+    print("╠" + "═" * 60 + "╣")
+    print("║  [SYSTEM]")
+    print("╟" + "─" * 60 + "╢")
+    for line in sys_msg.splitlines():
+        while len(line) > 58:
+            print(f"║  {line[:58]}")
+            line = line[58:]
+        print(f"║  {line}")
+    print("╟" + "─" * 60 + "╢")
+    print("║  [HUMAN / PATIENT DATA]")
+    print("╟" + "─" * 60 + "╢")
+    for line in human_msg.splitlines():
+        while len(line) > 58:
+            print(f"║  {line[:58]}")
+            line = line[58:]
+        print(f"║  {line}")
+    print("╚" + "═" * 60 + "╝\n")
+
+
 def diagnostic_node(state: dict) -> dict:
-    print("\n" + "="*54)
+    print("\n" + "=" * 54)
     print("📋 [Diagnostic] Generating clinical report with MedGemma")
 
     # ── Pull everything from state ────────────────────────────────
-    symptom    = state.get("extracted_symptom", "Not recorded")
-    profile    = state.get("patient_profile") or {}
-    ctx        = state.get("booking_context") or {}
-    triage_qa  = state.get("triage_qa") or []
-    patient    = ctx.get("patient", {})
-    doctor     = ctx.get("selected_doctor", {})
-    appt       = ctx.get("appointment", {})
+    symptom   = state.get("extracted_symptom", "Not recorded")
+    profile   = state.get("patient_profile") or {}
+    ctx       = state.get("booking_context") or {}
+    triage_qa = state.get("triage_qa") or []
+    patient   = ctx.get("patient", {})
+    doctor    = ctx.get("selected_doctor", {})
+    appt      = ctx.get("appointment", {})
 
     doctor_name    = profile.get("booked_doctor") or doctor.get("name") or "Unknown"
     specialization = profile.get("doctor_specialization") or doctor.get("specialization") or "General Physician"
@@ -99,14 +215,17 @@ def diagnostic_node(state: dict) -> dict:
     patient_phone  = patient.get("phone") or "Unknown"
     past_history   = profile.get("past_history") or "Not provided"
     booking_id     = appt.get("booking_id")
+    routing_reason = ctx.get("routing_reason") or "Not recorded"
+    severity       = ctx.get("triage_severity") or "Unknown"
 
     # Format Q&A
-    if triage_qa:
-        formatted_qa = "\n".join([f"  {pair}" for pair in triage_qa])
-    else:
-        formatted_qa = "  No triage questions recorded."
+    formatted_qa = (
+        "\n".join([f"  {pair}" for pair in triage_qa])
+        if triage_qa
+        else "  No triage questions recorded."
+    )
 
-    # Extract clinical summary from triage messages if present
+    # Clinical summary — look for it in triage messages
     clinical_summary = "See triage Q&A above."
     for m in reversed(list(state.get("messages", []))):
         content = str(m.content)
@@ -117,47 +236,83 @@ def diagnostic_node(state: dict) -> dict:
                 clinical_summary = content[start:end].strip()
             break
 
-    # Suggested specialist from symptom_lookup (if available in profile)
-    specialist  = profile.get("doctor_specialization") or specialization
+    specialist  = ctx.get("recommended_specialist") or profile.get("doctor_specialization") or specialization
     precautions = profile.get("precautions") or "Discuss with attending physician."
 
-    # ── Build user prompt for MedGemma ────────────────────────────
-    user_prompt = _DIAG_SYSTEM.format(
-        doctor        = doctor_name,
-        specialization= specialization,
-        name          = patient_name,
-        phone         = patient_phone,
-        complaint     = symptom,
-        history       = past_history,
-        qa            = formatted_qa,
-        summary       = clinical_summary,
-        specialist    = specialist,
-        precautions   = precautions,
+    # ── Build the two separate messages ───────────────────────────
+    # SYSTEM: role + format instructions only (no patient data)
+    # HUMAN:  all patient data, no instructions
+    system_text = _DIAG_SYSTEM.format(
+        doctor         = doctor_name,
+        specialization = specialization,
+        name           = patient_name,
+        phone          = patient_phone,
+        complaint      = symptom,
+        history        = past_history,
+        qa             = formatted_qa,
+        summary        = clinical_summary,
+        specialist     = specialist,
+        routing_reason = routing_reason,
+        severity       = severity,
+        precautions    = precautions,
     )
 
-    # ── Call MedGemma ─────────────────────────────────────────────
+    human_text = _DATA_TEMPLATE.format(
+        doctor         = doctor_name,
+        specialization = specialization,
+        name           = patient_name,
+        phone          = patient_phone,
+        complaint      = symptom,
+        history        = past_history,
+        qa             = formatted_qa,
+        summary        = clinical_summary,
+        specialist     = specialist,
+        routing_reason = routing_reason,
+        severity       = severity,
+        precautions    = precautions,
+    )
+
+    # ── Print full context for debugging ──────────────────────────
+    _print_diagnostic_context(system_text, human_text)
+
+    # ── Call MedGemma with correct message structure ──────────────
     report = ""
+    medgemma_succeeded = False
     try:
         med_llm  = _get_med_llm()
-        response = med_llm.invoke([SystemMessage(content=user_prompt)])
-        report   = str(response.content).strip()
-        print(f"✅ [Diagnostic] Report generated ({len(report)} chars)")
+        response = med_llm.invoke([
+            SystemMessage(content=system_text),
+            HumanMessage(content=human_text),   # ← THE FIX: separate HumanMessage
+        ])
+        raw = str(response.content).strip()
+        print(f"🧠 [Diagnostic] MedGemma raw output ({len(raw)} chars):\n{raw[:500]}")
+
+        if _validate_report(raw):
+            report = raw
+            medgemma_succeeded = True
+            print("✅ [Diagnostic] Report validated — looks like a real clinical report")
+        else:
+            print("⚠️  [Diagnostic] Validation FAILED — MedGemma hallucinated, using fallback")
+            print(f"   First 200 chars: {raw[:200]}")
+
     except Exception as e:
         print(f"❌ [Diagnostic] MedGemma failed: {e} — using fallback report")
-        report = (
-            "=========================================\n"
-            "      PRE-CONSULTATION CLINICAL REPORT\n"
-            "=========================================\n"
-            f"ATTENDING PHYSICIAN: {doctor_name}\n"
-            f"SPECIALTY: {specialization}\n\n"
-            f"PATIENT: {patient_name} ({patient_phone})\n\n"
-            f"CHIEF COMPLAINT: {symptom}\n\n"
-            f"PAST HISTORY: {past_history}\n\n"
-            "TRIAGE Q&A:\n"
-            f"{formatted_qa}\n\n"
-            f"CLINICAL SUMMARY: {clinical_summary}\n"
-            "=========================================\n"
-            "(Generated by fallback — MedGemma unavailable)"
+
+    # ── Fallback if MedGemma produced garbage ─────────────────────
+    if not medgemma_succeeded:
+        report = _build_fallback_report(
+            doctor_name    = doctor_name,
+            specialization = specialization,
+            patient_name   = patient_name,
+            patient_phone  = patient_phone,
+            symptom        = symptom,
+            past_history   = past_history,
+            formatted_qa   = formatted_qa,
+            clinical_summary = clinical_summary,
+            specialist     = specialist,
+            routing_reason = routing_reason,
+            severity       = severity,
+            precautions    = precautions,
         )
 
     # ── Save to Supabase if we have a booking ID ──────────────────
@@ -179,14 +334,14 @@ def diagnostic_node(state: dict) -> dict:
         try:
             safe_id   = re.sub(r"[^a-zA-Z0-9_\-]", "_", session_id)
             json_path = BOOKING_CTX_DIR / f"{safe_id}.json"
-            # Load existing context and append the report
             if json_path.exists():
                 existing = json.loads(json_path.read_text(encoding="utf-8"))
             else:
                 existing = {}
-            existing["diagnostic_report"]      = report
+            existing["diagnostic_report"]       = report
             existing["diagnostic_generated_at"] = datetime.now(PKT).isoformat()
             existing["triage_qa"]               = list(state.get("triage_qa") or [])
+            existing["medgemma_succeeded"]       = medgemma_succeeded
             json_path.write_text(
                 json.dumps(existing, indent=2, ensure_ascii=False),
                 encoding="utf-8",

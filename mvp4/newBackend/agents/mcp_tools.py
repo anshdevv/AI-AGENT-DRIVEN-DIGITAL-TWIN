@@ -1026,7 +1026,6 @@ def get_doctors_by_specialization(specialization: str) -> str:
 # =====================================================================
 
 ALL_TOOLS = [
-    recommend_specialist_tool,
     get_doctors_by_specialization, # <--- ADD IT HERE
     search_knowledge,
     list_database_tables,
