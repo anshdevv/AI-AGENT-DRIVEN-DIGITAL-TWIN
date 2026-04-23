@@ -26,7 +26,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langchain_ollama import ChatOllama
+from langchain_community.chat_models import ChatOllama
 
 from agents.mcp_tools import save_case_notes
 
