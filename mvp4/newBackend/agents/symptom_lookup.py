@@ -22,7 +22,7 @@ from typing import Optional
 # ── Path config — adjust if your CSVs live elsewhere ─────────────────────────
 _DATA_DIR = Path(__file__).parent.parent / "data"
 
-SYNAPSE_CSV       = _DATA_DIR / "SYNAPSE_An_Expert_Annotated_Dataset_of_Patient_symptoms_and_Demographics.csv"
+SYNAPSE_CSV       = _DATA_DIR / "Patient_symptoms.csv"
 DISEASE_SYM_CSV   = _DATA_DIR / "DiseaseAndSymptoms.csv"
 DISEASE_VEC_CSV   = _DATA_DIR / "Disease_and_symptoms_dataset.csv"
 PRECAUTION_CSV    = _DATA_DIR / "Disease_precaution.csv"

@@ -227,11 +227,20 @@ def _strip_all_system_tags(text: str) -> str:
     return cleaned.strip()
 
 
-def _rephrase_with_qwen(raw_text: str) -> str:
+def _rephrase_with_qwen(raw_text: str, patient_language: str = "en") -> str:
     # Always strip system tags from input before sending to Qwen
     clean_input = _strip_all_system_tags(raw_text)
     if not clean_input:
         return ""
+
+    is_urdu = patient_language in ("ur", "urdu")
+    language_instruction = (
+        "Reply in simple everyday Urdu (nastaliq script). "
+        "Use natural spoken words like: aap ko, kya, kab se, kitna, theek hai, batayein. "
+        "NOT formal/literary Urdu. NOT Roman Urdu. Actual Urdu script."
+        if is_urdu else
+        "Reply in plain conversational English."
+    )
 
     try:
         qwen = _get_qwen_llm()
@@ -239,11 +248,7 @@ def _rephrase_with_qwen(raw_text: str) -> str:
             SystemMessage(content=(
                 "You are a warm, friendly hospital receptionist.\n"
                 "Rephrase the given clinical question into natural easy language for the patient.\n\n"
-                "LANGUAGE:\n"
-                "- English conversation → plain conversational English\n"
-                "- Urdu or Roman Urdu → simple everyday Urdu that normal people speak. "
-                "NOT formal/literary Urdu. Use words like: aap ko, kya, kab se, kitna, "
-                "theek hai, batayein, kaafi, thoda. Avoid medical English jargon.\n\n"
+                f"LANGUAGE: {language_instruction}\n\n"
                 "RULES:\n"
                 "- ONE question only. One or two short sentences max.\n"
                 "- Sound like a human talking, not a form.\n"
@@ -499,7 +504,8 @@ def triage_node(state: dict) -> dict:
         )
 
     # ── STEP 2: Qwen — patient-facing rephrasing ───────────────────
-    polished = _rephrase_with_qwen(raw_text)
+    patient_language = ctx.get("patient_language", "en")
+    polished = _rephrase_with_qwen(raw_text, patient_language)
     print(f"💬 [Qwen→Patient] → {polished[:200]}")
 
     ctx["triage_questions_asked"] = questions_asked + 1
@@ -609,7 +615,8 @@ def _complete_triage(
             f"Ask if they would like to proceed with booking an appointment with a {final_doctor_type}."
         )
 
-    handoff = _rephrase_with_qwen(handoff_prompt)
+    patient_language = ctx.get("patient_language", "en")
+    handoff = _rephrase_with_qwen(handoff_prompt, patient_language)
 
     return {
         "triage_active":   False,

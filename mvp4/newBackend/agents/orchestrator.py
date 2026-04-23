@@ -718,6 +718,9 @@ DATE CONTEXT (Pakistan Standard Time):
   Today    : {today_str}
   Tomorrow : {tomorrow_str}
 
+PATIENT LANGUAGE: {ctx.get("patient_language", "en")}
+{"IMPORTANT: The patient speaks Urdu. You MUST reply in simple everyday Urdu (nastaliq script). NOT Roman Urdu, NOT English. Natural spoken Urdu only." if ctx.get("patient_language") in ("ur", "urdu") else "Reply in plain English."}
+
 {booking_directive}
 
 ABSOLUTE PROHIBITIONS:
