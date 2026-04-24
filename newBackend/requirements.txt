@@ -1,0 +1,34 @@
+# --- Core API & Server ---
+fastapi==0.110.0
+uvicorn==0.29.0
+pydantic>=2.7.4,<3.0.0
+python-dotenv==1.0.1
+websockets==12.0
+
+# --- Database ---
+supabase==2.4.1
+
+# # --- LangChain & LangGraph (The Brain) ---
+# langchain>=0.2.0,<0.3.0
+# langchain-core>=0.2.20,<0.3.0
+# langgraph>=0.1.4
+
+# # --- Local & Cloud LLM Integrations ---
+# langchain-ollama==0.1.0
+# langchain-huggingface>=0.0.3
+
+
+# --- LangChain & LangGraph ---
+langchain>=0.3.0
+langchain-core>=0.3.0
+langgraph>=0.2.0
+
+# --- Local & Cloud LLM Integrations ---
+# NOTE: ChatOllama is imported from langchain_community in this project.
+# Keeping langchain-ollama here can break env resolution with newer langchain-core.
+langchain-groq>=0.2.0
+langchain-huggingface>=0.1.0
+
+# --- Voice & Audio ---
+groq==0.4.2
+elevenlabs==1.0.0

@@ -1,0 +1,35 @@
+{
+  "session_id": "cf315a75-657c-4e74-be78-06f16ae091a3",
+  "created_at": "2026-04-24T16:38:41.198358+05:00",
+  "last_updated": "2026-04-24T16:38:41.198936+05:00",
+  "step": "collect_patient",
+  "prime_complaint": null,
+  "recommended_specialist": null,
+  "triage_completed": false,
+  "triage_questions_asked": 0,
+  "triage_qa": [],
+  "accumulated_symptoms": [],
+  "symptom_context_block": null,
+  "final_symptom_match": null,
+  "patient": {
+    "id": null,
+    "name": null,
+    "phone": null
+  },
+  "selected_doctor": {
+    "id": null,
+    "name": null,
+    "specialization": null
+  },
+  "pending_slot": {
+    "date": null,
+    "time": null
+  },
+  "appointment": {
+    "date": null,
+    "time": null,
+    "confirmed": false,
+    "booking_id": null
+  },
+  "patient_language": "en"
+}

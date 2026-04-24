@@ -1,0 +1,30 @@
+{
+  "session_id": "session_20260420_012157",
+  "created_at": "2026-04-20T01:21:57.346971+05:00",
+  "last_updated": "2026-04-20T01:22:01.367774+05:00",
+  "step": "collect_patient",
+  "prime_complaint": "Chest tightness, nausea, sweating",
+  "recommended_specialist": null,
+  "triage_completed": false,
+  "triage_questions_asked": 0,
+  "patient": {
+    "id": null,
+    "name": null,
+    "phone": null
+  },
+  "selected_doctor": {
+    "id": null,
+    "name": null,
+    "specialization": null
+  },
+  "pending_slot": {
+    "date": null,
+    "time": null
+  },
+  "appointment": {
+    "date": null,
+    "time": null,
+    "confirmed": false,
+    "booking_id": null
+  }
+}
