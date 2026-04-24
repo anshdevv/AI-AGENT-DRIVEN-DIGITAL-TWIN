@@ -2,6 +2,11 @@ import { startTransition, useEffect, useRef, useState } from "react";
 import "./index.css";
 
 const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:8000";
+const CALL_CHUNK_MS = 4000;
+const CALL_VAD_THRESHOLD = 1;
+const CALL_GATE_START_THRESHOLD = 18;
+const CALL_GATE_STOP_THRESHOLD = 15;
+const INTERRUPT_THRESHOLD = 18;
 
 function createSessionId() {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
@@ -27,9 +32,6 @@ function blobToBase64(blob) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// MicVisualiser — live volume bar drawn with AnalyserNode + canvas
-// ---------------------------------------------------------------------------
 function MicVisualiser({ stream }) {
   const canvasRef = useRef(null);
   const rafRef = useRef(null);
@@ -53,13 +55,11 @@ function MicVisualiser({ stream }) {
       const c = canvas.getContext("2d");
       c.clearRect(0, 0, canvas.width, canvas.height);
 
-      // Background track
       c.fillStyle = "rgba(83,59,45,0.10)";
       c.beginPath();
       c.roundRect(0, canvas.height / 2 - 4, canvas.width, 8, 4);
       c.fill();
 
-      // Filled portion
       const pct = Math.min(avg / 128, 1);
       const grad = c.createLinearGradient(0, 0, canvas.width, 0);
       grad.addColorStop(0, "#bf5c3f");
@@ -69,7 +69,6 @@ function MicVisualiser({ stream }) {
       c.roundRect(0, canvas.height / 2 - 4, canvas.width * pct, 8, 4);
       c.fill();
 
-      // Tip dot
       if (pct > 0.02) {
         c.beginPath();
         c.arc(canvas.width * pct, canvas.height / 2, 6, 0, Math.PI * 2);
@@ -96,10 +95,6 @@ function MicVisualiser({ stream }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// speakResponse — plays TTS audio and fires onStart/onEnd so the caller can
-// pause recognition while the bot is speaking (prevents TTS echo loop).
-// ---------------------------------------------------------------------------
 function speakResponse(text, audioBase64, { onStart, onEnd } = {}) {
   if (audioBase64) {
     const audio = new Audio(`data:audio/mp3;base64,${audioBase64}`);
@@ -121,9 +116,6 @@ function speakResponse(text, audioBase64, { onStart, onEnd } = {}) {
   window.speechSynthesis.speak(utterance);
 }
 
-// ---------------------------------------------------------------------------
-// App
-// ---------------------------------------------------------------------------
 function App() {
   const [sessionId] = useState(createSessionId);
   const [messages, setMessages] = useState([
@@ -141,32 +133,59 @@ function App() {
   const [callStatus, setCallStatus] = useState("Call is offline");
   const [callActive, setCallActive] = useState(false);
   const [callLogs, setCallLogs] = useState([]);
-
-  // Mic streams exposed to the visualiser
-  const [liveStream, setLiveStream] = useState(null);  // voice-note mode
-  const [callStream, setCallStream] = useState(null);  // call mode
+  const [liveStream, setLiveStream] = useState(null);
+  const [callStream, setCallStream] = useState(null);
 
   const scrollRef = useRef(null);
   const mediaRecorderRef = useRef(null);
   const recordedChunksRef = useRef([]);
   const voiceRecognitionRef = useRef(null);
-  const callRecognitionRef = useRef(null);
+
   const callSocketRef = useRef(null);
+  const callRecorderRef = useRef(null);
+  const callStreamRef = useRef(null);
+  const callAudioCtxRef = useRef(null);
   const callActiveRef = useRef(false);
-  const vadTimerRef = useRef(null);
-  const audioCtxRef = useRef(null);
-  const callStreamRef = useRef(null);   // ref mirror of callStream — safe to read inside callbacks
-  // True while bot audio / TTS is playing — recognition must be silenced
-  const isSpeakingRef = useRef(false);
-  const listenStartRef = useRef(null);  // timestamp when mic opened
+  const callAudioRef = useRef(null);
+  const botSpeakingRef = useRef(false);
+  const activeGenerationRef = useRef(0);
+  const lastInterruptSignalRef = useRef(0);
+  const pingTimerRef = useRef(null);
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading, voiceStatus, callStatus]);
 
+  useEffect(() => {
+    return () => {
+      callActiveRef.current = false;
+      try {
+        callSocketRef.current?.close();
+      } catch (_) {}
+      if (pingTimerRef.current) {
+        clearInterval(pingTimerRef.current);
+        pingTimerRef.current = null;
+      }
+      const recorder = callRecorderRef.current;
+      if (recorder && recorder.state !== "inactive") {
+        recorder.ondataavailable = null;
+        recorder.stop();
+      }
+      const stream = callStreamRef.current;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      try {
+        callAudioCtxRef.current?.close();
+      } catch (_) {}
+      try {
+        callAudioRef.current?.pause();
+      } catch (_) {}
+    };
+  }, []);
+
   function appendMessage(sender, text, channel) {
     startTransition(() => {
       setMessages((cur) => [
+  
         ...cur,
         { id: `${Date.now()}-${Math.random()}`, sender, text, channel },
       ]);
@@ -174,12 +193,15 @@ function App() {
   }
 
   function pushLog(msg) {
-    const ts = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-    setCallLogs((cur) => [...cur.slice(-49), `${ts}  ${msg}`]); // keep last 50
+    const ts = new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    setCallLogs((cur) => [...cur.slice(-49), `${ts}  ${msg}`]);
     console.log(`[Call] ${msg}`);
   }
 
-  // ── Chat ──────────────────────────────────────────────────────────────────
   async function sendChatMessage() {
     const text = input.trim();
     if (!text || loading) return;
@@ -201,7 +223,6 @@ function App() {
     }
   }
 
-  // ── Voice note ────────────────────────────────────────────────────────────
   async function startVoiceRecording() {
     if (!navigator.mediaDevices?.getUserMedia) {
       setVoiceStatus("Microphone access is not available in this browser.");
@@ -213,7 +234,7 @@ function App() {
       recordedChunksRef.current = [];
       const recorder = new MediaRecorder(stream);
       mediaRecorderRef.current = recorder;
-      setVoiceStatus("Recording — speak now");
+      setVoiceStatus("Recording - speak now");
 
       recorder.ondataavailable = (e) => {
         if (e.data.size > 0) recordedChunksRef.current.push(e.data);
@@ -232,8 +253,9 @@ function App() {
         voiceRecognitionRef.current = { engine: recognition, finalTranscript: "" };
         recognition.onresult = (e) => {
           const latest = e.results[e.results.length - 1];
-          if (latest?.isFinal)
+          if (latest?.isFinal) {
             voiceRecognitionRef.current.finalTranscript = latest[0].transcript.trim();
+          }
         };
         recognition.start();
       } else {
@@ -266,8 +288,7 @@ function App() {
         }),
       });
       const data = await res.json();
-      if (data.transcript && data.transcript !== transcriptHint)
-        appendMessage("user", data.transcript, "voice transcript");
+      if (data.transcript && data.transcript !== transcriptHint) appendMessage("user", data.transcript, "voice transcript");
       appendMessage("bot", data.reply, data.action || "voice");
       speakResponse(data.reply, data.audio_base64);
       setVoiceStatus("Voice note processed.");
@@ -279,17 +300,23 @@ function App() {
     }
   }
 
-  // ── Call ──────────────────────────────────────────────────────────────────
-  // When bot speaks we STOP the recorder entirely so no corrupt partial chunks
-  // accumulate. When bot finishes we restart it fresh with a clean container.
-  function pauseCallRecognition() {
-    isSpeakingRef.current = true;
-    if (listenStartRef.current) {
-      const secs = ((Date.now() - listenStartRef.current) / 1000).toFixed(1);
-      pushLog(`🔇 Mic closed — was listening for ${secs}s`);
-      listenStartRef.current = null;
-    } else {
-      pushLog("🔇 Mic closed — bot is speaking");
+  function notifyPlaybackDone(generationId) {
+    if (!generationId) return;
+    const socket = callSocketRef.current;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "assistant_playback_done", generation_id: generationId }));
+    }
+  }
+
+  function stopAssistantPlayback(reason = "") {
+    const current = callAudioRef.current;
+    if (current) {
+      try {
+        current.pause();
+      } catch (_) {}
+      current.onended = null;
+      current.onerror = null;
+      callAudioRef.current = null;
     }
     const recorder = callRecognitionRef.current;
     if (recorder && recorder.state === "recording") {
@@ -312,7 +339,7 @@ function App() {
   }
 
   function startCall() {
-    if (callActive) return;
+    if (callActiveRef.current) return;
 
     const socket = new WebSocket(`${API_BASE.replace("http", "ws")}/ws/call/${sessionId}`);
     callSocketRef.current = socket;
@@ -321,76 +348,99 @@ function App() {
       callActiveRef.current = true;
       setCallActive(true);
       setCallStatus("Live call connected");
-      setCallLogs([]);  // fresh log for new call
+      setCallLogs([]);
       appendMessage("bot", "Live call connected. Start speaking when you're ready.", "call");
-      pushLog("🔌 WebSocket connected");
+      pushLog("WebSocket connected");
+      if (pingTimerRef.current) clearInterval(pingTimerRef.current);
+      pingTimerRef.current = setInterval(() => {
+        if (callSocketRef.current?.readyState === WebSocket.OPEN) {
+          callSocketRef.current.send(JSON.stringify({ type: "ping" }));
+        }
+      }, 12000);
 
-      // Play intro then open mic
       const introAudio = new Audio("/intro.mp3");
-      introAudio.play()
-        .then(() => { introAudio.onended = startCallRecognitionWithStream; })
-        .catch(() => startCallRecognitionWithStream());
+      introAudio.play().then(() => {
+        introAudio.onended = startCallRecognitionWithStream;
+      }).catch(() => startCallRecognitionWithStream());
     };
 
     socket.onmessage = (event) => {
       const payload = JSON.parse(event.data);
+      if (payload.type === "call_ready") {
+        const mode = payload.pipeline === "pipecat" ? "Pipecat pipeline active" : "Live call active";
+        setCallStatus(mode);
+        pushLog(mode);
+      }
       if (payload.type === "user_transcript_echo") {
-        // Whisper heard this — show it as a user bubble
         appendMessage("user", payload.text, "call");
       }
       if (payload.type === "assistant_response") {
-        pushLog(`🤖 Bot responding — mic will pause`);
         appendMessage("bot", payload.text, payload.action || "call");
-        speakResponse(payload.text, payload.audio_base64, {
-          onStart: pauseCallRecognition,
-          onEnd: resumeCallRecognition,
-        });
+        pushLog("Assistant response received");
       }
-      if (payload.type === "call_ready") {
-        setCallStatus(
-          payload.server_stt
-            ? "Live call — server STT active"
-            : "Live call — browser speech"
-        );
+      if (payload.type === "assistant_audio") {
+        pushLog("Assistant audio received");
+        playAssistantAudio(payload);
+      }
+      if (payload.type === "assistant_interrupted") {
+        stopAssistantPlayback("barge-in");
+        pushLog("Interruption acknowledged by server");
+      }
+      if (payload.type === "error") {
+        pushLog(`Server error: ${payload.message || "unknown error"}`);
       }
     };
 
-    socket.onclose = () => {
+    socket.onclose = (event) => {
       callActiveRef.current = false;
       setCallActive(false);
       setCallStatus("Call ended");
-      pushLog("🔌 WebSocket closed");
+      if (pingTimerRef.current) {
+        clearInterval(pingTimerRef.current);
+        pingTimerRef.current = null;
+      }
+      pushLog(`WebSocket closed (code=${event.code}, reason='${event.reason || "none"}')`);
+      stopAssistantPlayback("call ended");
       stopCallRecognition();
     };
 
     socket.onerror = () => {
       callActiveRef.current = false;
-      setCallStatus("Call connection failed");
       setCallActive(false);
-      pushLog("❌ WebSocket error");
+      setCallStatus("Call connection failed");
+      pushLog("WebSocket error");
+      stopAssistantPlayback("socket error");
+      stopCallRecognition();
     };
   }
 
   function stopCall() {
     callActiveRef.current = false;
-    callSocketRef.current?.close();
     setCallActive(false);
     setCallStatus("Call ended");
+    stopAssistantPlayback("manual end");
     stopCallRecognition();
-    window.speechSynthesis?.cancel();
+    callSocketRef.current?.close();
+    callSocketRef.current = null;
+    if (pingTimerRef.current) {
+      clearInterval(pingTimerRef.current);
+      pingTimerRef.current = null;
+    }
   }
-
-  // How often we slice and send an audio chunk (ms).
-  // 4s is long enough for a full sentence, short enough to feel responsive.
-  const CHUNK_INTERVAL_MS = 4000;
 
   async function startCallRecognitionWithStream() {
     if (!navigator.mediaDevices?.getUserMedia) {
-      setCallStatus("Microphone unavailable — use chat or voice notes.");
+      setCallStatus("Microphone unavailable - use chat or voice notes.");
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
       setCallStream(stream);
       callStreamRef.current = stream;
       startCallRecorder(stream);
@@ -400,36 +450,77 @@ function App() {
   }
 
   function startCallRecorder(stream) {
-    // Kill any existing recorder first — never run two at once
-    const existing = callRecognitionRef.current;
+    const existing = callRecorderRef.current;
     if (existing && existing.state !== "inactive") {
       existing.ondataavailable = null;
       existing.stop();
     }
-    callRecognitionRef.current = null;
+    callRecorderRef.current = null;
 
-    // ── VAD setup: track peak volume during each recording window ──
-    // We sample the analyser every 100ms and store the max seen.
-    // If the whole window was silent we drop the chunk.
-    const VAD_THRESHOLD = 60;  // 0-255 scale — real speech typically hits 60+
-    let peakVolume = 0;
-    let vadInterval = null;
-
-    if (audioCtxRef.current) {
-      try { audioCtxRef.current.close(); } catch (_) {}
+    if (callAudioCtxRef.current) {
+      try {
+        callAudioCtxRef.current.close();
+      } catch (_) {}
     }
+
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    audioCtxRef.current = audioCtx;
+    callAudioCtxRef.current = audioCtx;
     const analyser = audioCtx.createAnalyser();
     analyser.fftSize = 256;
     audioCtx.createMediaStreamSource(stream).connect(analyser);
     const freqData = new Uint8Array(analyser.frequencyBinCount);
 
-    vadInterval = setInterval(() => {
+    let peakVolume = 0;
+    let currentVolume = 0;
+    let gateOpen = false;
+    let highFrames = 0;
+    let lowFrames = 0;
+    const vadInterval = setInterval(() => {
       analyser.getByteFrequencyData(freqData);
       const avg = freqData.reduce((a, b) => a + b, 0) / freqData.length;
+      currentVolume = avg;
       if (avg > peakVolume) peakVolume = avg;
-    }, 100);
+
+      // Interruption should be immediate even while gated.
+      const now = Date.now();
+      if (
+        botSpeakingRef.current &&
+        avg >= INTERRUPT_THRESHOLD &&
+        now - lastInterruptSignalRef.current > 350 &&
+        callSocketRef.current?.readyState === WebSocket.OPEN
+      ) {
+        lastInterruptSignalRef.current = now;
+        callSocketRef.current.send(JSON.stringify({ type: "interrupt" }));
+        stopAssistantPlayback("user started speaking");
+        pushLog(`Barge-in detected (vol ${avg.toFixed(1)})`);
+      }
+
+      // Voice gate with hysteresis:
+      // open only after sustained high signal, close after sustained low signal.
+      if (!gateOpen) {
+        if (avg >= CALL_GATE_START_THRESHOLD) {
+          highFrames += 1;
+          if (highFrames >= 3) {
+            gateOpen = true;
+            lowFrames = 0;
+            pushLog(`Voice gate OPEN (>= ${CALL_GATE_START_THRESHOLD})`);
+          }
+        } else {
+          highFrames = 0;
+        }
+      } else {
+        if (avg <= CALL_GATE_STOP_THRESHOLD) {
+          lowFrames += 1;
+          if (lowFrames >= 8) {
+            gateOpen = false;
+            highFrames = 0;
+            pushLog(`Voice gate CLOSED (<= ${CALL_GATE_STOP_THRESHOLD})`);
+          }
+        } else {
+          lowFrames = 0;
+        }
+      }
+    }, 80);
 
     const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg"].find(
       (t) => MediaRecorder.isTypeSupported(t)
@@ -513,20 +604,26 @@ function App() {
   }
 
   function stopCallRecognition() {
-    const recorder = callRecognitionRef.current;
+    const recorder = callRecorderRef.current;
     if (recorder && recorder.state !== "inactive") {
       recorder.ondataavailable = null;
       recorder.stop();
     }
-    callRecognitionRef.current = null;
+    callRecorderRef.current = null;
+
     const stream = callStreamRef.current;
     if (stream) stream.getTracks().forEach((t) => t.stop());
     callStreamRef.current = null;
     setCallStream(null);
+
+    if (callAudioCtxRef.current) {
+      try {
+        callAudioCtxRef.current.close();
+      } catch (_) {}
+      callAudioCtxRef.current = null;
+    }
   }
 
-
-  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div className="app-shell">
       <div className="ambient ambient-one" />
@@ -563,10 +660,7 @@ function App() {
 
         <main className="conversation">
           {messages.map((message) => (
-            <article
-              key={message.id}
-              className={message.sender === "user" ? "bubble user" : "bubble bot"}
-            >
+            <article key={message.id} className={message.sender === "user" ? "bubble user" : "bubble bot"}>
               <span className="channel-tag">{message.channel}</span>
               <p>{message.text}</p>
             </article>
@@ -581,7 +675,9 @@ function App() {
               <input
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") sendChatMessage(); }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") sendChatMessage();
+                }}
                 placeholder="Describe symptoms, ask about a doctor, or start a booking..."
               />
               <button onClick={sendChatMessage}>Send</button>
@@ -626,19 +722,23 @@ function App() {
                 </button>
               </div>
               {callLogs.length > 0 ? (
-                <div style={{
-                  marginTop: 10,
-                  maxHeight: 160,
-                  overflowY: "auto",
-                  background: "rgba(0,0,0,0.55)",
-                  borderRadius: 8,
-                  padding: "6px 10px",
-                  fontFamily: "monospace",
-                  fontSize: 11,
-                  color: "#b8ffc8",
-                  lineHeight: 1.6,
-                }}>
-                  {callLogs.map((line, i) => <div key={i}>{line}</div>)}
+                <div
+                  style={{
+                    marginTop: 10,
+                    maxHeight: 160,
+                    overflowY: "auto",
+                    background: "rgba(0,0,0,0.55)",
+                    borderRadius: 8,
+                    padding: "6px 10px",
+                    fontFamily: "monospace",
+                    fontSize: 11,
+                    color: "#b8ffc8",
+                    lineHeight: 1.6,
+                  }}
+                >
+                  {callLogs.map((line, i) => (
+                    <div key={i}>{line}</div>
+                  ))}
                 </div>
               ) : null}
             </div>

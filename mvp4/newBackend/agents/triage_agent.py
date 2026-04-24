@@ -30,7 +30,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
-from langchain_ollama import ChatOllama
+from langchain_community.chat_models import ChatOllama
 
 from agents.llm_config import get_llm
 from agents.symptom_lookup import lookup, format_for_prompt
