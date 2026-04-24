@@ -23,8 +23,11 @@
 
 from __future__ import annotations
 
+import json
 import re
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
 from langchain_ollama import ChatOllama
@@ -33,7 +36,41 @@ from agents.llm_config import get_llm
 from agents.symptom_lookup import lookup, format_for_prompt
 from agents.mcp_tools import save_case_notes, get_recent_case_notes
 
+try:
+    PKT = ZoneInfo("Asia/Karachi")
+except ZoneInfoNotFoundError:
+    PKT = timezone(timedelta(hours=5))
+
+BOOKING_CTX_DIR = Path("booking_context")
+BOOKING_CTX_DIR.mkdir(exist_ok=True)
+
 _PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "triage_system.md"
+
+
+# ── Booking context disk-persistence (mirrors orchestrator's save_booking_context)
+# We cannot import orchestrator here (circular), so we do the same write inline.
+# This is critical: the API handler re-loads booking_context from disk on every
+# turn, so any in-memory mutation (like medgemma_raw_history) will be LOST unless
+# we immediately flush it to the JSON sidecar.
+
+def _persist_booking_context(ctx: dict) -> None:
+    """Write ctx to its session JSON file so the next API turn sees the updates."""
+    session_id = ctx.get("session_id")
+    if not session_id or session_id == "default":
+        print("⚠️  [TriagePersist] No valid session_id — skipping disk save")
+        return
+    safe = re.sub(r"[^a-zA-Z0-9_\-]", "_", session_id)
+    path = BOOKING_CTX_DIR / f"{safe}.json"
+    ctx["last_updated"] = datetime.now(PKT).isoformat()
+    try:
+        path.write_text(json.dumps(ctx, indent=2, ensure_ascii=False), encoding="utf-8")
+        history_len = len(ctx.get("medgemma_raw_history", []))
+        print(f"💾 [TriagePersist] Saved ctx → {path.name}  "
+              f"medgemma_raw_history={history_len} entries  "
+              f"contents={[e['role'] for e in ctx.get('medgemma_raw_history', [])]}")
+    except Exception as e:
+        print(f"❌ [TriagePersist] Failed to save ctx: {e}")
+
 
 # Dynamic limits by severity — Severe gets escalated faster
 MAX_QUESTIONS_BY_SEVERITY = {
@@ -142,55 +179,88 @@ def _print_medgemma_context(msgs: list) -> None:
 
 def _build_triage_messages(state: dict, sys_prompt_text: str) -> list:
     """
-    Build a clean history for MedGemma.
+    Build a clean, ISOLATED history exclusively for MedGemma.
 
-    FIX: triage_start_idx is now stored in booking_context on the first call
-    so it's stable across all turns. Previously it was recomputed every turn
-    from scratch, which could drift if message ordering changed slightly.
+    MedGemma's context is completely separate from the main LangGraph messages
+    array so it NEVER sees Qwen's rephrased/translated output.
 
-    Only includes messages from AFTER [START_TRIAGE] — so MedGemma only sees
-    the real clinical Q&A, not the pre-triage symptom description or booking noise.
+    Turn 1  → seeds ctx["medgemma_raw_history"] with the patient's original
+              complaint (all pre-triage human text)
+    Turn N+ → appends the latest patient answer only when last history entry was AI
+    MedGemma's raw response is appended to medgemma_raw_history by triage_node
+    AFTER invoke, so the final sequence per call is:
+      user: <original complaint>
+      assistant: <MedGemma raw Q1>    ← NOT Qwen's version
+      user: <patient answer 1>
+      assistant: <MedGemma raw Q2>
+      …
     """
     sys_msg  = SystemMessage(content=sys_prompt_text)
     all_msgs = list(state.get("messages", []))
     ctx      = state.get("booking_context", {})
 
-    # ── Use stored index if available (stable across turns) ──────────────────
-    triage_start_idx = ctx.get("triage_start_msg_index")
+    # Safe init — backward compat with sessions that pre-date this field
+    raw_history: list[dict] = ctx.setdefault("medgemma_raw_history", [])
 
+    # ── Locate triage start index (stored once, stable across turns) ─────────
+    triage_start_idx = ctx.get("triage_start_msg_index")
     if triage_start_idx is None:
-        # First call — find and store it
         triage_start_idx = 0
         for i, m in enumerate(all_msgs):
             if m.type == "ai" and "[START_TRIAGE]" in str(m.content):
                 triage_start_idx = i + 1
                 break
-        # Also check booking_context for the supervisor's silent AIMessage case:
-        # When supervisor emits [START_TRIAGE] it replaces response with AIMessage("")
-        # so the tag is in response_text but NOT in m.content — fall back to
-        # the index stored by supervisor_node
         if triage_start_idx == 0:
             triage_start_idx = ctx.get("triage_start_msg_index_fallback", 0)
-
         ctx["triage_start_msg_index"] = triage_start_idx
         print(f"   [TriageMsgs] Stored triage_start_idx={triage_start_idx} (first call)")
     else:
         print(f"   [TriageMsgs] Using stored triage_start_idx={triage_start_idx}")
 
-    triage_msgs = all_msgs[triage_start_idx:]
+    print(f"   [MedGemmaHistory] At build time: {len(raw_history)} entries, "
+          f"roles={[e['role'] for e in raw_history]}")
 
-    # Strip orchestrator control tags from AI messages
-    clean = []
-    for m in triage_msgs:
-        content = str(m.content)
-        if m.type == "ai":
-            stripped = _SYSTEM_TAG_RE.sub("", content).strip()
-            if stripped:
-                clean.append(AIMessage(content=stripped))
+    # ── TURN 1: seed with the original complaint ──────────────────────────────
+    if not raw_history:
+        pre_triage_text = " ".join(
+            str(m.content) for m in all_msgs[:triage_start_idx] if m.type == "human"
+        ).strip()
+        if not pre_triage_text:
+            pre_triage_text = state.get("extracted_symptom", "I have a medical complaint.")
+        raw_history.append({"role": "user", "content": pre_triage_text})
+        print(f"   [MedGemmaHistory] Turn-1 seed → complaint: '{pre_triage_text[:80]}'")
+
+    # ── TURN N+: append latest patient answer (only when MedGemma last spoke) ─
+    elif raw_history[-1]["role"] == "assistant":
+        last_human = next(
+            (str(m.content) for m in reversed(all_msgs) if m.type == "human"), ""
+        ).strip()
+        if last_human:
+            # Guard: don't duplicate if already appended
+            last_user_content = next(
+                (e["content"] for e in reversed(raw_history) if e["role"] == "user"), ""
+            )
+            if last_user_content.strip() != last_human:
+                raw_history.append({"role": "user", "content": last_human})
+                print(f"   [MedGemmaHistory] Turn-N answer appended: '{last_human[:60]}...'")
+            else:
+                print(f"   [MedGemmaHistory] Answer already in history — skip duplicate")
         else:
-            clean.append(m)
+            print(f"   [MedGemmaHistory] No human message found to append")
+    else:
+        print(f"   [MedGemmaHistory] Last entry is 'user' — waiting for MedGemma to respond first")
 
-    print(f"   [TriageMsgs] {len(clean)} clean msgs (from idx {triage_start_idx} of {len(all_msgs)} total)")
+    # ── Convert to LangChain messages ─────────────────────────────────────────
+    clean = []
+    for item in raw_history:
+        if item["role"] == "user":
+            clean.append(HumanMessage(content=item["content"]))
+        else:
+            stripped = _SYSTEM_TAG_RE.sub("", item["content"]).strip()
+            clean.append(AIMessage(content=stripped or item["content"]))
+
+    print(f"   [TriageMsgs] {len(clean)} msgs built from MedGemma's private history "
+          f"(Qwen outputs fully excluded)")
     return [sys_msg] + clean
 
 
@@ -488,6 +558,19 @@ def triage_node(state: dict) -> dict:
         response = med_llm.invoke(msgs)
         raw_text = str(response.content).strip()
         print(f"🧠 [MedGemma raw output] → {raw_text[:300]}")
+
+        # ── Append MedGemma's raw output to its ISOLATED history ──────────────
+        # MUST happen here — before Qwen rephrases — so we store the clinical
+        # English text, never Qwen's translated/rephrased version.
+        # We also immediately persist to disk because the API handler reloads
+        # booking_context from disk on every turn, so in-memory changes are lost.
+        history = ctx.setdefault("medgemma_raw_history", [])
+        history.append({"role": "assistant", "content": raw_text})
+        print(f"📝 [MedGemmaHistory] Appended assistant entry "
+              f"(total entries now: {len(history)}) "
+              f"→ roles: {[e['role'] for e in history]}")
+        _persist_booking_context(ctx)
+
     except Exception as e:
         print(f"❌ [Triage] MedGemma failed: {e}")
         summary = f"Complaint: {symptom}. MedGemma unavailable."
@@ -598,6 +681,13 @@ def _complete_triage(
     ctx["triage_completed"]       = True
     ctx["triage_questions_asked"] = ctx.get("triage_questions_asked", 0)
     ctx["triage_qa"]              = qa_pairs
+
+    # ── CRITICAL: flush to disk NOW so the next API turn sees triage_completed=True.
+    # Without this, _persist_booking_context() was called earlier (when appending
+    # MedGemma's raw output) BEFORE triage_completed was set, so the JSON sidecar
+    # always had triage_completed=False — causing the supervisor to re-trigger
+    # [START_TRIAGE] on every subsequent message.
+    _persist_booking_context(ctx)
 
     # Build handoff message
     if final_doctor_type == "General Physician":

@@ -293,7 +293,8 @@ function App() {
     }
     const recorder = callRecognitionRef.current;
     if (recorder && recorder.state === "recording") {
-      recorder.ondataavailable = null;  // discard any final chunk
+      recorder.ondataavailable = null;  // discard any partial chunk — bot is speaking
+      recorder.onstop = null;           // don't spawn next recorder while bot speaks
       recorder.stop();
     }
   }
@@ -434,53 +435,80 @@ function App() {
       (t) => MediaRecorder.isTypeSupported(t)
     ) || "";
 
-    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
-    callRecognitionRef.current = recorder;
+    // ── Stop/restart loop — each recorder instance gets its own fresh WebM
+    // header, so every blob sent to Groq is a valid standalone file. ──────────
+    let chunkIntervalId = null;
 
-    recorder.onstart = () => {
-      peakVolume = 0;  // reset for this window
-      listenStartRef.current = Date.now();
-      pushLog(`🎙️ Listening... (${CHUNK_INTERVAL_MS / 1000}s window)`);
-    };
+    function spawnRecorder() {
+      if (!callActiveRef.current || isSpeakingRef.current) return;
 
-    recorder.ondataavailable = async (e) => {
-      const listenedMs = listenStartRef.current ? Date.now() - listenStartRef.current : 0;
-      const peak = peakVolume;
-      peakVolume = 0;  // reset for next window
+      const rec = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+      callRecognitionRef.current = rec;
 
-      if (e.data.size < 3000) {
-        pushLog(`⏭️ Dropped — too small (${e.data.size}B)`);
+      const windowStart = Date.now();
+      peakVolume = 0;
+
+      rec.ondataavailable = async (e) => {
+        const listenedMs = Date.now() - windowStart;
+        const peak = peakVolume;
+
+        if (e.data.size < 3000) {
+          pushLog(`⏭️ Dropped — too small (${e.data.size}B)`);
+          return;
+        }
+        if (peak < VAD_THRESHOLD) {
+          pushLog(`🔕 Dropped — silence (peak vol ${peak.toFixed(1)}, threshold ${VAD_THRESHOLD})`);
+          return;
+        }
+        if (isSpeakingRef.current) {
+          pushLog("⏭️ Dropped — bot started speaking");
+          return;
+        }
+        if (callSocketRef.current?.readyState !== WebSocket.OPEN) return;
+
+        pushLog(`📤 Sending ${(e.data.size / 1024).toFixed(1)}KB — peak vol ${peak.toFixed(1)} (${(listenedMs / 1000).toFixed(1)}s)`);
+
+        const b64 = await blobToBase64(e.data);
+        callSocketRef.current.send(JSON.stringify({
+          type: "user_audio",
+          audio_base64: b64,
+          mime_type: e.data.type || mimeType || "audio/webm",
+        }));
+      };
+
+      rec.onstart = () => {
         listenStartRef.current = Date.now();
-        return;
-      }
-      if (peak < VAD_THRESHOLD) {
-        pushLog(`🔕 Dropped — silence (peak vol ${peak.toFixed(1)}, threshold ${VAD_THRESHOLD})`);
-        listenStartRef.current = Date.now();
-        return;
-      }
-      if (isSpeakingRef.current) {
-        pushLog("⏭️ Dropped — bot started speaking");
-        return;
-      }
-      if (callSocketRef.current?.readyState !== WebSocket.OPEN) return;
+        pushLog(`🎙️ Listening... (${CHUNK_INTERVAL_MS / 1000}s window)`);
+      };
 
-      pushLog(`📤 Sending ${(e.data.size / 1024).toFixed(1)}KB — peak vol ${peak.toFixed(1)} (${(listenedMs / 1000).toFixed(1)}s)`);
-      listenStartRef.current = Date.now();
+      rec.onstop = () => {
+        // Spawn next recorder immediately after this one finishes
+        if (callActiveRef.current && !isSpeakingRef.current) {
+          spawnRecorder();
+        }
+      };
 
-      const b64 = await blobToBase64(e.data);
-      callSocketRef.current.send(JSON.stringify({
-        type: "user_audio",
-        audio_base64: b64,
-        mime_type: e.data.type || mimeType || "audio/webm",
-      }));
-    };
+      rec.start();
 
-    // Clean up VAD interval when recorder stops
-    recorder.onstop = () => {
+      // Stop after the window — triggers ondataavailable then onstop
+      setTimeout(() => {
+        if (rec.state === "recording") rec.stop();
+      }, CHUNK_INTERVAL_MS);
+    }
+
+    // Clean up VAD interval when the whole call stops (stopCallRecognition clears the recorder ref)
+    const origVadCleanup = () => {
       if (vadInterval) { clearInterval(vadInterval); vadInterval = null; }
+      if (chunkIntervalId) { clearInterval(chunkIntervalId); chunkIntervalId = null; }
     };
 
-    recorder.start(CHUNK_INTERVAL_MS);
+    // Patch stopCallRecognition cleanup onto the stream tracks
+    stream.getTracks().forEach(t => {
+      const origStop = t.stop.bind(t);
+      t.stop = () => { origVadCleanup(); origStop(); };
+    });
+
+    spawnRecorder();
     setCallStatus("Live call — Whisper STT active");
   }
 

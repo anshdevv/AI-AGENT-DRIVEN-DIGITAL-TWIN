@@ -110,7 +110,7 @@ class VoiceService:
                     file=(file_name, bytes(audio_bytes)),
                     model="whisper-large-v3-turbo",
                     response_format="verbose_json",
-                    prompt="The user may speak in English or Urdu. Transcribe exactly what is spoken in its native script.",
+                    prompt="The patient is describing their medical symptoms, such as headache, fever, and pain.",
                 )
                 original_text = (getattr(result, "text", None) or "").strip()
                 detected_lang = (getattr(result, "language", None) or "en").lower().strip()
@@ -168,7 +168,7 @@ class VoiceService:
                 file=(file_name, bytes(audio_bytes)),
                 model="whisper-large-v3",   # turbo doesn't support translations endpoint
                 response_format="text",
-                prompt="Medical conversation. Translate accurately to English.",
+                prompt="The patient is describing their medical symptoms, such as headache, fever, and pain.",
             )
             # Groq returns a plain string for response_format="text"
             english_text = (result if isinstance(result, str) else getattr(result, "text", str(result))).strip()

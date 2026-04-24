@@ -299,6 +299,31 @@ def _slot_starts_at(slot: dict[str, Any], target_time: datetime.time) -> bool:
     return slot_start == target_time
 
 
+def _find_nearest_slot(
+    slots: list[dict[str, Any]],
+    target_time: datetime.time,
+    tolerance_minutes: int = 30,
+) -> dict[str, Any] | None:
+    """
+    Return the available slot whose start time is closest to target_time,
+    within tolerance_minutes. Prefers slots at-or-after target_time.
+    Returns None if no slot is within tolerance.
+    """
+    target_delta = timedelta(hours=target_time.hour, minutes=target_time.minute)
+    best_slot  = None
+    best_diff  = timedelta(minutes=tolerance_minutes + 1)
+
+    for slot in slots:
+        slot_start = datetime.fromisoformat(str(slot["start_time"])).timetz().replace(tzinfo=None)
+        slot_delta = timedelta(hours=slot_start.hour, minutes=slot_start.minute)
+        diff = abs(slot_delta - target_delta)
+        if diff < best_diff:
+            best_diff = diff
+            best_slot = slot
+
+    return best_slot
+
+
 def _format_slot_start(slot: dict[str, Any]) -> str:
     return datetime.fromisoformat(str(slot["start_time"])).strftime("%H:%M")
 
@@ -354,6 +379,7 @@ def _apply_query_filter(query: Any, column: str, op: str, value: Any) -> Any:
 def _get_schedule_rows(doctor_id: int, weekday: int) -> list[dict[str, Any]]:
     if not supabase:
         return []
+    print(f"   [ScheduleRows] Querying doctor_availability: doctor_id={doctor_id}, day_of_week={weekday}")
     response = (
         supabase.table("doctor_availability")
         .select("*")
@@ -361,13 +387,15 @@ def _get_schedule_rows(doctor_id: int, weekday: int) -> list[dict[str, Any]]:
         .eq("day_of_week", weekday)
         .execute()
     )
-    return sorted(
+    rows = sorted(
         list(response.data or []),
         key=lambda row: (
             str(row.get("start_time", "")),
             str(row.get("end_time", "")),
         ),
     )
+    print(f"   [ScheduleRows] Found {len(rows)} row(s): {[{'start': r.get('start_time'), 'end': r.get('end_time'), 'duration': r.get('slot_duration_minutes')} for r in rows]}")
+    return rows
 
 
 def _build_bookable_slots(
@@ -380,7 +408,10 @@ def _build_bookable_slots(
         return []
 
     day_start = datetime.combine(target_date.date(), datetime.min.time()).replace(tzinfo=PKT)
-    day_end = day_start + timedelta(days=1)
+    day_end   = day_start + timedelta(days=1)
+
+    print(f"   [BuildSlots] doctor_id={doctor_id}  date={target_date.date()}  window={day_start.isoformat()} → {day_end.isoformat()}")
+
     slot_response = (
         supabase.table("slots")
         .select("*")
@@ -389,6 +420,10 @@ def _build_bookable_slots(
         .lt("start_time", day_end.isoformat())
         .execute()
     )
+    print(f"   [BuildSlots] Existing slots in DB for this day: {len(slot_response.data or [])}")
+    for s in (slot_response.data or []):
+        print(f"      slot id={s.get('id')} start={s.get('start_time')} status={s.get('status')}")
+
     appointment_response = (
         supabase.table("appointments")
         .select("slot_id, status")
@@ -401,6 +436,7 @@ def _build_bookable_slots(
         if item.get("slot_id") is not None
         and str(item.get("status", "")).strip().lower() not in {"cancelled", "canceled", "no_show"}
     }
+    print(f"   [BuildSlots] Active appointment slot_ids (blocking): {active_appointment_slot_ids}")
 
     blocked_windows = []
     for slot in slot_response.data or []:
@@ -412,14 +448,17 @@ def _build_bookable_slots(
                 datetime.fromisoformat(str(slot["end_time"])),
             )
         )
+    print(f"   [BuildSlots] Blocked windows: {[(str(s), str(e)) for s, e in blocked_windows]}")
 
     bookable_slots: list[dict[str, Any]] = []
     for schedule_row in schedule_rows:
         duration_minutes = int(schedule_row.get("slot_duration_minutes") or 15)
-        start_time = datetime.strptime(str(schedule_row["start_time"]), "%H:%M:%S").time()
-        end_time = datetime.strptime(str(schedule_row["end_time"]), "%H:%M:%S").time()
-        slot_start = datetime.combine(target_date.date(), start_time).replace(tzinfo=PKT)
-        schedule_end = datetime.combine(target_date.date(), end_time).replace(tzinfo=PKT)
+        start_time       = datetime.strptime(str(schedule_row["start_time"]), "%H:%M:%S").time()
+        end_time         = datetime.strptime(str(schedule_row["end_time"]),   "%H:%M:%S").time()
+        slot_start       = datetime.combine(target_date.date(), start_time).replace(tzinfo=PKT)
+        schedule_end     = datetime.combine(target_date.date(), end_time).replace(tzinfo=PKT)
+
+        print(f"   [BuildSlots] Schedule row: {start_time} → {end_time}  duration={duration_minutes}min")
 
         while slot_start + timedelta(minutes=duration_minutes) <= schedule_end:
             slot_end = slot_start + timedelta(minutes=duration_minutes)
@@ -432,16 +471,17 @@ def _build_bookable_slots(
 
             bookable_slots.append(
                 {
-                    "doctor_id": doctor_id,
-                    "start_time": slot_start.isoformat(),
-                    "end_time": slot_end.isoformat(),
+                    "doctor_id":             doctor_id,
+                    "start_time":            slot_start.isoformat(),
+                    "end_time":              slot_end.isoformat(),
                     "slot_duration_minutes": duration_minutes,
-                    "source_schedule_id": schedule_row.get("id"),
-                    "status": "available",
+                    "source_schedule_id":    schedule_row.get("id"),
+                    "status":                "available",
                 }
             )
             slot_start = slot_end
 
+    print(f"   [BuildSlots] → {len(bookable_slots)} bookable slot(s) remaining after blocking")
     return bookable_slots
 
 
@@ -740,6 +780,7 @@ def get_doctor_profile(doctor_name: str | None = None, doctor_id: int | None = N
 def find_provider_availability(
     specialization: str | None = None,
     doctor_name: str | None = None,
+    doctor_id: int | None = None,
     date: str | None = None,
     time: str | None = None,
 ) -> str:
@@ -747,57 +788,123 @@ def find_provider_availability(
     Find available appointment slots for a doctor or specialization on a given date.
     Date accepts: today, tomorrow, day after tomorrow, weekday names (monday etc), or YYYY-MM-DD.
     Time (optional) filters to a specific start time, e.g. '14:30' or '2:30 PM'.
+    Identify the doctor via doctor_id (preferred when already selected), doctor_name, or specialization.
     Checks actual booked/held slots to show only truly free times.
     """
-    print(f"🛠️ [Tool] find_provider_availability: spec={specialization}, doctor={doctor_name}, date={date}, time={time}")
+    print(f"🛠️ [Tool] find_provider_availability: spec={specialization!r}, doctor={doctor_name!r}, doctor_id={doctor_id}, date={date!r}, time={time!r}")
     if not supabase:
         return "Database not connected."
-    print(doctor_name, specialization)
-    
-    # Resolve providers
-    if doctor_name:
-        response = supabase.table("doctors").select("*").ilike("name", f"%{doctor_name}%").execute()
+
+    # Resolve providers — doctor_id takes priority (most precise), then name, then specialization
+    if doctor_id is not None:
+        print(f"   [Availability] Looking up by doctor_id={doctor_id}")
+        response = supabase.table("doctors").select("*").eq("id", doctor_id).limit(1).execute()
         providers = [_normalize_doctor_record(p) for p in (response.data or [])]
+        if not providers:
+            return f"No doctor found with ID {doctor_id}."
+    elif doctor_name:
+        # Normalize: strip "Dr." prefix so "Dr. Afaf Irfan" matches DB value "Dr.Afaf Irfan"
+        search_name = re.sub(r"^[Dd][Rr]\.?\s*", "", doctor_name).strip()
+        print(f"   [Availability] Looking up by name: original='{doctor_name}' → search='{search_name}'")
+        response = supabase.table("doctors").select("*").ilike("name", f"%{search_name}%").execute()
+        providers = [_normalize_doctor_record(p) for p in (response.data or [])]
+        print(f"   [Availability] Name search returned {len(providers)} provider(s): {[p.get('name') for p in providers]}")
     elif specialization:
+        print(f"   [Availability] Looking up by specialization='{specialization}'")
         providers = _lookup_providers_by_specialization(specialization)
+        print(f"   [Availability] Specialization search returned {len(providers)} provider(s)")
     else:
-        return "Provide at least a specialization or doctor_name."
+        return "Provide at least a doctor_id, doctor_name, or specialization."
 
     if not providers:
         return "No providers found matching that criteria."
 
-    target_date = _parse_date(date)
+    try:
+        target_date = _parse_date(date)
+    except ValueError as e:
+        return f"Invalid date: {e}"
     target_weekday = _day_of_week_from_date(target_date)
-    target_time = _parse_time(time) if time else None
-    available = []
+    target_time    = _parse_time(time) if time else None
+    available      = []
+
+    print(f"   [Availability] Target date: {target_date.strftime('%A %Y-%m-%d')}  weekday_index={target_weekday}  time_filter={target_time}")
 
     for provider in providers:
-        schedule_rows = _get_schedule_rows(provider["id"], target_weekday)
+        p_id   = provider["id"]
+        p_name = provider.get("name", "Unknown")
+        schedule_rows = _get_schedule_rows(p_id, target_weekday)
+        print(f"   [Availability] Dr.{p_name} (ID={p_id}): schedule_rows={len(schedule_rows)}")
         if not schedule_rows:
+            print(f"   [Availability] ⚠️  No schedule rows for weekday_index={target_weekday} — doctor may not work this day")
             continue
 
-        matching_slots = _build_bookable_slots(
-            doctor_id=provider["id"],
+        all_slots = _build_bookable_slots(
+            doctor_id=p_id,
             target_date=target_date,
             schedule_rows=schedule_rows,
         )
+        print(f"   [Availability] Dr.{p_name}: {len(all_slots)} free slot(s) built")
+        if all_slots:
+            print(f"   [Availability] First few slots: {[_format_slot_start(s) for s in all_slots[:4]]}")
+
         if target_time is not None:
-            matching_slots = [s for s in matching_slots if _slot_starts_at(s, target_time)]
+            # Try exact match first
+            exact = [s for s in all_slots if _slot_starts_at(s, target_time)]
+            if exact:
+                print(f"   [Availability] Exact time match found for {target_time}")
+                matching_slots = exact
+                time_note = None
+            else:
+                # Fall back to nearest available slot within 30 minutes
+                nearest = _find_nearest_slot(all_slots, target_time, tolerance_minutes=30)
+                if nearest:
+                    nearest_str = _format_slot_start(nearest)
+                    print(f"   [Availability] No exact match for {target_time}; nearest slot={nearest_str}")
+                    matching_slots = [nearest]
+                    time_note = f"(closest to {time} — exact time not available)"
+                else:
+                    print(f"   [Availability] No slot within 30 min of {target_time}")
+                    matching_slots = []
+                    time_note = None
+        else:
+            matching_slots = all_slots
+            time_note = None
 
         if matching_slots:
             display_slots = [_format_slot_start(s) for s in matching_slots[:6]]
-            available.append((provider, display_slots, len(matching_slots)))
+            extra_count   = len(all_slots) - len(display_slots) if not target_time else 0
+            available.append((provider, display_slots, len(all_slots), time_note, extra_count))
 
     if not available:
-        day_name = target_date.strftime("%A")
-        date_str = target_date.strftime("%Y-%m-%d")
+        day_name  = target_date.strftime("%A")
+        date_str  = target_date.strftime("%Y-%m-%d")
+        if target_time:
+            # Show all slots even though requested time has no match
+            # Re-run without time filter for a helpful "here's what IS available" message
+            fallback = []
+            for provider in providers:
+                rows = _get_schedule_rows(provider["id"], target_weekday)
+                if not rows:
+                    continue
+                slots = _build_bookable_slots(doctor_id=provider["id"], target_date=target_date, schedule_rows=rows)
+                if slots:
+                    fallback.append((provider, [_format_slot_start(s) for s in slots[:6]], len(slots)))
+            if fallback:
+                lines = [f"No slot at {time} on {day_name} ({date_str}). Available slots:"]
+                for provider, display_slots, total in fallback:
+                    extra = f" (+{total - len(display_slots)} more)" if total > len(display_slots) else ""
+                    lines.append(f"  Dr. {provider.get('name')} ({provider.get('specialization')}): {', '.join(display_slots)}{extra}")
+                return "\n".join(lines)
         return f"No available slots found on {day_name} ({date_str})."
 
     lines = [f"Available slots on {target_date.strftime('%A, %Y-%m-%d')}:"]
-    for provider, display_slots, total in available:
-        slots_str = ", ".join(display_slots)
-        extra = f" (+{total - len(display_slots)} more)" if total > len(display_slots) else ""
-        lines.append(f"  Dr. {provider.get('name')} ({provider.get('specialization')}): {slots_str}{extra}")
+    for provider, display_slots, total, time_note, extra_count in available:
+        note_str  = f" {time_note}" if time_note else ""
+        extra_str = f" (+{extra_count} more)" if extra_count > 0 else ""
+        lines.append(
+            f"  Dr. {provider.get('name')} ({provider.get('specialization')}): "
+            f"{', '.join(display_slots)}{extra_str}{note_str}"
+        )
     return "\n".join(lines)
 
 

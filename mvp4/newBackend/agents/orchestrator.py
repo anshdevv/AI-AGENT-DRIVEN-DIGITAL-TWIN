@@ -71,6 +71,7 @@ def _empty_booking_context(session_id: str) -> dict:
         "triage_completed":         False,
         "triage_questions_asked":   0,          # incremented each turn in triage_node
         "triage_qa":                [],         # Q&A pairs — saved here AND flushed to Supabase
+        "medgemma_raw_history":     [],         # Parallel history: only MedGemma's own raw outputs
         "accumulated_symptoms":     [],         # patient answers collected across all triage turns
         "symptom_context_block":    None,       # turn-1 lookup result (cached, injected into MedGemma prompt)
         "final_symptom_match":      None,       # lookup result after full triage (used for specialist routing)
@@ -132,22 +133,37 @@ def save_booking_context(session_id: str, ctx: dict) -> None:
 # ═══════════════════════════════════════════════════════════════════
 
 def _advance_step(ctx: dict) -> None:
-    if ctx["appointment"]["confirmed"]:
-        ctx["step"] = "completed"
-        return
     p = ctx["patient"]
     d = ctx["selected_doctor"]
     s = ctx["pending_slot"]
+
+    print(f"\n🔀 [AdvanceStep] Evaluating state:")
+    print(f"   patient.id      = {p['id']}")
+    print(f"   doctor.id       = {d['id']}")
+    print(f"   pending_slot    = {s['date']} at {s['time']}")
+    print(f"   confirmed       = {ctx['appointment']['confirmed']}")
+
+    if ctx["appointment"]["confirmed"]:
+        ctx["step"] = "completed"
+        print(f"   → step = 'completed' (appointment already confirmed)")
+        return
     if p["id"] and d["id"] and s["date"] and s["time"]:
         ctx["step"] = "await_confirmation"
+        print(f"   → step = 'await_confirmation' ✅ all data present")
         return
     if not p["id"]:
         ctx["step"] = "collect_patient"
+        print(f"   → step = 'collect_patient' (missing patient.id)")
         return
     if not d["id"]:
         ctx["step"] = "collect_doctor"
+        print(f"   → step = 'collect_doctor' (missing doctor.id)")
         return
     ctx["step"] = "collect_slot"
+    missing = []
+    if not s["date"]: missing.append("date")
+    if not s["time"]: missing.append("time")
+    print(f"   → step = 'collect_slot' (missing slot: {', '.join(missing)})")
 
 
 def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
@@ -179,7 +195,10 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
         lines.append(f"  appointment         = CONFIRMED (ID={ctx['appointment']['booking_id']})")
     lines.append("")
 
-    if not ctx.get("triage_completed"):
+    # ── GUARD: only trigger triage when step is collect_patient AND flag is unset.
+    # If step has already advanced (collect_doctor, collect_slot, etc.) triage
+    # clearly happened — don't re-trigger it even if the flag was somehow lost.
+    if not ctx.get("triage_completed") and step == "collect_patient":
         lines.append("YOUR NEXT ACTION: Medical Triage.")
         lines.append("  If the user mentions ANY medical symptom, you MUST output exactly:")
         lines.append("  [SYMPTOM_LOGGED: <symptom>]")
@@ -202,10 +221,42 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
         lines.append("  Ask which doctor the patient prefers, then call get_doctor_profile to confirm ID.")
 
     elif step == "collect_slot":
-        lines.append("YOUR NEXT ACTION: Find an available time slot.")
-        lines.append(f"  Call find_provider_availability(doctor_id={d['id']}, date='today' or ask patient).")
+        d_name     = d.get("name", "Unknown")
+        d_id       = d.get("id")
+        schedule   = ctx.get("doctor_schedule", [])
+
+        lines.append("YOUR NEXT ACTION: Help the patient pick a date and time slot.")
         lines.append(f"  TODAY = {today} | TOMORROW = {tomorrow}")
-        lines.append("  DO NOT call get_doctor_schedule — use find_provider_availability.")
+        lines.append("")
+
+        if schedule:
+            lines.append(f"  ✅ Dr. {d_name}'s weekly schedule (already fetched — DO NOT call get_doctor_profile again):")
+            for entry in schedule:
+                lines.append(f"     {entry['day']}: {entry['start']} – {entry['end']}")
+            lines.append("")
+            lines.append("  WORKFLOW:")
+            lines.append("  1. If patient has NOT said which day they want → present the schedule above and ask.")
+            lines.append("  2. Once patient states a day (e.g. 'monday') or day+time (e.g. 'monday 9:30 am'):")
+            lines.append(f"     Call: find_provider_availability(doctor_id={d_id}, date='<day>', time='<HH:MM or omit>')")
+            lines.append("  3. Show the returned free slots. Ask the patient to confirm one.")
+            lines.append("  4. Once patient confirms a specific slot → show full booking summary and ask YES/NO.")
+        else:
+            lines.append(f"  STEP 1: Call get_doctor_profile(doctor_id={d_id}) to fetch Dr. {d_name}'s schedule.")
+            lines.append("  STEP 2: Present the schedule days to the patient and ask which they prefer.")
+            lines.append(f"  STEP 3: Call find_provider_availability(doctor_id={d_id}, date='<chosen_day>').")
+            lines.append("  STEP 4: Show free slots, ask patient to pick one.")
+
+        lines.append("")
+        lines.append("  ⛔ NEVER call find_provider_availability without a date.")
+        lines.append(f"  ⛔ ALWAYS pass doctor_id={d_id} — never leave doctor unspecified.")
+        lines.append("  ⛔ DO NOT call get_doctor_schedule — use find_provider_availability.")
+
+    if ctx.get("triage_completed"):
+        lines.append("")
+        lines.append("⛔ TRIAGE IS DONE — ABSOLUTE PROHIBITION:")
+        lines.append(f"  Complaint already logged: '{ctx.get('prime_complaint', '–')}'")
+        lines.append("  NEVER emit [SYMPTOM_LOGGED:...] or [START_TRIAGE] again under any circumstances.")
+        lines.append("  These tags are only valid before triage. Emitting them now will break the flow.")
 
     elif step == "await_confirmation":
         lines.append("YOUR NEXT ACTION: Show summary. Ask 'Shall I confirm? (yes/no)'. Call NO tools.")
@@ -279,6 +330,12 @@ _TOOL_REQUIRED_ARGS = {
     "lookup_customer_profile": {"phone": "patient phone number"},
 }
 _TIME_RE = re.compile(r"\b(\d{1,2}:\d{2})\b")
+# Matches schedule lines like "Monday: 09:01 – 18:01" from get_doctor_profile/get_doctor_schedule output
+_SCHEDULE_RE = re.compile(
+    r"\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
+    r":\s*(\d{1,2}:\d{2})\s*[\u2013\-]\s*(\d{1,2}:\d{2})",
+    re.IGNORECASE,
+)
 _DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 
 
@@ -458,15 +515,71 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
                 ctx["selected_doctor"]["specialization"] = m.group(1).strip()
                 changed = True
             print(f"   → doctor.spec = '{ctx['selected_doctor']['specialization']}'")
-
-    elif tool_name == "get_doctors_by_specialization":
+        # ── Cache the weekly schedule so we never re-fetch it ─────
+        # Parse lines like "Monday: 09:01 – 18:01" from the result text.
+        # Stored in ctx["doctor_schedule"] as a list of {day, start, end} dicts.
+        schedule_entries = [
+            {"day": m.group(1).title(), "start": m.group(2), "end": m.group(3)}
+            for m in _SCHEDULE_RE.finditer(result_str)
+        ]
+        if schedule_entries:
+            ctx["doctor_schedule"] = schedule_entries
+            changed = True
+            print(f"   → doctor_schedule cached: {schedule_entries}")
+    elif tool_name in ("get_doctors_by_specialization", "query_database_table"):
         print(f"   result preview: {result_str[:300]}")
+        # Always stamp specialization from args if available
         if not ctx["selected_doctor"]["specialization"]:
             spec = tool_args.get("specialization")
             if spec:
                 ctx["selected_doctor"]["specialization"] = str(spec)
                 changed = True
                 print(f"   → doctor.spec (from args) = '{spec}'")
+
+        # ── Extract doctor id + name from raw dict output ──────────
+        # Handles both formats:
+        #   [{'id': 7, 'name': 'Dr.Afaf Irfan'}]   ← query_database_table
+        #   - Dr. Afaf Irfan (ID: 7)                ← get_doctors_by_specialization formatted
+        _RAW_DOC_ID_RE   = re.compile(r"['\"]id['\"]\s*:\s*(\d+)")
+        _RAW_DOC_NAME_RE = re.compile(r"['\"]name['\"]\s*:\s*['\"]([^'\"]+)['\"]")
+        _FMT_DOC_RE      = re.compile(
+            r"-\s*Dr\.?\s*([A-Za-z][A-Za-z .]{1,40}?)\s*\(ID:\s*(\d+)\)",
+            re.IGNORECASE,
+        )
+
+        # Try formatted style first
+        fmt_matches = _FMT_DOC_RE.findall(result_str)
+        raw_ids     = _RAW_DOC_ID_RE.findall(result_str)
+        raw_names   = _RAW_DOC_NAME_RE.findall(result_str)
+
+        # Filter out the patient id/name already stored so we don't cross-contaminate
+        patient_id_str = str(ctx["patient"]["id"]) if ctx["patient"]["id"] else None
+        patient_name   = ctx["patient"]["name"] or ""
+
+        if fmt_matches and len(fmt_matches) == 1 and not ctx["selected_doctor"]["id"]:
+            name, doc_id = fmt_matches[0]
+            ctx["selected_doctor"]["id"]   = int(doc_id)
+            ctx["selected_doctor"]["name"] = name.strip()
+            changed = True
+            print(f"   → (fmt) doctor.id={doc_id}  doctor.name='{name.strip()}'")
+        elif raw_ids and not ctx["selected_doctor"]["id"]:
+            # Filter out patient id
+            doc_ids = [i for i in raw_ids if i != patient_id_str]
+            if len(doc_ids) == 1:
+                ctx["selected_doctor"]["id"] = int(doc_ids[0])
+                changed = True
+                print(f"   → (raw) doctor.id={doc_ids[0]}")
+            elif doc_ids:
+                print(f"   ℹ️  Multiple doctor IDs found {doc_ids} — user must pick one")
+
+        if raw_names and not ctx["selected_doctor"]["name"]:
+            doc_names = [n for n in raw_names if n.lower() != patient_name.lower()]
+            if len(doc_names) == 1:
+                ctx["selected_doctor"]["name"] = doc_names[0].strip()
+                changed = True
+                print(f"   → (raw) doctor.name='{doc_names[0].strip()}'")
+
+        print(f"   After extract: doctor.id={ctx['selected_doctor']['id']}  doctor.name='{ctx['selected_doctor']['name']}'")
 
     elif tool_name == "recommend_specialist_tool":
         print(f"   result preview: {result_str[:200]}")
@@ -482,7 +595,13 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
 
     elif tool_name == "find_provider_availability":
         print(f"   result preview: {result_str[:300]}")
-        # Slot captured later in _try_extract_pending_slot after user picks a time
+        # Try to grab the date from the result itself (it echoes back the resolved date)
+        date_m = _DATE_RE.search(result_str)
+        if date_m and not ctx["pending_slot"]["date"]:
+            ctx["pending_slot"]["date"] = date_m.group(1)
+            changed = True
+            print(f"   → pending_slot.date (from availability result) = '{date_m.group(1)}'")
+        # Time will be extracted from the human message in _try_extract_pending_slot
 
     elif tool_name == "create_booking":
         print(f"   result preview: {result_str[:300]}")
@@ -561,20 +680,71 @@ def tool_executor_node(state: ConversationState) -> dict:
             tool_messages.append(ToolMessage(content=msg, tool_call_id=tool_call_id, name=tool_name))
             continue
 
+        # ── GUARD 4: find_provider_availability must always have a doctor identifier.
+        # If the LLM forgot to pass doctor_name/specialization/doctor_id but we already
+        # know the selected doctor from ctx, auto-inject it so the call succeeds.
+        # Also: if patient hasn't stated a date yet, require it before calling.
+        if tool_name == "find_provider_availability":
+            args = dict(tool_args)
+            has_doctor = args.get("doctor_id") or args.get("doctor_name") or args.get("specialization")
+            if not has_doctor:
+                known_id   = ctx["selected_doctor"].get("id")
+                known_name = ctx["selected_doctor"].get("name")
+                if known_id:
+                    args["doctor_id"] = known_id
+                    print(f"   💉 [Guard4] Auto-injected doctor_id={known_id} into find_provider_availability")
+                elif known_name:
+                    args["doctor_name"] = known_name
+                    print(f"   💉 [Guard4] Auto-injected doctor_name='{known_name}' into find_provider_availability")
+                else:
+                    known_spec = ctx.get("recommended_specialist") or ctx["selected_doctor"].get("specialization")
+                    if known_spec:
+                        args["specialization"] = known_spec
+                        print(f"   💉 [Guard4] Auto-injected specialization='{known_spec}' into find_provider_availability")
+            # Require a date — calling without one defaults to today which is usually wrong
+            if not args.get("date"):
+                block_msg = (
+                    "find_provider_availability blocked — no date provided. "
+                    "Ask the patient which day they prefer before checking availability."
+                )
+                print(f"   🚫 [Guard4] BLOCKED — no date in find_provider_availability call")
+                tool_messages.append(ToolMessage(content=block_msg, tool_call_id=tool_call_id, name=tool_name))
+                continue
+            tool_args = args  # use the patched args
+
         # ── GUARD 3: create_booking requires confirmed YES ────────
         if tool_name == "create_booking":
             last_human = _last_human_text(messages)
             is_yes     = bool(_YES_RE.search(last_human))
             step       = ctx.get("step", "")
 
-            print(f"   🔐 [BookingGate] step='{step}'  last_human='{last_human[:80]}'  is_yes={is_yes}")
+            print(f"\n   🔐 [BookingGate] ═══════════════════════════════════")
+            print(f"   🔐 step          = '{step}'  (must be 'await_confirmation')")
+            print(f"   🔐 last_human    = '{last_human[:120]}'")
+            print(f"   🔐 is_yes        = {is_yes}")
+            print(f"   🔐 patient.id    = {ctx['patient']['id']}")
+            print(f"   🔐 doctor.id     = {ctx['selected_doctor']['id']}")
+            print(f"   🔐 slot.date     = {ctx['pending_slot']['date']}")
+            print(f"   🔐 slot.time     = {ctx['pending_slot']['time']}")
+            print(f"   🔐 ═══════════════════════════════════════════════════")
 
             if step != "await_confirmation":
+                # Diagnose WHY we aren't at await_confirmation yet
+                p = ctx["patient"]
+                d = ctx["selected_doctor"]
+                s = ctx["pending_slot"]
+                reasons = []
+                if not p["id"]:     reasons.append(f"patient.id is None")
+                if not d["id"]:     reasons.append(f"doctor.id is None")
+                if not s["date"]:   reasons.append(f"pending_slot.date is None")
+                if not s["time"]:   reasons.append(f"pending_slot.time is None")
+                reasons_str = " | ".join(reasons) if reasons else "unknown reason"
                 block_msg = (
                     f"Booking blocked — step is '{step}', must be 'await_confirmation'. "
+                    f"Root cause: {reasons_str}. "
                     f"Show the appointment summary and ask the patient to confirm first."
                 )
-                print(f"   🚫 [BookingGate] BLOCKED — wrong step")
+                print(f"   🚫 [BookingGate] BLOCKED — wrong step. Root cause: {reasons_str}")
                 tool_messages.append(ToolMessage(content=block_msg, tool_call_id=tool_call_id, name=tool_name))
                 continue
 
@@ -588,7 +758,7 @@ def tool_executor_node(state: ConversationState) -> dict:
                 tool_messages.append(ToolMessage(content=block_msg, tool_call_id=tool_call_id, name=tool_name))
                 continue
 
-            print(f"   ✅ [BookingGate] ALLOWED — patient said YES")
+            print(f"   ✅ [BookingGate] ALLOWED — step is correct and patient said YES")
 
         # ── Run the tool ──────────────────────────────────────────
         fn = _TOOL_MAP.get(tool_name)
@@ -726,9 +896,12 @@ PATIENT LANGUAGE: {ctx.get("patient_language", "en")}
 ABSOLUTE PROHIBITIONS:
   Never call a tool with null/unknown values.
   Never call lookup_customer_profile if patient.id is set above.
-  Never call get_doctor_schedule — use find_provider_availability.
+  Never call get_doctor_schedule — use find_provider_availability instead.
   Never call create_booking — code handles it after YES.
+  Never call find_provider_availability without a date — ask the patient first.
+  Always pass doctor_id or doctor_name when calling find_provider_availability.
   One tool per turn, then reply to the user.
+{"  TRIAGE DONE: NEVER emit [SYMPTOM_LOGGED:...] or [START_TRIAGE] — triage is complete." if ctx.get("triage_completed") else ""}
 """)
 
     print("📡 [Supervisor] Calling LLM…")

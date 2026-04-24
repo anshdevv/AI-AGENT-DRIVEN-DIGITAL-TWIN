@@ -1,0 +1,153 @@
+{
+  "session_id": "531435b2-ebf9-4fc1-81a2-eeaa744a51c2",
+  "created_at": "2026-04-24T13:47:22.192957+05:00",
+  "last_updated": "2026-04-24T13:55:09.382729+05:00",
+  "step": "completed",
+  "prime_complaint": "severe headache",
+  "recommended_specialist": "General Physician",
+  "triage_completed": true,
+  "triage_questions_asked": 0,
+  "triage_qa": [
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: Is your headache always there, or does it come and go?\nA: it comes and goes",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: Is your headache always there, or does it come and go?\nA: it comes and goes",
+    "Q: Does anything seem to make your headache worse, like moving your head or doing specific tasks?\nA: moving around my head",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: Is your headache always there, or does it come and go?\nA: it comes and goes",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: Is your headache always there, or does it come and go?\nA: it comes and goes",
+    "Q: Does anything seem to make your headache worse, like moving your head or doing specific tasks?\nA: moving around my head",
+    "Q: Besides the headache, do you feel sick to your stomach, throw up, or notice any changes in how you see things?\nA: no other symptoms",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: Is your headache always there, or does it come and go?\nA: it comes and goes",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: Is your headache always there, or does it come and go?\nA: it comes and goes",
+    "Q: Does anything seem to make your headache worse, like moving your head or doing specific tasks?\nA: moving around my head",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: Is your headache always there, or does it come and go?\nA: it comes and goes",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: How long have you had this headache?\nA: its been going on for a couple of hours",
+    "Q: Is your headache always there, or does it come and go?\nA: it comes and goes",
+    "Q: Does anything seem to make your headache worse, like moving your head or doing specific tasks?\nA: moving around my head",
+    "Q: Besides the headache, do you feel sick to your stomach, throw up, or notice any changes in how you see things?\nA: no other symptoms",
+    "Q: Have you tried any medicine for the headache, and did it help?\nA: i had tea and it made it helped"
+  ],
+  "medgemma_raw_history": [
+    {
+      "role": "user",
+      "content": "severe headache"
+    },
+    {
+      "role": "assistant",
+      "content": "How long have you been experiencing this headache?"
+    },
+    {
+      "role": "user",
+      "content": "its been going on for a couple of hours"
+    },
+    {
+      "role": "assistant",
+      "content": "Is the headache a constant pain, or does it come and go?"
+    },
+    {
+      "role": "user",
+      "content": "it comes and goes"
+    },
+    {
+      "role": "assistant",
+      "content": "Does anything seem to make the headache worse, like certain movements or activities?"
+    },
+    {
+      "role": "user",
+      "content": "moving around my head"
+    },
+    {
+      "role": "assistant",
+      "content": "Are you experiencing any other symptoms along with the headache, such as nausea, vomiting, or vision changes?"
+    },
+    {
+      "role": "user",
+      "content": "no other symptoms"
+    },
+    {
+      "role": "assistant",
+      "content": "Have you taken any medications for the headache, and did they help?"
+    },
+    {
+      "role": "user",
+      "content": "i had tea and it made it helped"
+    },
+    {
+      "role": "assistant",
+      "content": "[TRIAGE_COMPLETE]\nCLINICAL_SUMMARY:\n- Chief complaint: severe headache\n- Duration: 2 hours\n- Severity: Mild\n- Associated symptoms: None\n- Relevant history: Tea helped\n- Suggested specialist: General Physician"
+    }
+  ],
+  "accumulated_symptoms": [
+    "i am having severe headache",
+    "its been going on for a couple of hours",
+    "it comes and goes",
+    "moving around my head",
+    "no other symptoms",
+    "i had tea and it made it helped"
+  ],
+  "symptom_context_block": "── SYMPTOM LOOKUP CONTEXT (from medical datasets) ──\nSeverity estimate   : Mild\nRecommendation      : OTC Drug\nSuggested specialist: General Physician\n\nTop candidate conditions:\n  1. Drug Reaction  (score 50%)\n     Matched symptoms : headache\n     Precautions      : stop irritation; consult nearest hospital; stop taking drug; follow up\n  2. Hypertension  (score 50%)\n     Matched symptoms : headache\n     Precautions      : meditation; salt baths; reduce stress; get proper sleep\n  3. Migraine  (score 50%)\n     Matched symptoms : headache\n     Precautions      : meditation; reduce stress; use poloroid glasses in sun; consult doctor\n────────────────────────────────────────────────────",
+  "final_symptom_match": "── SYMPTOM LOOKUP CONTEXT (from medical datasets) ──\nSeverity estimate   : Mild\nRecommendation      : OTC Drug\nSuggested specialist: General Physician\n\nTop candidate conditions:\n  1. Drug Reaction  (score 3%)\n     Matched symptoms : headache\n     Precautions      : stop irritation; consult nearest hospital; stop taking drug; follow up\n  2. Hypertension  (score 3%)\n     Matched symptoms : headache\n     Precautions      : meditation; salt baths; reduce stress; get proper sleep\n  3. Migraine  (score 3%)\n     Matched symptoms : headache\n     Precautions      : meditation; reduce stress; use poloroid glasses in sun; consult doctor\n────────────────────────────────────────────────────",
+  "patient": {
+    "id": 2,
+    "name": "Muhammad hamza",
+    "phone": "03102010910"
+  },
+  "selected_doctor": {
+    "id": 7,
+    "name": "Dr.Afaf Irfan",
+    "specialization": "General Physician"
+  },
+  "pending_slot": {
+    "date": "2026-04-27",
+    "time": "9:30"
+  },
+  "appointment": {
+    "date": "2026-04-27",
+    "time": "09:30",
+    "confirmed": true,
+    "booking_id": 9
+  },
+  "patient_language": "en",
+  "triage_severity": "Mild",
+  "patient_history_block": "",
+  "triage_start_msg_index": 0,
+  "routing_reason": "First visit / non-severe → General Physician first",
+  "diagnostic_report": "=========================================\n     PRE-CONSULTATION SOAP NOTE\n=========================================\nDATE                : 2026-04-24 13:55 PKT\nATTENDING PHYSICIAN : Dr.Afaf Irfan\nSPECIALTY           : General Physician\n\nPATIENT\n  Name  : Muhammad hamza\n  Phone : 03102010910\n\n─────────────────────────────────────────\nS — SUBJECTIVE\n─────────────────────────────────────────\nChief Complaint: severe headache\nHistory of Present Illness (HPI): Patient reports a headache that has been going on for a couple of hours. The headache comes and goes. It is aggravated by moving his head. He reports that drinking tea helped.\nTriage Q&A (clinical pre-screening):\n  Q1: How long have you been experiencing this headache?\n  A1: its been going on for a couple of hours\n  Q2: Is the headache a constant pain, or does it come and go?\n  A2: it comes and goes\n  Q3: Does anything seem to make the headache worse, like certain movements or activities?\n  A3: moving around my head\n  Q4: Are you experiencing any other symptoms along with the headache, such as nausea, vomiting, or vision changes?\n  A4: no other symptoms\n  Q5: Have you taken any medications for the headache, and did they help?\n  A5: i had tea and it made it helped\n\nPast Medical / Surgical History: Not provided\n\n─────────────────────────────────────────\nO — OBJECTIVE\n─────────────────────────────────────────\nVital Signs    : Not recorded (pre-consultation triage only)\nPhysical Exam  : Deferred — to be completed by attending physician\n\nSymptom Severity  : Mild\nSymptom Match     : ── SYMPTOM LOOKUP CONTEXT (from medical datasets) ──\nSeverity estimate   : Mild\nRecommendation      : OTC Drug\nSuggested specialist: General Physician\n\nTop candidate conditions:\n  1. Drug Reaction  (score 3%)\n     Matched symptoms : headache\n     Precautions      : stop irritation; consult nearest hospital; stop taking drug; follow up\n  2. Hypertension  (score 3%)\n     Matched symptoms : headache\n     Precautions      : meditation; salt baths; reduce stress; get proper sleep\n  3. Migraine  (score 3%)\n     Matched symptoms : headache\n     Precautions      : meditation; reduce stress; use poloroid glasses in sun; consult doctor\n────────────────────────────────────────────────────\n\n─────────────────────────────────────────\nA — ASSESSMENT\n─────────────────────────────────────────\nClinical Impression: Mild headache, likely tension-type headache or migraine.\nRouting Rationale : First visit / non-severe → General Physician first\n\n─────────────────────────────────────────\nP — PLAN\n─────────────────────────────────────────\nRecommended Specialist : General Physician\nBooking Status         : CONFIRMED — Booking ID 9  (2026-04-27 at 09:30)\n\nPrecautions / Red Flags to Discuss: Discuss with attending physician.\n\nNext Steps:\n  1. Attending physician to perform full history and physical examination.\n  2. Order investigations as clinically indicated.\n  3. Review and update this note after consultation.\n=========================================\nPRECAUTIONS         : Discuss with attending physician.\n\nTRIAGE Q&A (MedGemma clinical questions + patient answers — use for HPI):\nQ1: How long have you been experiencing this headache?\nA1: its been going on for a couple of hours\nQ2: Is the headache a constant pain, or does it come and go?\nA2: it comes and goes\nQ3: Does anything seem to make the headache worse, like certain movements or activities?\nA3: moving around my head\nQ4: Are you experiencing any other symptoms along with the headache, such as nausea, vomiting, or vision changes?\nA4: no other symptoms\nQ5: Have you taken any medications for the headache, and did they help?\nA5: i had tea and it made it helped\n\nCLINICAL SUMMARY FROM TRIAGE:\nSee triage Q&A above.",
+  "diagnostic_generated_at": "2026-04-24T14:01:03.973158+05:00",
+  "medgemma_qa_pairs": [
+    {
+      "q": "How long have you been experiencing this headache?",
+      "a": "its been going on for a couple of hours"
+    },
+    {
+      "q": "Is the headache a constant pain, or does it come and go?",
+      "a": "it comes and goes"
+    },
+    {
+      "q": "Does anything seem to make the headache worse, like certain movements or activities?",
+      "a": "moving around my head"
+    },
+    {
+      "q": "Are you experiencing any other symptoms along with the headache, such as nausea, vomiting, or vision changes?",
+      "a": "no other symptoms"
+    },
+    {
+      "q": "Have you taken any medications for the headache, and did they help?",
+      "a": "i had tea and it made it helped"
+    }
+  ],
+  "medgemma_succeeded": true
+}
