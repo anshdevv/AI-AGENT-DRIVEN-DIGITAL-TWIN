@@ -135,8 +135,8 @@ def health() -> dict:
         "ok": True,
         "domain": settings.app_domain,
         "huggingface_llm": bool(settings.huggingface_api_key),
-        "groq_stt": voice_service.supports_server_stt,
-        "edge_tts": voice_service.supports_server_tts,
+        "elevenlabs_stt": voice_service.supports_server_stt,
+        "elevenlabs_tts": voice_service.supports_server_tts,
     }
 
 
@@ -148,12 +148,13 @@ async def voice_message(request: VoiceRequest) -> dict:
     raw_transcript, detected_lang = await voice_service.transcribe_raw(
         audio_bytes=audio_bytes,
         mime_type=request.mime_type,
+        transcript_hint=request.transcript,
     )
 
     if detected_lang not in ("en", "english"):
         _session_lang[session_id] = detected_lang
 
-    if detected_lang not in ("en", "english") and audio_bytes:
+    if detected_lang not in ("en", "english") and audio_bytes and voice_service.supports_server_stt:
         transcript = await voice_service.translate_to_english(
             audio_bytes=audio_bytes,
             mime_type=request.mime_type,

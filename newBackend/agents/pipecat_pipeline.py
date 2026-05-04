@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -23,6 +24,8 @@ class PipecatCallPipeline:
     interruption: if user speaks while assistant audio is still playing, backend
     emits `assistant_interrupted` so frontend can stop playback immediately.
     """
+
+    AUDIO_FLUSH_SILENCE_MS = max(250, int(os.getenv("CALL_AUDIO_FLUSH_SILENCE_MS", "850")))
 
     def __init__(
         self,
@@ -46,6 +49,11 @@ class PipecatCallPipeline:
         self._assistant_speaking = False
         self._generation_id = 0
         self._lock = asyncio.Lock()
+        self._audio_lock = asyncio.Lock()
+        self._pending_audio_chunks: list[bytes] = []
+        self._pending_audio_mime_type = "audio/webm"
+        self._pending_transcript_hint = ""
+        self._audio_flush_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         self._worker_task = asyncio.create_task(self._turn_worker())
@@ -61,6 +69,12 @@ class PipecatCallPipeline:
 
     async def shutdown(self) -> None:
         self._closed = True
+        if self._audio_flush_task:
+            self._audio_flush_task.cancel()
+            try:
+                await self._audio_flush_task
+            except asyncio.CancelledError:
+                pass
         if self._worker_task:
             self._worker_task.cancel()
             try:
@@ -116,35 +130,72 @@ class PipecatCallPipeline:
             return
         print(f"[Pipecat] audio bytes={len(audio_bytes)} mime={mime_type}")
 
-        try:
-            raw_transcript, detected_lang = await self.voice_service.transcribe_raw(
-                audio_bytes=audio_bytes,
-                mime_type=mime_type,
-            )
-        except Exception as e:
-            await self._safe_send({"type": "error", "message": f"Speech recognition failed: {e}"})
+        transcript_hint = (payload.get("transcript") or "").strip()
+        flush_now = bool(
+            payload.get("final")
+            or payload.get("is_final")
+            or payload.get("end_of_speech")
+            or payload.get("speech_ended")
+        )
+
+        await self._interrupt_assistant(reason="user_barge_in")
+
+        async with self._audio_lock:
+            self._pending_audio_chunks.append(audio_bytes)
+            self._pending_audio_mime_type = mime_type or self._pending_audio_mime_type
+            if transcript_hint:
+                self._pending_transcript_hint = transcript_hint
+
+        if flush_now:
+            await self._flush_buffered_audio()
             return
+
+        await self._schedule_audio_flush()
+
+    async def _schedule_audio_flush(self) -> None:
+        if self._audio_flush_task:
+            self._audio_flush_task.cancel()
+
+        async def delayed_flush() -> None:
+            try:
+                await asyncio.sleep(self.AUDIO_FLUSH_SILENCE_MS / 1000)
+                await self._flush_buffered_audio()
+            except asyncio.CancelledError:
+                return
+
+        self._audio_flush_task = asyncio.create_task(delayed_flush())
+
+    async def _flush_buffered_audio(self) -> None:
+        async with self._audio_lock:
+            if not self._pending_audio_chunks:
+                return
+            chunks = self._pending_audio_chunks
+            mime_type = self._pending_audio_mime_type
+            transcript_hint = self._pending_transcript_hint
+            self._pending_audio_chunks = []
+            self._pending_transcript_hint = ""
+            self._audio_flush_task = None
+
+        transcript, detected_lang = await self._transcribe_buffered_chunks(
+            chunks=chunks,
+            mime_type=mime_type,
+            transcript_hint=transcript_hint,
+        )
 
         if detected_lang not in ("en", "english"):
             self.session_lang_store[self.session_id] = detected_lang
 
-        if not raw_transcript.strip():
-            print("[Pipecat] empty transcript from STT")
+        if not transcript.strip():
+            print("[Pipecat] empty transcript after buffered STT flush")
+            if not self.voice_service.supports_server_stt:
+                await self._safe_send(
+                    {
+                        "type": "error",
+                        "message": "Server STT is disabled. Send 'user_transcript' (text) or include transcript in payload.",
+                    }
+                )
             return
 
-        if detected_lang not in ("en", "english"):
-            try:
-                english_transcript = await self.voice_service.translate_to_english(
-                    audio_bytes=audio_bytes,
-                    mime_type=mime_type,
-                )
-                transcript = english_transcript.strip() or raw_transcript
-            except Exception:
-                transcript = raw_transcript
-        else:
-            transcript = raw_transcript
-
-        await self._interrupt_assistant(reason="user_barge_in")
         await self._safe_send(
             {
                 "type": "user_transcript_echo",
@@ -153,6 +204,73 @@ class PipecatCallPipeline:
             }
         )
         await self._enqueue_turn(transcript)
+
+    async def _transcribe_buffered_chunks(
+        self,
+        *,
+        chunks: list[bytes],
+        mime_type: str,
+        transcript_hint: str,
+    ) -> tuple[str, str]:
+        if not chunks:
+            return "", "en"
+
+        merged_audio = b"".join(chunks)
+        try:
+            raw_transcript, detected_lang = await self.voice_service.transcribe_raw(
+                audio_bytes=merged_audio,
+                mime_type=mime_type,
+                transcript_hint=transcript_hint,
+            )
+        except Exception as e:
+            await self._safe_send({"type": "error", "message": f"Speech recognition failed: {e}"})
+            return "", "en"
+
+        if raw_transcript.strip():
+            transcript = raw_transcript.strip()
+            if detected_lang not in ("en", "english") and self.voice_service.supports_server_stt:
+                try:
+                    english_transcript = await self.voice_service.translate_to_english(
+                        audio_bytes=merged_audio,
+                        mime_type=mime_type,
+                    )
+                    transcript = english_transcript.strip() or transcript
+                except Exception:
+                    pass
+            return transcript, detected_lang
+
+        if len(chunks) == 1:
+            return "", detected_lang
+
+        piece_texts: list[str] = []
+        piece_lang = detected_lang
+        for chunk in chunks:
+            try:
+                piece_transcript, piece_lang = await self.voice_service.transcribe_raw(
+                    audio_bytes=chunk,
+                    mime_type=mime_type,
+                    transcript_hint=transcript_hint,
+                )
+            except Exception:
+                continue
+            piece_transcript = piece_transcript.strip()
+            if piece_transcript:
+                piece_texts.append(piece_transcript)
+
+        transcript = " ".join(piece_texts).strip()
+        if not transcript:
+            return "", piece_lang
+
+        if piece_lang not in ("en", "english") and self.voice_service.supports_server_stt:
+            try:
+                english_transcript = await self.voice_service.translate_to_english(
+                    audio_bytes=merged_audio,
+                    mime_type=mime_type,
+                )
+                transcript = english_transcript.strip() or transcript
+            except Exception:
+                pass
+        return transcript, piece_lang
 
     async def _enqueue_turn(self, transcript: str) -> None:
         await self._turn_queue.put(PipelineTurn(transcript=transcript, channel="call"))

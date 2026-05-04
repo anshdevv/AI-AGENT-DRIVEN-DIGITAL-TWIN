@@ -267,7 +267,7 @@ _TOOL_MAP: dict[str, Any] = {t.name: t for t in ALL_TOOLS}
 # ═══════════════════════════════════════════════════════════════════
 
 MAX_HISTORY_MESSAGES = 20   # Raised from 12 — triage now runs up to 8 rounds
-MAX_TOOLS_PER_TURN   = 4    # Hard cap — prevents Groq 400 from long tool chains
+MAX_TOOLS_PER_TURN   = 8    # Hard cap — prevents Groq 400 from long tool chains
 
 _YES_RE = re.compile(
     r"\b(yes|yeah|yep|yup|confirm|book\s*it|go\s*ahead|sure|ok|okay|"

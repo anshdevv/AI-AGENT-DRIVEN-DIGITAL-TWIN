@@ -1,0 +1,44 @@
+{
+  "session_id": "fdd6d69c-e870-4d8e-ad1e-bf029a239e3f",
+  "created_at": "2026-04-25T02:55:47.523982+05:00",
+  "last_updated": "2026-04-25T02:58:33.501065+05:00",
+  "step": "collect_slot",
+  "prime_complaint": "headache",
+  "recommended_specialist": "General Physician",
+  "triage_completed": true,
+  "triage_questions_asked": 0,
+  "triage_qa": [
+    "Q: Hello! How can I assist you today? If you're feeling unwell, I'm here to help with medical triage and booking an appointment. Please share your symptoms, and I'll guide you through the process.\nA: مجھے سر میں درد ہو رہا ہے۔",
+    "Q: To proceed with booking your appointment, I'll need your phone number to check your patient profile. Could you please share your contact number? (We only need the digits, no spaces or symbols.)\nA: Zero three two three three three nine four nine four two"
+  ],
+  "accumulated_symptoms": [
+    "Zero three two three three three nine four nine four two"
+  ],
+  "symptom_context_block": "── SYMPTOM LOOKUP CONTEXT (from medical datasets) ──\nSeverity estimate   : Mild\nRecommendation      : OTC Drug\nSuggested specialist: Cardiologist\n\nTop candidate conditions:\n  1. Hypertension  (score 100%)\n     Matched symptoms : headache\n     Precautions      : meditation; salt baths; reduce stress; get proper sleep\n  2. Migraine  (score 100%)\n     Matched symptoms : headache\n     Precautions      : meditation; reduce stress; use poloroid glasses in sun; consult doctor\n  3. Paralysis Brain Hemorrhage  (score 100%)\n     Matched symptoms : headache\n     Precautions      : massage; eat healthy; exercise; consult doctor\n────────────────────────────────────────────────────",
+  "final_symptom_match": "── SYMPTOM LOOKUP CONTEXT (from medical datasets) ──\nSeverity estimate   : Mild\nRecommendation      : OTC Drug\nSuggested specialist: Cardiologist\n\nTop candidate conditions:\n  1. Hypertension  (score 17%)\n     Matched symptoms : headache\n     Precautions      : meditation; salt baths; reduce stress; get proper sleep\n  2. Migraine  (score 17%)\n     Matched symptoms : headache\n     Precautions      : meditation; reduce stress; use poloroid glasses in sun; consult doctor\n  3. Paralysis Brain Hemorrhage  (score 17%)\n     Matched symptoms : headache\n     Precautions      : massage; eat healthy; exercise; consult doctor\n────────────────────────────────────────────────────",
+  "patient": {
+    "id": 1,
+    "name": "ansh dev udassi",
+    "phone": "03233394942"
+  },
+  "selected_doctor": {
+    "id": 7,
+    "name": "Dr.Afaf Irfan",
+    "specialization": "General Physician"
+  },
+  "pending_slot": {
+    "date": null,
+    "time": null
+  },
+  "appointment": {
+    "date": null,
+    "time": null,
+    "confirmed": false,
+    "booking_id": null
+  },
+  "patient_language": "urd",
+  "triage_severity": "Mild",
+  "patient_history_block": "── PATIENT HISTORY (last 5 visits) ──\nLast 1 note(s) for patient 1:\n  [2026-04-06T13:35:54.003396+00:00] Appt#1 — Here's a summary of\n────────────────────",
+  "triage_start_msg_index": 0,
+  "routing_reason": "First visit / non-severe → General Physician first"
+}

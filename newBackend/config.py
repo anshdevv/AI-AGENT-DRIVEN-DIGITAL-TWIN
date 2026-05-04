@@ -45,6 +45,12 @@ class Settings:
     huggingface_api_key: str = field(default_factory=lambda: os.getenv("HUGGINGFACE_API_KEY", "").strip())
     groq_api_key: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY", "").strip())
     elevenlabs_api_key: str = field(default_factory=lambda: os.getenv("ELEVENLABS_API_KEY", os.getenv("ElevenLabs", "")).strip())
+    elevenlabs_stt_model: str = field(default_factory=lambda: os.getenv("ELEVENLABS_STT_MODEL", "scribe_v2").strip())
+    elevenlabs_stt_language_hint: str = field(default_factory=lambda: os.getenv("ELEVENLABS_STT_LANGUAGE_HINT", "ur").strip().lower())
+    elevenlabs_voice_id: str = field(default_factory=lambda: os.getenv("ELEVENLABS_VOICE_ID", "nPczCjzI2devNBz1zQrb").strip())
+    elevenlabs_tts_model: str = field(default_factory=lambda: os.getenv("ELEVENLABS_TTS_MODEL", "eleven_turbo_v2_5").strip())
+    elevenlabs_tts_fallback_model: str = field(default_factory=lambda: os.getenv("ELEVENLABS_TTS_FALLBACK_MODEL", "eleven_turbo_v2_5").strip())
+    elevenlabs_output_format: str = field(default_factory=lambda: os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128").strip())
     
     # Models (UPDATED TO DEFAULT TO QWEN 14B)
     action_model: str = field(default_factory=lambda: os.getenv("ACTION_MODEL", "Qwen/Qwen2.5-14B-Instruct"))
