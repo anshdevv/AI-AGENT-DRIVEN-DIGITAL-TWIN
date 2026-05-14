@@ -17,6 +17,8 @@
 #   - tool_executor blocks re-fetching patient data if already in context
 #   - Triage runs FIRST; booking step starts at collect_patient after triage
 #   - Triage Q&A saved to Supabase via save_case_notes
+#   - Slot extraction is LLM-based (no regex) — handles all languages/formats
+#     Default time when none is stated: 11:00 AM
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -46,6 +48,20 @@ except ZoneInfoNotFoundError:
 
 
 # ═══════════════════════════════════════════════════════════════════
+# TESTING FLAGS
+# ═══════════════════════════════════════════════════════════════════
+# Set this to False when you want the assistant to follow the detected/user language again.
+FORCE_ENGLISH_TEST = True
+
+
+def _force_english_for_testing(ctx: dict) -> dict:
+    """Testing-only language lock: keep supervisor/Qwen-facing replies in English."""
+    if FORCE_ENGLISH_TEST:
+        ctx["patient_language"] = "en"
+    return ctx
+
+
+# ═══════════════════════════════════════════════════════════════════
 # BOOKING CONTEXT — per-session JSON sidecar
 # ═══════════════════════════════════════════════════════════════════
 
@@ -65,6 +81,7 @@ def _empty_booking_context(session_id: str) -> dict:
         "session_id":               session_id,
         "created_at":               datetime.now(PKT).isoformat(),
         "last_updated":             None,
+        "patient_language":         "en",
         "step":                     "collect_patient",
         "prime_complaint":          None,
         "recommended_specialist":   None,
@@ -137,33 +154,41 @@ def _advance_step(ctx: dict) -> None:
     d = ctx["selected_doctor"]
     s = ctx["pending_slot"]
 
-    print(f"\n🔀 [AdvanceStep] Evaluating state:")
-    print(f"   patient.id      = {p['id']}")
-    print(f"   doctor.id       = {d['id']}")
-    print(f"   pending_slot    = {s['date']} at {s['time']}")
-    print(f"   confirmed       = {ctx['appointment']['confirmed']}")
+    print(f"\n🔀 [AdvanceStep] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"🔀 [AdvanceStep] patient.id      = {p['id']}         ← must be set")
+    print(f"🔀 [AdvanceStep] patient.name    = {p['name']}")
+    print(f"🔀 [AdvanceStep] doctor.id       = {d['id']}         ← must be set")
+    print(f"🔀 [AdvanceStep] doctor.name     = {d['name']}")
+    print(f"🔀 [AdvanceStep] pending_slot    = {s['date']} at {s['time']}  ← both must be set")
+    print(f"🔀 [AdvanceStep] confirmed       = {ctx['appointment']['confirmed']}")
+    print(f"🔀 [AdvanceStep] booking_id      = {ctx['appointment'].get('booking_id')}")
 
     if ctx["appointment"]["confirmed"]:
         ctx["step"] = "completed"
-        print(f"   → step = 'completed' (appointment already confirmed)")
+        print(f"🔀 [AdvanceStep] → step = 'completed' ✅ (appointment already confirmed)")
+        print(f"🔀 [AdvanceStep] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
         return
     if p["id"] and d["id"] and s["date"] and s["time"]:
         ctx["step"] = "await_confirmation"
-        print(f"   → step = 'await_confirmation' ✅ all data present")
+        print(f"🔀 [AdvanceStep] → step = 'await_confirmation' ✅ all data present")
+        print(f"🔀 [AdvanceStep] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
         return
     if not p["id"]:
         ctx["step"] = "collect_patient"
-        print(f"   → step = 'collect_patient' (missing patient.id)")
+        print(f"🔀 [AdvanceStep] → step = 'collect_patient' ❌ missing patient.id")
+        print(f"🔀 [AdvanceStep] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
         return
     if not d["id"]:
         ctx["step"] = "collect_doctor"
-        print(f"   → step = 'collect_doctor' (missing doctor.id)")
+        print(f"🔀 [AdvanceStep] → step = 'collect_doctor' ❌ missing doctor.id")
+        print(f"🔀 [AdvanceStep] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
         return
     ctx["step"] = "collect_slot"
     missing = []
     if not s["date"]: missing.append("date")
     if not s["time"]: missing.append("time")
-    print(f"   → step = 'collect_slot' (missing slot: {', '.join(missing)})")
+    print(f"🔀 [AdvanceStep] → step = 'collect_slot' ❌ missing slot fields: {', '.join(missing)}")
+    print(f"🔀 [AdvanceStep] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 
 
 def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
@@ -216,9 +241,18 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
 
     elif step == "collect_doctor":
         spec = ctx.get("recommended_specialist", "")
-        lines.append("YOUR NEXT ACTION: Find and select a doctor.")
-        lines.append(f"  Call get_doctors_by_specialization('{spec}') to list doctors.")
-        lines.append("  Ask which doctor the patient prefers, then call get_doctor_profile to confirm ID.")
+        if d["id"]:
+            # Doctor already resolved — should not normally land here, but be safe
+            lines.append("YOUR NEXT ACTION: Doctor is already selected — do NOT call any doctor tools.")
+            lines.append(f"  Doctor: Dr. {d['name']} (ID={d['id']}, {d['specialization']})")
+            lines.append("  Just ask the patient which date they prefer for their appointment.")
+        else:
+            lines.append("YOUR NEXT ACTION: Find and select a doctor.")
+            lines.append(f"  1. Call get_doctors_by_specialization(specialization='{spec}') to list available doctors.")
+            lines.append("  2. If only one doctor is returned, auto-select them and immediately ask for a preferred date.")
+            lines.append("  3. If multiple doctors, present them and ask the patient to pick one.")
+            lines.append("  ⛔ DO NOT call get_doctor_profile — the ID is extracted automatically from the list.")
+            lines.append("  ⛔ DO NOT call get_doctors_by_specialization more than once.")
 
     elif step == "collect_slot":
         d_name     = d.get("name", "Unknown")
@@ -241,15 +275,17 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
             lines.append("  3. Show the returned free slots. Ask the patient to confirm one.")
             lines.append("  4. Once patient confirms a specific slot → show full booking summary and ask YES/NO.")
         else:
-            lines.append(f"  STEP 1: Call get_doctor_profile(doctor_id={d_id}) to fetch Dr. {d_name}'s schedule.")
-            lines.append("  STEP 2: Present the schedule days to the patient and ask which they prefer.")
-            lines.append(f"  STEP 3: Call find_provider_availability(doctor_id={d_id}, date='<chosen_day>').")
-            lines.append("  STEP 4: Show free slots, ask patient to pick one.")
+            lines.append(f"  ⛔ DO NOT call get_doctor_profile or any doctor-lookup tool.")
+            lines.append(f"  STEP 1: Ask the patient which day they would like to see Dr. {d_name}.")
+            lines.append(f"  STEP 2: Once they give a day, call find_provider_availability(doctor_id={d_id}, date='<chosen_day>').")
+            lines.append("  STEP 3: Show free slots, ask patient to pick one.")
 
         lines.append("")
         lines.append("  ⛔ NEVER call find_provider_availability without a date.")
         lines.append(f"  ⛔ ALWAYS pass doctor_id={d_id} — never leave doctor unspecified.")
         lines.append("  ⛔ DO NOT call get_doctor_schedule — use find_provider_availability.")
+        lines.append("  ⛔ NEVER present appointment time options from your own knowledge.")
+        lines.append("     You MUST call find_provider_availability first — only show slots it returns.")
 
     if ctx.get("triage_completed"):
         lines.append("")
@@ -266,12 +302,13 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
         lines.append("  DO NOT call create_booking — code handles it after YES.")
 
     elif step == "completed":
-        lines.append("YOUR NEXT ACTION: Booking is confirmed. Follow these steps in order:")
-        lines.append(f"  1. Confirm the booking warmly: Dr. {d['name']}, {s['date']} at {s['time']}, Booking ID={ctx['appointment']['booking_id']}")
-        lines.append("  2. Ask: 'Is there anything else I can help you with today?'")
-        lines.append("  3. If the patient says no / goodbye / nothing else → output [END_CALL]")
-        lines.append("  4. If they have more questions, answer them first, then ask again.")
-        lines.append("  ⛔ DO NOT call any tools.")
+        lines.append("YOUR NEXT ACTION: Booking is confirmed.")
+        lines.append(f"  1. Warmly confirm: Dr. {d['name']}, {s['date']} at {s['time']}, Booking ID={ctx['appointment']['booking_id']}")
+        lines.append("  2. Ask ONE time: 'Is there anything else I can help you with today?'")
+        lines.append("  3. If the patient says no / goodbye / done / nothing else → output exactly: [END_CALL]")
+        lines.append("     Do NOT say goodbye yourself — the system will send the goodbye message.")
+        lines.append("  4. If they have a real follow-up question, answer it, then ask once more.")
+        lines.append("  ⛔ DO NOT call any tools. ⛔ DO NOT output [END_CALL] unless patient declines.")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     return "\n".join(lines)
@@ -311,6 +348,16 @@ def _get_llm_with_tools():
 
 _TOOL_MAP: dict[str, Any] = {t.name: t for t in ALL_TOOLS}
 
+_SLOT_EXTRACTOR_LLM: Any = None
+
+
+def _get_slot_extractor_llm():
+    """Lazy-init a raw (no tools) LLM used only for slot date/time extraction."""
+    global _SLOT_EXTRACTOR_LLM
+    if _SLOT_EXTRACTOR_LLM is None:
+        _SLOT_EXTRACTOR_LLM = get_llm(temperature=0.0)
+    return _SLOT_EXTRACTOR_LLM
+
 
 # ═══════════════════════════════════════════════════════════════════
 # HELPERS
@@ -321,7 +368,10 @@ MAX_TOOLS_PER_TURN   = 2    # Hard cap — prevents Groq 400 from long tool chai
 
 _YES_RE = re.compile(
     r"\b(yes|yeah|yep|yup|confirm|book\s*it|go\s*ahead|sure|ok|okay|"
-    r"haan|ji|bilkul|theek\s*hai|kar\s*do|confirm\s*kar)\b",
+    r"haan|ji|bilkul|theek\s*hai|kar\s*do|confirm\s*kar|"
+    r"book\s*(this|the|my)?\s*appointment|"
+    r"please\s*book|do\s*it|proceed|sounds\s*good|perfect|great|"
+    r"appointment\s*(book\s*kar|confirm\s*kar|kar\s*do))\b",
     re.IGNORECASE,
 )
 _INVALID_VALUES = {"unknown", "none", "null", "n/a", "", "undefined", "?"}
@@ -329,14 +379,15 @@ _TOOL_REQUIRED_ARGS = {
     "create_booking":          {"patient_id": "patient ID", "doctor_id": "doctor ID", "date": "date", "time": "time"},
     "lookup_customer_profile": {"phone": "patient phone number"},
 }
-_TIME_RE = re.compile(r"\b(\d{1,2}:\d{2})\b")
-# Matches schedule lines like "Monday: 09:01 – 18:01" from get_doctor_profile/get_doctor_schedule output
+
+# Used by _extract_from_tool_result — still needed for tool result parsing
 _SCHEDULE_RE = re.compile(
     r"\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
     r":\s*(\d{1,2}:\d{2})\s*[\u2013\-]\s*(\d{1,2}:\d{2})",
     re.IGNORECASE,
 )
-_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+_DATE_RE    = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+_BOOKING_ID_RE = re.compile(r"(?i)Appointment\s+ID:\s*(\d+)")
 
 
 def _is_invalid(val: Any) -> bool:
@@ -451,18 +502,21 @@ def _print_messages(messages: list, label: str = "Messages") -> None:
 # PER-TOOL BOOKING CONTEXT EXTRACTORS
 # ═══════════════════════════════════════════════════════════════════
 
-_PATIENT_ID_RE   = re.compile(r"['\"]id['\"]\s*:\s*(\d+)")                          # matches 'id': 3
-_PATIENT_NAME_RE = re.compile(r"['\"]name['\"]\s*:\s*['\"]([A-Za-z][A-Za-z ]{1,40}?)['\"]")  # matches 'name': 'ashal'
+_PATIENT_ID_RE   = re.compile(r"['\"]id['\"]\s*:\s*(\d+)")
+_PATIENT_NAME_RE = re.compile(r"['\"]name['\"]\s*:\s*['\"]([A-Za-z][A-Za-z ]{1,40}?)['\"]")
 _DOCTOR_ID_RE    = re.compile(r"\(ID:\s*(\d+)\)")
 _DOCTOR_NAME_RE  = re.compile(r"Dr\.\s+([A-Za-z][A-Za-z .]{1,40}?)(?:\s*[\(|,\n]|$)")
 _DOCTOR_SPEC_RE  = re.compile(r"\|\s*([A-Za-z][A-Za-z /]+?)\s*(?:Fee|$|\|)")
-_BOOKING_ID_RE   = re.compile(r"(?i)Appointment\s+ID:\s*(\d+)")
 _SPECIALIST_RE   = re.compile(r"(?i)(?:Recommended specialist|specialist|see a?n?)\s*[:\-]\s*([A-Za-z][A-Za-z /]{3,40})")
 
 
 def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, ctx: dict) -> bool:
     changed = False
-    print(f"🔍 [ToolExtract] Processing '{tool_name}' result")
+    print(f"\n🔍 [ToolExtract] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"🔍 [ToolExtract] tool        = '{tool_name}'")
+    print(f"🔍 [ToolExtract] args        = {tool_args}")
+    print(f"🔍 [ToolExtract] result[:200]= {result_str[:200]}")
+    print(f"🔍 [ToolExtract] BEFORE: patient.id={ctx['patient']['id']}  doctor.id={ctx['selected_doctor']['id']}  slot={ctx['pending_slot']}")
 
     if tool_name == "lookup_customer_profile":
         print(f"   result preview: {result_str[:300]}")
@@ -516,8 +570,6 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
                 changed = True
             print(f"   → doctor.spec = '{ctx['selected_doctor']['specialization']}'")
         # ── Cache the weekly schedule so we never re-fetch it ─────
-        # Parse lines like "Monday: 09:01 – 18:01" from the result text.
-        # Stored in ctx["doctor_schedule"] as a list of {day, start, end} dicts.
         schedule_entries = [
             {"day": m.group(1).title(), "start": m.group(2), "end": m.group(3)}
             for m in _SCHEDULE_RE.finditer(result_str)
@@ -526,9 +578,9 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
             ctx["doctor_schedule"] = schedule_entries
             changed = True
             print(f"   → doctor_schedule cached: {schedule_entries}")
+
     elif tool_name in ("get_doctors_by_specialization", "query_database_table"):
         print(f"   result preview: {result_str[:300]}")
-        # Always stamp specialization from args if available
         if not ctx["selected_doctor"]["specialization"]:
             spec = tool_args.get("specialization")
             if spec:
@@ -536,10 +588,6 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
                 changed = True
                 print(f"   → doctor.spec (from args) = '{spec}'")
 
-        # ── Extract doctor id + name from raw dict output ──────────
-        # Handles both formats:
-        #   [{'id': 7, 'name': 'Dr.Afaf Irfan'}]   ← query_database_table
-        #   - Dr. Afaf Irfan (ID: 7)                ← get_doctors_by_specialization formatted
         _RAW_DOC_ID_RE   = re.compile(r"['\"]id['\"]\s*:\s*(\d+)")
         _RAW_DOC_NAME_RE = re.compile(r"['\"]name['\"]\s*:\s*['\"]([^'\"]+)['\"]")
         _FMT_DOC_RE      = re.compile(
@@ -547,12 +595,10 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
             re.IGNORECASE,
         )
 
-        # Try formatted style first
         fmt_matches = _FMT_DOC_RE.findall(result_str)
         raw_ids     = _RAW_DOC_ID_RE.findall(result_str)
         raw_names   = _RAW_DOC_NAME_RE.findall(result_str)
 
-        # Filter out the patient id/name already stored so we don't cross-contaminate
         patient_id_str = str(ctx["patient"]["id"]) if ctx["patient"]["id"] else None
         patient_name   = ctx["patient"]["name"] or ""
 
@@ -563,7 +609,6 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
             changed = True
             print(f"   → (fmt) doctor.id={doc_id}  doctor.name='{name.strip()}'")
         elif raw_ids and not ctx["selected_doctor"]["id"]:
-            # Filter out patient id
             doc_ids = [i for i in raw_ids if i != patient_id_str]
             if len(doc_ids) == 1:
                 ctx["selected_doctor"]["id"] = int(doc_ids[0])
@@ -595,13 +640,12 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
 
     elif tool_name == "find_provider_availability":
         print(f"   result preview: {result_str[:300]}")
-        # Try to grab the date from the result itself (it echoes back the resolved date)
+        # Grab the resolved date echoed back in the result
         date_m = _DATE_RE.search(result_str)
         if date_m and not ctx["pending_slot"]["date"]:
             ctx["pending_slot"]["date"] = date_m.group(1)
             changed = True
             print(f"   → pending_slot.date (from availability result) = '{date_m.group(1)}'")
-        # Time will be extracted from the human message in _try_extract_pending_slot
 
     elif tool_name == "create_booking":
         print(f"   result preview: {result_str[:300]}")
@@ -625,8 +669,10 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
 
     if changed:
         _advance_step(ctx)
-        print(f"   → step advanced to '{ctx['step']}'")
-
+        print(f"🔍 [ToolExtract] AFTER:  patient.id={ctx['patient']['id']}  doctor.id={ctx['selected_doctor']['id']}  slot={ctx['pending_slot']}  step={ctx['step']}")
+    else:
+        print(f"🔍 [ToolExtract] AFTER:  no changes extracted from this tool result")
+    print(f"🔍 [ToolExtract] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
     return changed
 
 
@@ -639,7 +685,14 @@ def tool_executor_node(state: ConversationState) -> dict:
     ctx        = state.get("booking_context") or load_booking_context(session_id)
     messages   = list(state.get("messages", []))
 
-    print(f"\n🔧 [ToolExecutor] Entering — step={ctx['step']}  session={session_id}")
+    print(f"\n🔧 [ToolExecutor] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"🔧 [ToolExecutor] session_id  = {session_id}")
+    print(f"🔧 [ToolExecutor] step        = {ctx['step']}")
+    print(f"🔧 [ToolExecutor] patient.id  = {ctx['patient']['id']}  name={ctx['patient']['name']}")
+    print(f"🔧 [ToolExecutor] doctor.id   = {ctx['selected_doctor']['id']}  name={ctx['selected_doctor']['name']}")
+    print(f"🔧 [ToolExecutor] slot        = {ctx['pending_slot']}")
+    print(f"🔧 [ToolExecutor] confirmed   = {ctx['appointment']['confirmed']}")
+    print(f"🔧 [ToolExecutor] num_msgs    = {len(messages)}")
 
     if not messages:
         print("   ⚠️  No messages")
@@ -670,20 +723,20 @@ def tool_executor_node(state: ConversationState) -> dict:
             tool_messages.append(ToolMessage(content=msg, tool_call_id=tool_call_id, name=tool_name))
             continue
 
-        # ── GUARD 2: Never re-fetch doctor profile if ID already set ─
-        if tool_name in ("get_doctor_profile", "get_doctor_schedule") and ctx["selected_doctor"]["id"]:
+        # ── GUARD 2: Never re-fetch doctor info if ID already set ─
+        _DOCTOR_TOOLS = ("get_doctor_profile", "get_doctor_schedule", "get_doctors_by_specialization")
+        if tool_name in _DOCTOR_TOOLS and ctx["selected_doctor"]["id"]:
             msg = (
                 f"Doctor already loaded: Dr. {ctx['selected_doctor']['name']} "
-                f"(ID={ctx['selected_doctor']['id']}, {ctx['selected_doctor']['specialization']}). Skipping."
+                f"(ID={ctx['selected_doctor']['id']}, {ctx['selected_doctor']['specialization']}). "
+                f"Do NOT call any doctor-lookup tools again. "
+                f"Just ask the patient which date they prefer for their appointment."
             )
             print(f"   🚫 [Guard2] {msg}")
             tool_messages.append(ToolMessage(content=msg, tool_call_id=tool_call_id, name=tool_name))
             continue
 
         # ── GUARD 4: find_provider_availability must always have a doctor identifier.
-        # If the LLM forgot to pass doctor_name/specialization/doctor_id but we already
-        # know the selected doctor from ctx, auto-inject it so the call succeeds.
-        # Also: if patient hasn't stated a date yet, require it before calling.
         if tool_name == "find_provider_availability":
             args = dict(tool_args)
             has_doctor = args.get("doctor_id") or args.get("doctor_name") or args.get("specialization")
@@ -701,7 +754,6 @@ def tool_executor_node(state: ConversationState) -> dict:
                     if known_spec:
                         args["specialization"] = known_spec
                         print(f"   💉 [Guard4] Auto-injected specialization='{known_spec}' into find_provider_availability")
-            # Require a date — calling without one defaults to today which is usually wrong
             if not args.get("date"):
                 block_msg = (
                     "find_provider_availability blocked — no date provided. "
@@ -710,7 +762,7 @@ def tool_executor_node(state: ConversationState) -> dict:
                 print(f"   🚫 [Guard4] BLOCKED — no date in find_provider_availability call")
                 tool_messages.append(ToolMessage(content=block_msg, tool_call_id=tool_call_id, name=tool_name))
                 continue
-            tool_args = args  # use the patched args
+            tool_args = args
 
         # ── GUARD 3: create_booking requires confirmed YES ────────
         if tool_name == "create_booking":
@@ -718,18 +770,41 @@ def tool_executor_node(state: ConversationState) -> dict:
             is_yes     = bool(_YES_RE.search(last_human))
             step       = ctx.get("step", "")
 
-            print(f"\n   🔐 [BookingGate] ═══════════════════════════════════")
-            print(f"   🔐 step          = '{step}'  (must be 'await_confirmation')")
-            print(f"   🔐 last_human    = '{last_human[:120]}'")
-            print(f"   🔐 is_yes        = {is_yes}")
-            print(f"   🔐 patient.id    = {ctx['patient']['id']}")
-            print(f"   🔐 doctor.id     = {ctx['selected_doctor']['id']}")
-            print(f"   🔐 slot.date     = {ctx['pending_slot']['date']}")
-            print(f"   🔐 slot.time     = {ctx['pending_slot']['time']}")
-            print(f"   🔐 ═══════════════════════════════════════════════════")
+            # ── AUTO-HYDRATE slot from tool args ──────────────────────────────
+            args_date = str(tool_args.get("date", "")).strip()
+            args_time = str(tool_args.get("time", "")).strip()
+            if args_date and not ctx["pending_slot"]["date"]:
+                ctx["pending_slot"]["date"] = args_date
+                print(f"   💉 [BookingGate] Auto-set slot.date={args_date} from tool args")
+            if args_time and not ctx["pending_slot"]["time"]:
+                ctx["pending_slot"]["time"] = args_time
+                print(f"   💉 [BookingGate] Auto-set slot.time={args_time} from tool args")
+            if ctx["pending_slot"]["date"] and ctx["pending_slot"]["time"]:
+                _advance_step(ctx)
+                save_booking_context(session_id, ctx)
+                step = ctx.get("step", "")
+                print(f"   💉 [BookingGate] Step re-evaluated → '{step}'")
+
+            print(f"\n   🔐 [BookingGate] ═══════════════════════════════════════════")
+            print(f"   🔐 step            = '{step}'  (must be 'await_confirmation')")
+            print(f"   🔐 last_human      = '{last_human[:120]}'")
+            print(f"   🔐 is_yes          = {is_yes}  (regex: {_YES_RE.pattern[:60]})")
+            print(f"   🔐 patient.id      = {ctx['patient']['id']}")
+            print(f"   🔐 patient.name    = {ctx['patient']['name']}")
+            print(f"   🔐 doctor.id       = {ctx['selected_doctor']['id']}")
+            print(f"   🔐 doctor.name     = {ctx['selected_doctor']['name']}")
+            print(f"   🔐 slot.date       = {ctx['pending_slot']['date']}")
+            print(f"   🔐 slot.time       = {ctx['pending_slot']['time']}")
+            print(f"   🔐 confirmed       = {ctx['appointment']['confirmed']}")
+            print(f"   🔐 tool_args       = {tool_args}")
+            print(f"   🔐 --- Full message history ({len(messages)} msgs) ---")
+            for i, m in enumerate(messages):
+                role    = m.__class__.__name__.replace("Message", "")
+                content = str(m.content)[:150].replace("\n", " ")
+                print(f"   🔐   [{i}] {role}: {content}")
+            print(f"   🔐 ═══════════════════════════════════════════════════════════")
 
             if step != "await_confirmation":
-                # Diagnose WHY we aren't at await_confirmation yet
                 p = ctx["patient"]
                 d = ctx["selected_doctor"]
                 s = ctx["pending_slot"]
@@ -776,11 +851,10 @@ def tool_executor_node(state: ConversationState) -> dict:
         changed     = _extract_from_tool_result(tool_name, tool_args, str(result_str), ctx)
         ctx_changed = ctx_changed or changed
 
-        # ── Try slot extraction after every tool result ───────────
-        # Needed because the user may have already said "10:30 AM" in their
-        # previous message — we can only set the slot once we have a date
-        # from a tool result (find_provider_availability returns the date).
-        if ctx["step"] == "collect_slot" and not ctx["pending_slot"]["time"]:
+        # ── Try slot extraction ONLY after find_provider_availability ──
+        # Calling it after get_doctors_by_specialization is wrong —
+        # last_human is just the phone number at that point, not a slot.
+        if tool_name == "find_provider_availability" and ctx["step"] == "collect_slot" and not ctx["pending_slot"]["time"]:
             _try_extract_pending_slot_inline(messages, ctx)
             if ctx["pending_slot"]["time"]:
                 ctx_changed = True
@@ -799,48 +873,141 @@ def tool_executor_node(state: ConversationState) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# PENDING SLOT EXTRACTOR
+# PENDING SLOT EXTRACTOR  (LLM-based — no regex)
 # ═══════════════════════════════════════════════════════════════════
 
 def _try_extract_pending_slot_inline(messages: list, ctx: dict) -> None:
     """
-    Core slot extraction — takes messages directly.
-    Called from both tool_executor (after tool result arrives) and supervisor_node.
-    Extracts time from last human message + date from most recent message with a date.
+    LLM-based slot extraction.
+
+    Sends the last 8 messages to a small Qwen model with a strict JSON-only
+    prompt. Handles all languages, formats, and spoken styles:
+      - "11 am", "11:00", "11.00 AM", "3.30 PM"
+      - Urdu / Roman Urdu time expressions
+      - Patient said YES where the time was shown in an earlier AI message
+
+    Default: if a date is known but no time can be found anywhere, falls back
+    to 11:00 (the clinic's standard morning slot).
     """
     last_human = _last_human_text(messages)
-    time_m     = _TIME_RE.search(last_human)
-    if not time_m:
-        # Also try parsing written time like "10 30" or "10:30 AM"
-        written = re.search(r"\b(\d{1,2})\s+(\d{2})\b", last_human)
-        if written:
-            time_m = re.search(r"\b(\d{1,2}:\d{2})\b",
-                               f"{written.group(1)}:{written.group(2)}")
-    if not time_m:
+
+    print(f"\n🔍 [SlotExtract] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"🔍 [SlotExtract] last_human   = '{last_human[:120]}'")
+    print(f"🔍 [SlotExtract] current slot = date={ctx['pending_slot']['date']}  time={ctx['pending_slot']['time']}")
+
+    # Build a short context window — last 8 messages is plenty
+    recent        = messages[-8:]
+    context_lines = []
+    for m in recent:
+        role    = "Patient" if m.type == "human" else "Assistant"
+        content = str(m.content).strip().replace("\n", " ")[:200]
+        context_lines.append(f"{role}: {content}")
+    context_block = "\n".join(context_lines)
+
+    known_date = ctx["pending_slot"].get("date") or "unknown"
+
+    prompt = f"""You are a date/time extractor for a hospital appointment booking system in Pakistan.
+
+CONVERSATION SO FAR:
+{context_block}
+
+ALREADY KNOWN:
+- date: {known_date}
+
+TASK:
+Extract the appointment date and time the patient wants.
+
+Date rules:
+- Return a YYYY-MM-DD string.
+- If the already-known date is not "unknown", use it unless the patient explicitly changes it.
+- Return null only if genuinely unclear.
+- Urdu day names (check the raw Urdu in the conversation, NOT the English translation which may be wrong):
+    پیر = Monday | منگل = Tuesday | بدھ = Wednesday | جمعرات = Thursday
+    جمعہ = Friday | ہفتہ = Saturday | اتوار = Sunday
+  Roman Urdu: peer/pir=Monday, mangal=Tuesday, budh=Wednesday,
+    jumerat/jumeraat=Thursday, jumma/juma=Friday, hafta=Saturday, itwar/etwar=Sunday
+
+Time rules:
+- Return HH:MM in 24-hour format.
+- Convert: "11 am" → "11:00", "3.30 PM" → "15:30", "2:00 PM" → "14:00", "9 baj ke" → "09:00".
+- If the patient said YES/confirm/book without stating a time, find the most recently mentioned time anywhere in the Assistant messages (the assistant showed available slots — use that time).
+- Return null ONLY if no time appears anywhere in the conversation.
+
+Respond with ONLY valid JSON. No explanation, no markdown fences, no extra text.
+
+{{"date": "YYYY-MM-DD or null", "time": "HH:MM or null"}}"""
+
+    print(f"🔍 [SlotExtract] Calling LLM for extraction…")
+    try:
+        response  = _get_slot_extractor_llm().invoke([HumanMessage(content=prompt)])
+        raw       = str(response.content).strip()
+        # Strip <think>...</think> blocks emitted by Qwen reasoning models
+        raw       = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        # Strip accidental markdown fences just in case
+        raw       = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw       = re.sub(r"\n?```$",        "", raw)
+        raw       = raw.strip()
+        print(f"🔍 [SlotExtract] LLM raw output: {raw[:200]}")
+        extracted = json.loads(raw)
+    except Exception as e:
+        print(f"🔍 [SlotExtract] ❌ LLM extraction failed: {e} — slot NOT set")
+        print(f"🔍 [SlotExtract] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
         return
 
-    candidate_date = None
-    for m in reversed(messages):
-        date_m = _DATE_RE.search(str(m.content))
-        if date_m:
-            candidate_date = date_m.group(1)
-            break
+    ext_date = extracted.get("date") or None
+    ext_time = extracted.get("time") or None
 
-    if candidate_date:
-        ctx["pending_slot"]["time"] = time_m.group(1)
-        ctx["pending_slot"]["date"] = candidate_date
-        _advance_step(ctx)
-        print(f"📅 [SlotExtract] slot={candidate_date} at {time_m.group(1)} → step={ctx['step']}")
+    # Normalise string "null" / "none" the model might return as text
+    if isinstance(ext_date, str) and ext_date.lower() in ("null", "none", "unknown", ""):
+        ext_date = None
+    if isinstance(ext_time, str) and ext_time.lower() in ("null", "none", "unknown", ""):
+        ext_time = None
+
+    print(f"🔍 [SlotExtract] Extracted → date={ext_date}  time={ext_time}")
+
+    # ── Default time fallback ─────────────────────────────────────
+    # If no time was found anywhere but we at least have a date,
+    # default to 11:00 AM (clinic standard morning slot).
+    if not ext_time:
+        final_date = ctx["pending_slot"].get("date") or ext_date
+        if final_date:
+            ext_time = "11:00"
+            print(f"🔍 [SlotExtract] ⚠️  No time found — defaulting to 11:00")
+        else:
+            print(f"🔍 [SlotExtract] ❌ RESULT: no time and no date — slot NOT set")
+            print(f"🔍 [SlotExtract] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+            return
+
+    # Prefer the date already in ctx (it came from find_provider_availability),
+    # fall back to whatever the LLM found in the conversation
+    final_date = ctx["pending_slot"].get("date") or ext_date
+
+    if not final_date:
+        print(f"🔍 [SlotExtract] ❌ RESULT: have time='{ext_time}' but NO date — slot NOT set")
+        print(f"🔍 [SlotExtract] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+        return
+
+    ctx["pending_slot"]["time"] = ext_time
+    ctx["pending_slot"]["date"] = final_date
+    _advance_step(ctx)
+    print(f"🔍 [SlotExtract] ✅ RESULT: slot SET → {final_date} at {ext_time}  step={ctx['step']}")
+    print(f"🔍 [SlotExtract] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
 
 
 def _try_extract_pending_slot(state: dict, ctx: dict, session_id: str) -> None:
-    """Supervisor-side wrapper — saves to disk if slot was extracted."""
-    if ctx["step"] != "collect_slot" or ctx["pending_slot"]["time"]:
+    """Supervisor-side wrapper — saves to disk if the slot was extracted."""
+    print(f"\n📅 [SlotExtract-Wrapper] step={ctx['step']}  slot.time={ctx['pending_slot']['time']}  slot.date={ctx['pending_slot']['date']}")
+    if ctx["step"] != "collect_slot":
+        print(f"📅 [SlotExtract-Wrapper] SKIPPED — step is '{ctx['step']}', not 'collect_slot'")
+        return
+    if ctx["pending_slot"]["time"]:
+        print(f"📅 [SlotExtract-Wrapper] SKIPPED — slot.time already set: '{ctx['pending_slot']['time']}'")
         return
     messages = list(state.get("messages", []))
     _try_extract_pending_slot_inline(messages, ctx)
     if ctx["pending_slot"]["time"]:
         save_booking_context(session_id, ctx)
+        print(f"📅 [SlotExtract-Wrapper] Saved slot to disk")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -858,6 +1025,7 @@ def supervisor_node(state: ConversationState) -> dict:
         print(f"⚠️  [Supervisor] session_id missing — generated: {session_id}")
 
     ctx             = state.get("booking_context") or load_booking_context(session_id)
+    ctx             = _force_english_for_testing(ctx)
     raw_messages    = _trim_messages(list(state.get("messages", [])))
     safe_messages   = _build_safe_messages(raw_messages)
     tools_this_turn = _count_tools_since_last_human(list(state.get("messages", [])))
@@ -889,7 +1057,7 @@ DATE CONTEXT (Pakistan Standard Time):
   Tomorrow : {tomorrow_str}
 
 PATIENT LANGUAGE: {ctx.get("patient_language", "en")}
-{"IMPORTANT: The patient speaks Urdu. You MUST reply in simple everyday Urdu (nastaliq script). NOT Roman Urdu, NOT English. Natural spoken Urdu only." if ctx.get("patient_language") in ("ur", "urdu") else "Reply in plain English."}
+{"IMPORTANT: The patient speaks Urdu. You MUST reply in simple everyday Urdu (nastaliq script). NOT Roman Urdu, NOT English. Natural spoken Urdu only." if ctx.get("patient_language") in ("ur", "urdu") else "Reply in plain conversational English only. Do not use Urdu, Roman Urdu, Hindi, or mixed-script text."}
 
 {booking_directive}
 
@@ -901,7 +1069,11 @@ ABSOLUTE PROHIBITIONS:
   Never call find_provider_availability without a date — ask the patient first.
   Always pass doctor_id or doctor_name when calling find_provider_availability.
   One tool per turn, then reply to the user.
+  Never present appointment times that did not come from find_provider_availability.
 {"  TRIAGE DONE: NEVER emit [SYMPTOM_LOGGED:...] or [START_TRIAGE] — triage is complete." if ctx.get("triage_completed") else ""}
+
+SPECIAL TAGS (output these exact strings when needed):
+  [TRANSFER_TO_HUMAN] — output this (alone, no other text) if the patient says they want to speak to a human, a real person, a human agent, or uses phrases like "insaan se baat", "banda chahiye", "agent se milna", "انسان سے بات", "حقیقی نمائندے". The system will immediately hand off the call.
 """)
 
     print("📡 [Supervisor] Calling LLM…")
@@ -945,15 +1117,57 @@ ABSOLUTE PROHIBITIONS:
     if "[START_TRIAGE]" in response_text:
         triage_active = True
         print("🚦 [Supervisor] triage_active = True — muting supervisor reply, triage_node will speak")
-        # Suppress supervisor's patient-facing text so triage_node owns the conversation
-        # Keep a silent AIMessage so LangGraph state is valid
         response = AIMessage(content="")
 
     if "[END_CALL]" in response_text:
+        booking_done = (
+            ctx.get("appointment", {}).get("confirmed")
+            or ctx.get("step") == "completed"
+        )
+        if not booking_done:
+            print(
+                f"⚠️  [Supervisor] [END_CALL] blocked — booking not done yet "
+                f"(step={ctx.get('step')}, confirmed={ctx.get('appointment', {}).get('confirmed')})"
+            )
+            cleaned = response_text.replace("[END_CALL]", "").strip()
+            cleaned = re.sub(r"\[SYMPTOM_LOGGED:[^\]]*\]", "", cleaned).strip()
+            if not cleaned:
+                lang = ctx.get("patient_language", "en")
+                if lang in ("ur", "urdu"):
+                    cleaned = "معذرت، ہم ابھی آپ کی appointment مکمل نہیں کر سکے۔ کیا آپ آگے بڑھنا چاہیں گے؟"
+                else:
+                    cleaned = "Sorry, we haven't finished booking your appointment yet. Shall we continue?"
+            response = AIMessage(content=cleaned)
+        else:
+            interaction_completed = True
+            ctx["triage_completed"] = True
+            save_booking_context(session_id, ctx)
+            print("🏁 [Supervisor] interaction_completed = True")
+
+            lang = ctx.get("patient_language", "en")
+            if lang in ("ur", "urdu"):
+                goodbye = "آپ کا شکریہ کہ آپ نے ہم سے رابطہ کیا۔ اپنا خیال رکھیں، خدا حافظ۔ 🙏"
+            else:
+                goodbye = "Thank you for your time. Take care, and goodbye! 🙏"
+            response = AIMessage(content=goodbye)
+            print(f"👋 [Supervisor] Goodbye sent ({lang}): {goodbye}")
+
+    if "[TRANSFER_TO_HUMAN]" in response_text:
+        print("🔄 [Supervisor] [TRANSFER_TO_HUMAN] detected — stopping and handing off")
         interaction_completed = True
-        ctx["triage_completed"] = True
         save_booking_context(session_id, ctx)
-        print("🏁 [Supervisor] interaction_completed = True")
+        lang = ctx.get("patient_language", "en")
+        if lang in ("ur", "urdu"):
+            transfer_msg = "آپ کو ابھی ایک انسانی نمائندے سے منسلک کیا جا رہا ہے۔ براہ کرم انتظار کریں۔"
+        else:
+            transfer_msg = "Transferring you to a human agent now. Please hold."
+        print(f"🔄 [Supervisor] Transfer message ({lang}): {transfer_msg}")
+        response = AIMessage(content=transfer_msg)
+
+    if not str(response.content).strip() and not triage_active:
+        print("⚠️  [Supervisor] EMPTY response returned and triage not active — this is the silent-AI bug.")
+        print(f"   response_text was: {repr(response_text[:300])}")
+        print(f"   step={ctx.get('step')}  triage_active={triage_active}  interaction_completed={interaction_completed}")
 
     return {
         "messages":              [response],
@@ -1000,7 +1214,6 @@ def supervisor_router(state: ConversationState) -> str:
         return "tool_executor"
 
     if state.get("triage_active"):
-        # Supervisor just emitted [START_TRIAGE] — hand off to triage_node
         print("🔀 [Router] → triage_node")
         return "triage_node"
 
@@ -1048,3 +1261,4 @@ print(f"   ctx_dir={BOOKING_CTX_DIR.resolve()}")
 print(f"   triage: Option B (MedGemma→Qwen direct chain, max {8} questions)")
 print("   create_booking: code-gated YES check in tool_executor")
 print("   session JSON: named by session_id (never 'default')")
+print("   slot extraction: LLM-based (default time: 11:00 AM)")

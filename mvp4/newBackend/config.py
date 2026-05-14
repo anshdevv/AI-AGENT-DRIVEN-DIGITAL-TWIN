@@ -73,3 +73,6 @@ else:
     print("⚠️ Supabase Client:     NOT CONNECTED. Check keys.")
 
 print("=" * 50 + "\n")
+# ✅ ADD THIS — quick key sanity check at boot
+print(f"🔑 [Config] GROQ_API_KEY: {'SET (' + settings.groq_api_key[:8] + '...)' if settings.groq_api_key else '❌ EMPTY'}")
+print(f"🔑 [Config] ELEVENLABS_API_KEY: {'SET (' + settings.elevenlabs_api_key[:8] + '...)' if settings.elevenlabs_api_key else '❌ EMPTY'}")

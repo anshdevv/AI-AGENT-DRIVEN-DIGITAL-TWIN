@@ -1,0 +1,28 @@
+=== STARTING TEST SESSION: test-session-fad3c9 ===
+
+👤 Patient: I have a very bad stomach ache and I feel nauseous.
+🤖 Bot: Hi there, how long have you been feeling this way with your stomach pain and feeling sick?
+
+👤 Patient: It started last night after dinner.
+🤖 Bot: Is the pain always there, or does it sometimes go away?
+
+👤 Patient: No, I haven't taken any medicine yet.
+🤖 Bot: Kya aap ko temperature hai?
+
+👤 Patient: Yes, I have some mild fever too.
+🤖 Bot: Have you been throwing up or having runny stools?  
+Kya aap ko ultee ya dast ho rahi hai?
+
+👤 Patient: Okay, my phone number is 03001234567.
+🤖 Bot: [No question provided to rephrase.]
+
+👤 Patient: Dr. Ali sounds good.
+🤖 Bot: I couldn't find your profile in our system. May I please have your full name so we can register you? (This is required to book appointments)
+
+👤 Patient: Tomorrow at 10:30 AM please.
+🤖 Bot: I need to register you first before booking. Could you please share your full name? Once registered, I'll check availability for tomorrow at 10:30 AM.
+
+👤 Patient: Yes, please confirm the booking.
+❌ ERROR: Failed to connect to backend: ('Connection aborted.', ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None))
+
+=== TEST COMPLETED ===

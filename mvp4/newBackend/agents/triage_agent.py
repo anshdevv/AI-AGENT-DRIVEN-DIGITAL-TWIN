@@ -30,7 +30,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
-from langchain_community.chat_models import ChatOllama
+from langchain_ollama import ChatOllama
 
 from agents.llm_config import get_llm
 from agents.symptom_lookup import lookup, format_for_prompt
@@ -40,6 +40,21 @@ try:
     PKT = ZoneInfo("Asia/Karachi")
 except ZoneInfoNotFoundError:
     PKT = timezone(timedelta(hours=5))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TESTING FLAGS
+# ═══════════════════════════════════════════════════════════════════
+# Set this to False when you want Qwen rephrasing to follow the detected/user language again.
+FORCE_ENGLISH_TEST = True
+
+
+def _force_english_for_testing(ctx: dict) -> dict:
+    """Testing-only language lock: keep triage/Qwen-facing replies in English."""
+    if FORCE_ENGLISH_TEST:
+        ctx["patient_language"] = "en"
+    return ctx
+
 
 BOOKING_CTX_DIR = Path("booking_context")
 BOOKING_CTX_DIR.mkdir(exist_ok=True)
@@ -303,14 +318,35 @@ def _rephrase_with_qwen(raw_text: str, patient_language: str = "en") -> str:
     if not clean_input:
         return ""
 
+    if FORCE_ENGLISH_TEST:
+        patient_language = "en"
+
     is_urdu = patient_language in ("ur", "urdu")
-    language_instruction = (
-        "Reply in simple everyday Urdu (nastaliq script). "
-        "Use natural spoken words like: aap ko, kya, kab se, kitna, theek hai, batayein. "
-        "NOT formal/literary Urdu. NOT Roman Urdu. Actual Urdu script."
-        if is_urdu else
-        "Reply in plain conversational English."
-    )
+
+    if is_urdu:
+        language_rules = (
+            "LANGUAGE: Reply in the natural way Pakistanis actually speak — "
+            "a warm mix of Roman Urdu and Urdu nastaliq script.\n"
+            "  Roman Urdu connectors (aap, kya, kab se, kitna, theek hai, batayein, "
+            "ho raha hai, hain, bhi) stay in latin script.\n"
+            "  Key nouns and descriptive words stay in Urdu nastaliq script.\n"
+            "  GOOD: 'Aap ko کتنے دن سے یہ درد ہو رہا ہے?'\n"
+            "  GOOD: 'Kya آپ کو بخار بھی ہے، ya sirf درد ہے?'\n"
+            "  BAD:  'آپ کو کتنے عرصے سے یہ تکلیف ہے؟'  (too formal)\n"
+            "  BAD:  'Aap ko kitne din se yeh dard ho raha hai?'  (all Roman, no nastaliq)\n"
+            "  Must sound like a friendly Pakistani receptionist. NOT English."
+        )
+    else:
+        language_rules = (
+            "LANGUAGE: Reply in plain conversational English only.\n"
+            "  If the input contains Urdu, Roman Urdu, Hindi, or mixed language, translate/rephrase it into natural English.\n"
+            "  Do NOT use Urdu script.\n"
+            "  Do NOT use Roman Urdu words like aap, kya, theek hai, dard, bukhar, batayein.\n"
+            "  GOOD: 'How long have you had this headache?'\n"
+            "  GOOD: 'Is the pain constant or does it come and go?'\n"
+            "  BAD: Any Urdu, Roman Urdu, Hindi, or mixed-script text.\n"
+            "  Sound warm and human, like a friendly clinic receptionist."
+        )
 
     try:
         qwen = _get_qwen_llm()
@@ -318,13 +354,14 @@ def _rephrase_with_qwen(raw_text: str, patient_language: str = "en") -> str:
             SystemMessage(content=(
                 "You are a warm, friendly hospital receptionist.\n"
                 "Rephrase the given clinical question into natural easy language for the patient.\n\n"
-                f"LANGUAGE: {language_instruction}\n\n"
+                f"{language_rules}\n\n"
                 "RULES:\n"
                 "- ONE question only. One or two short sentences max.\n"
                 "- Sound like a human talking, not a form.\n"
                 "- Do NOT mention AI, MedGemma, triage, system, or any technical term.\n"
                 "- Do NOT output any tags like [TRIAGE_COMPLETE] or [MEDGEMMA_SUMMARY].\n"
-                "- Output ONLY the rephrased question, nothing else."
+                "- Output ONLY the rephrased question, nothing else.\n"
+                "- When LANGUAGE is English, never output Urdu script or Roman Urdu words."
             )),
             HumanMessage(content=clean_input),
         ])
@@ -458,6 +495,7 @@ def triage_node(state: dict) -> dict:
 
     symptom         = state.get("extracted_symptom", "")
     ctx             = state.get("booking_context", {})
+    ctx             = _force_english_for_testing(ctx)
     profile         = state.get("patient_profile") or {}
     triage_qa       = list(state.get("triage_qa", []))
     questions_asked = _get_questions_asked(state)
@@ -612,6 +650,7 @@ def _complete_triage(
     ctx: dict,
 ) -> dict:
     print("✅ [Triage] COMPLETE — running final specialist lookup + GP-first routing")
+    ctx = _force_english_for_testing(ctx)
 
     # ── FINAL LOOKUP: use ALL accumulated symptoms ────────────────
     initial     = ctx.get("prime_complaint", "")
