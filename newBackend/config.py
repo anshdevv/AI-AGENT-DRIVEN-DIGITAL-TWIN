@@ -43,6 +43,7 @@ class Settings:
     
     # LLMs & AI APIs
     huggingface_api_key: str = field(default_factory=lambda: os.getenv("HUGGINGFACE_API_KEY", "").strip())
+    judge_model: str = field(default_factory=lambda: os.getenv("JUDGE_MODEL", "Qwen/Qwen2.5-7B-Instruct:fastest").strip())
     groq_api_key: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY", "").strip())
     elevenlabs_api_key: str = field(default_factory=lambda: os.getenv("ELEVENLABS_API_KEY", os.getenv("ElevenLabs", "")).strip())
     elevenlabs_stt_model: str = field(default_factory=lambda: os.getenv("ELEVENLABS_STT_MODEL", "scribe_v2").strip())
@@ -57,6 +58,10 @@ class Settings:
     
     # App Settings
     app_domain: str = field(default_factory=lambda: os.getenv("APP_DOMAIN", "healthcare").strip() or "healthcare")
+    admin_username: str = field(default_factory=lambda: os.getenv("ADMIN_USERNAME", "admin").strip() or "admin")
+    admin_password: str = field(default_factory=lambda: os.getenv("ADMIN_PASSWORD", "admin123").strip() or "admin123")
+    csr_username: str = field(default_factory=lambda: os.getenv("CSR_USERNAME", "csr").strip() or "csr")
+    csr_password: str = field(default_factory=lambda: os.getenv("CSR_PASSWORD", "csr123").strip() or "csr123")
     cors_origins: list[str] = field(
         default_factory=lambda: _split_csv(
             os.getenv("CORS_ORIGINS"),

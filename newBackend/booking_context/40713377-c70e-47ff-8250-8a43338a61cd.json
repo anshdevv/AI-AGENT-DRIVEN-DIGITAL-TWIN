@@ -1,0 +1,61 @@
+{
+  "session_id": "40713377-c70e-47ff-8250-8a43338a61cd",
+  "created_at": "2026-05-14T21:31:21.171916+05:00",
+  "last_updated": "2026-05-14T21:31:26.165294+05:00",
+  "step": "collect_patient",
+  "prime_complaint": null,
+  "recommended_specialist": null,
+  "triage_completed": false,
+  "triage_questions_asked": 0,
+  "triage_qa": [],
+  "accumulated_symptoms": [],
+  "symptom_context_block": null,
+  "final_symptom_match": null,
+  "patient": {
+    "id": null,
+    "name": null,
+    "phone": null
+  },
+  "selected_doctor": {
+    "id": null,
+    "name": null,
+    "specialization": null
+  },
+  "pending_slot": {
+    "date": null,
+    "time": null
+  },
+  "appointment": {
+    "date": null,
+    "time": null,
+    "confirmed": false,
+    "booking_id": null
+  },
+  "transcript": [
+    {
+      "at": "2026-05-14T21:31:21.170892+05:00",
+      "sender": "patient",
+      "text": "hi",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:31:26.123425+05:00",
+      "sender": "assistant",
+      "text": "I want to make sure you get accurate guidance, so I am routing this to a human care specialist now. Please stay here and they will review the conversation.",
+      "channel": "chat",
+      "metadata": {
+        "judge": {
+          "approved": false,
+          "accuracy_risk": true,
+          "medical_safety_risk": true,
+          "reason": "Judge request failed: HTTP Error 403: Forbidden"
+        }
+      }
+    }
+  ],
+  "patient_language": "en",
+  "human_handoff": true,
+  "handoff_status": "pending",
+  "handoff_reason": "Judge flagged agent reply: Judge request failed: HTTP Error 403: Forbidden"
+}

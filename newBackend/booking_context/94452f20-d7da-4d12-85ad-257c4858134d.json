@@ -1,0 +1,151 @@
+{
+  "session_id": "94452f20-d7da-4d12-85ad-257c4858134d",
+  "created_at": "2026-05-14T21:19:27.268475+05:00",
+  "last_updated": "2026-05-14T21:29:09.232702+05:00",
+  "step": "collect_patient",
+  "prime_complaint": null,
+  "recommended_specialist": null,
+  "triage_completed": false,
+  "triage_questions_asked": 0,
+  "triage_qa": [],
+  "accumulated_symptoms": [],
+  "symptom_context_block": null,
+  "final_symptom_match": null,
+  "patient": {
+    "id": null,
+    "name": null,
+    "phone": null
+  },
+  "selected_doctor": {
+    "id": null,
+    "name": null,
+    "specialization": null
+  },
+  "pending_slot": {
+    "date": null,
+    "time": null
+  },
+  "appointment": {
+    "date": null,
+    "time": null,
+    "confirmed": false,
+    "booking_id": null
+  },
+  "transcript": [
+    {
+      "at": "2026-05-14T21:19:27.263476+05:00",
+      "sender": "patient",
+      "text": "[背景人声]",
+      "channel": "voice_message",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:19:31.655904+05:00",
+      "sender": "assistant",
+      "text": "I want to make sure you get accurate guidance, so I am routing this to a human care specialist now. Please stay here and they will review the conversation.",
+      "channel": "voice_message",
+      "metadata": {
+        "judge": {
+          "approved": false,
+          "accuracy_risk": true,
+          "medical_safety_risk": true,
+          "reason": "Judge request failed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-14T21:20:07.826206+05:00",
+      "sender": "csr",
+      "text": "hi what do you need",
+      "channel": "human",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:20:14.162042+05:00",
+      "sender": "patient",
+      "text": "i love you",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:20:14.387862+05:00",
+      "sender": "assistant",
+      "text": "I'm having trouble. Please repeat that.",
+      "channel": "chat",
+      "metadata": {
+        "judge": null
+      }
+    },
+    {
+      "at": "2026-05-14T21:20:49.696777+05:00",
+      "sender": "patient",
+      "text": "yo",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:20:50.084013+05:00",
+      "sender": "assistant",
+      "text": "I'm having trouble. Please repeat that.",
+      "channel": "chat",
+      "metadata": {
+        "judge": null
+      }
+    },
+    {
+      "at": "2026-05-14T21:20:54.789221+05:00",
+      "sender": "patient",
+      "text": "i want to talk to a human",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:20:54.958271+05:00",
+      "sender": "assistant",
+      "text": "I'm having trouble. Please repeat that.",
+      "channel": "chat",
+      "metadata": {
+        "judge": null
+      }
+    },
+    {
+      "at": "2026-05-14T21:27:19.760594+05:00",
+      "sender": "patient",
+      "text": "hey",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:27:23.260936+05:00",
+      "sender": "assistant",
+      "text": "I want to make sure you get accurate guidance, so I am routing this to a human care specialist now. Please stay here and they will review the conversation.",
+      "channel": "chat",
+      "metadata": {
+        "judge": {
+          "approved": false,
+          "accuracy_risk": true,
+          "medical_safety_risk": true,
+          "reason": "Judge request failed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-14T21:29:02.298035+05:00",
+      "sender": "csr",
+      "text": "hi",
+      "channel": "human",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:29:09.172907+05:00",
+      "sender": "patient",
+      "text": "hi",
+      "channel": "chat",
+      "metadata": {}
+    }
+  ],
+  "patient_language": "en",
+  "human_handoff": true,
+  "handoff_status": "active",
+  "handoff_reason": "CSR joined the conversation."
+}

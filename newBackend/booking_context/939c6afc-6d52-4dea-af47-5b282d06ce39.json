@@ -1,0 +1,147 @@
+{
+  "session_id": "939c6afc-6d52-4dea-af47-5b282d06ce39",
+  "created_at": "2026-05-14T21:37:36.864736+05:00",
+  "last_updated": "2026-05-14T21:45:08.151870+05:00",
+  "step": "collect_patient",
+  "prime_complaint": "i have headache",
+  "recommended_specialist": null,
+  "triage_completed": false,
+  "triage_questions_asked": 0,
+  "triage_qa": [],
+  "accumulated_symptoms": [],
+  "symptom_context_block": null,
+  "final_symptom_match": null,
+  "patient": {
+    "id": null,
+    "name": null,
+    "phone": null
+  },
+  "selected_doctor": {
+    "id": null,
+    "name": null,
+    "specialization": null
+  },
+  "pending_slot": {
+    "date": null,
+    "time": null
+  },
+  "appointment": {
+    "date": null,
+    "time": null,
+    "confirmed": false,
+    "booking_id": null
+  },
+  "transcript": [
+    {
+      "at": "2026-05-14T21:37:36.864736+05:00",
+      "sender": "patient",
+      "text": "hi",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:37:40.917724+05:00",
+      "sender": "assistant",
+      "text": "I want to make sure you get accurate guidance, so I am routing this to a human care specialist now. Please stay here and they will review the conversation.",
+      "channel": "chat",
+      "metadata": {
+        "judge": {
+          "approved": false,
+          "accuracy_risk": true,
+          "medical_safety_risk": true,
+          "reason": "Judge request failed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-14T21:40:27.299082+05:00",
+      "sender": "patient",
+      "text": "hi",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:40:32.010276+05:00",
+      "sender": "assistant",
+      "text": "I want to make sure you get accurate guidance, so I am routing this to a human care specialist now. Please stay here and they will review the conversation.",
+      "channel": "chat",
+      "metadata": {
+        "judge": {
+          "approved": false,
+          "accuracy_risk": true,
+          "medical_safety_risk": true,
+          "reason": "Judge request failed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-14T21:43:26.644380+05:00",
+      "sender": "patient",
+      "text": "hi",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:43:30.073130+05:00",
+      "sender": "assistant",
+      "text": "Hello! How can I assist you today? If you're feeling unwell, please let me know your main concern so I can help arrange the right care for you.",
+      "channel": "chat",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Low-risk non-medical turn; judge skipped."
+        }
+      }
+    },
+    {
+      "at": "2026-05-14T21:43:44.240118+05:00",
+      "sender": "patient",
+      "text": "i have headache",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:44:17.151336+05:00",
+      "sender": "assistant",
+      "text": "Please provide your phone number so I can check your existing profile or create a new one if needed.",
+      "channel": "chat",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-14T21:44:50.715747+05:00",
+      "sender": "patient",
+      "text": "i want to talk to a human",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:44:50.776250+05:00",
+      "sender": "assistant",
+      "text": "Sure, I am routing you to a human care specialist now. Please continue here and they will reply shortly.",
+      "channel": "chat",
+      "metadata": {
+        "judge": null
+      }
+    },
+    {
+      "at": "2026-05-14T21:45:08.103258+05:00",
+      "sender": "csr",
+      "text": "hey bitch",
+      "channel": "human",
+      "metadata": {}
+    }
+  ],
+  "patient_language": "en",
+  "human_handoff": true,
+  "handoff_status": "active",
+  "handoff_reason": "CSR joined the conversation."
+}
