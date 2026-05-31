@@ -1,110 +1,89 @@
 # Medical Concierge MVP
 
-This project now uses a LangGraph-based medical concierge instead of the older manual customer-service router.
+A LangGraph-powered medical concierge prototype for conversational triage, booking, and care routing.
 
-## What It Handles
+## Scope
 
-- chat
-- voice notes
-- live call transcripts
-- symptom-to-specialty routing
-- doctor info and schedule lookups
-- appointment booking
-- safe pre-visit triage
+- Handles chat, voice note, and live call interactions.
+- Supports symptom-to-specialist recommendation, doctor lookup, appointment booking, and pre-visit triage.
+- Preserves session context per patient via `newBackend/booking_context/*.json`.
+- Includes human handoff and CSR/doctor review flows.
+- Does not prescribe medication or provide emergency medical diagnosis.
 
-The assistant does **not** prescribe medication or handle emergency advice beyond urgent escalation.
+## Architecture
 
-## Backend Flow
+- Backend: `newBackend/main.py` (FastAPI)
+- Orchestration: `newBackend/agents/orchestrator.py` (LangGraph)
+- Agent logic: `newBackend/agents/`
+- Voice pipeline: `newBackend/agents/voice_agent.py`
+- WhatsApp bridge: `newBackend/whatsapp/` (optional, unofficial)
 
-1. A hybrid intent classifier runs first.
-   It uses heuristics and entity extraction for speed, with an LLM only as backup.
-2. LangGraph routes the turn to the right specialist agent.
-3. Agents share the same session context:
-   recommendation, doctor info, booking, triage, FAQ, safety, and handoff.
-4. MCP tools power the business actions and can also be called over `/mcp`.
+## Primary API Endpoints
 
-## RAG + Tools
+- `POST /chat` — text conversation turn
+- `POST /voice/message` — voice note upload, STT, optional translation, and reply
+- `WS /ws/call/{session_id}` — live audio/WebSocket call pipeline
+- `POST /human/message` — CSR/human agent sends a message into a patient session
+- `GET /human/messages/{session_id}` — read queued human messages for a session
+- `GET /health` — service health and integration status
+- `GET /csr/handoffs` — CSR handoff queue
+- `GET /csr/handoffs/{session_id}` — handoff session detail
 
-- FAQ RAG: `backend/rag/faq`
-- symptom-to-specialization map: `backend/rag/mapping/symptoms_to_specialization.md`
-- triage question flows: `backend/rag/question_flows`
-- doctor schedule seed data: `backend/seeds/doctor_availability_seed.json`
+## Core Features
 
-Key MCP tools:
+- Persistent patient session state for booking, triage, and transcript history
+- Agent-level orchestration with LangGraph for routing and multi-step medical workflows
+- Voice note transcription and synthesis using `newBackend/agents/voice_agent.py`
+- Human handoff detection and support for explicit CSR/doctor messaging
+- Booking context stored as JSON in `newBackend/booking_context/`
 
-- `match_symptoms_to_specialization`
-- `recommend_service_provider`
-- `get_doctor_profile`
-- `find_provider_availability`
-- `create_booking`
-- `get_triage_flow`
+## Deployment
 
-## API Surface
-
-- `POST /chat`
-- `POST /voice/message`
-- `WS /ws/call/{session_id}`
-- `GET /mcp`
-- `POST /mcp`
-
-All three user channels share the same backend session state.
-
-## Booking Data
-
-- `doctor_availability` is the source of truth for bookable clinic hours.
-- `slots` are created only when an appointment is reserved.
-- Load the starter schedule with:
+### Backend
 
 ```bash
-venv\Scripts\python.exe -m backend.seed_doctor_availability
+cd newBackend
+python -m pip install -r requirements.txt
+python main.py
 ```
 
-Current live roster support is limited to:
-
-- Cardiologist
-- Dermatologist
-- Neurologist
-- Pediatrician
-- Orthopedic
-- Gynecologist
-
-## Legacy Code
-
-`backend/orchestrator.py` is the live booking and triage path used by the API.
-The files under `backend/Nodes/` are legacy reference code and are not used by `/chat`, `/voice/message`, or `/ws/call/{session_id}`.
-
-## Voice
-
-The app keeps the same voice-note and live-call surfaces, and the backend voice service still supports server-side STT/TTS when the optional keys and packages are available. The old `voice chit` folder remains as reference material for voice handling ideas.
-
-## Environment
-
-Detected keys used by this repo:
-
-- `SUPABASE_URL`
-- `SUPABASE_KEY`
-- `GOOGLE_API_KEY`
-- `GROQ_API_KEY`
-- `ELEVENLABS` or `ElevenLabs`
-- `CLASSIFIER_MODEL`
-- `ACTION_MODEL`
-- `TRIAGE_MODEL`
-- `APP_DOMAIN`
-- `CORS_ORIGINS`
-
-## Run
-
-Use the project virtual environment so `langgraph` and the other pinned packages are available.
+Or from repository root:
 
 ```bash
-venv\Scripts\python.exe -m pip install -r requirements.txt
-venv\Scripts\python.exe api.py
+python api.py
 ```
 
-For the frontend:
+### Frontend
 
 ```bash
 cd frontend
 npm install
 npm start
 ```
+
+## Configuration
+
+The backend loads `.env` from `newBackend/.env` and supports these environment variables:
+
+- `SUPABASE_URL`
+- `SUPABASE_KEY`
+- `HUGGINGFACE_API_KEY`
+- `GROQ_API_KEY`
+- `ELEVENLABS_API_KEY` / `ElevenLabs`
+- `ELEVENLABS_STT_MODEL`
+- `ELEVENLABS_TTS_MODEL`
+- `ACTION_MODEL`
+- `APP_DOMAIN`
+- `CORS_ORIGINS`
+- `ADMIN_USERNAME`
+- `ADMIN_PASSWORD`
+- `CSR_USERNAME`
+- `CSR_PASSWORD`
+- `DOCTOR_PORTAL_PASSWORD`
+
+## Notes
+
+- `newBackend/booking_context/` stores per-session JSON to keep patient data and transcripts between requests.
+- The WhatsApp bridge in `newBackend/whatsapp/` is optional and uses an unofficial Web client; it is not production-safe.
+- Voice STT/TTS is enabled only when supported credentials and packages are configured.
+- The project is a prototype; the current focus is on conversational booking and triage workflows rather than full clinical decision support.
