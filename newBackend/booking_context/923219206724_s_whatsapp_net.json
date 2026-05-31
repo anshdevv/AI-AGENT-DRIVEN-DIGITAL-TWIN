@@ -1,0 +1,121 @@
+{
+  "session_id": "923219206724@s.whatsapp.net",
+  "created_at": "2026-05-31T18:15:55.731417+05:00",
+  "last_updated": "2026-05-31T18:20:45.874313+05:00",
+  "step": "collect_patient",
+  "prime_complaint": "stomach pain",
+  "recommended_specialist": null,
+  "triage_completed": false,
+  "triage_questions_asked": 0,
+  "triage_qa": [],
+  "accumulated_symptoms": [],
+  "symptom_context_block": null,
+  "final_symptom_match": null,
+  "patient": {
+    "id": null,
+    "name": null,
+    "phone": "03219206721"
+  },
+  "selected_doctor": {
+    "id": null,
+    "name": null,
+    "specialization": "Gastroenterologist"
+  },
+  "pending_slot": {
+    "date": null,
+    "time": null
+  },
+  "appointment": {
+    "date": null,
+    "time": null,
+    "confirmed": false,
+    "booking_id": null
+  },
+  "transcript": [
+    {
+      "at": "2026-05-31T18:15:55.731417+05:00",
+      "sender": "patient",
+      "text": "Hi",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-31T18:16:14.678961+05:00",
+      "sender": "assistant",
+      "text": "Hello! How can I assist you today? If you're feeling unwell, please let me know your symptoms so I can help arrange the right care for you.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Low-risk non-medical turn; judge skipped."
+        }
+      }
+    },
+    {
+      "at": "2026-05-31T18:17:00.398496+05:00",
+      "sender": "patient",
+      "text": "I am having stomach pain",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-31T18:17:47.213264+05:00",
+      "sender": "assistant",
+      "text": "Could you please share your phone number so I can check your existing profile? If you're a new patient, we'll create a new record with the details you provide.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-31T18:18:48.626840+05:00",
+      "sender": "patient",
+      "text": "03219206721",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-31T18:19:16.766407+05:00",
+      "sender": "assistant",
+      "text": "It looks like you're a new patient with us. Could you please share your full name so I can create a new profile for you?",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-31T18:19:21.957907+05:00",
+      "sender": "patient",
+      "text": "I want to see a gastroenterologist",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-31T18:20:45.843771+05:00",
+      "sender": "assistant",
+      "text": "I'm sorry, but we currently don't have any gastroenterologists on our roster. Would you like me to book an appointment with a General Physician instead? They can evaluate your symptoms and determine if a specialist referral is needed.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    }
+  ],
+  "patient_language": "en"
+}

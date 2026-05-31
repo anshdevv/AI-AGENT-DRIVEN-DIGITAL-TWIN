@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -14,6 +15,12 @@ except ImportError:
 # 1. Get the absolute path to the directory where config.py lives
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 print("\n" + "="*50)
 print("🔍 SYSTEM BOOT START")
@@ -62,6 +69,10 @@ class Settings:
     admin_password: str = field(default_factory=lambda: os.getenv("ADMIN_PASSWORD", "admin123").strip() or "admin123")
     csr_username: str = field(default_factory=lambda: os.getenv("CSR_USERNAME", "csr").strip() or "csr")
     csr_password: str = field(default_factory=lambda: os.getenv("CSR_PASSWORD", "csr123").strip() or "csr123")
+    doctor_portal_password: str = field(
+        default_factory=lambda: os.getenv("DOCTOR_PORTAL_PASSWORD", os.getenv("DOCTOR_PASSWORD", "doctor123")).strip()
+        or "doctor123"
+    )
     cors_origins: list[str] = field(
         default_factory=lambda: _split_csv(
             os.getenv("CORS_ORIGINS"),

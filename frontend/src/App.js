@@ -37,6 +37,7 @@ const wsOrigin = () => {
 };
 
 const wsCallUrl = (sessionId) => `${wsOrigin()}/ws/call/${encodeURIComponent(sessionId)}`;
+
 const formatDate = (value) => {
   if (!value) return "Not scheduled";
   const date = new Date(value);
@@ -44,24 +45,47 @@ const formatDate = (value) => {
   return date.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
 };
 
-function LoginScreen({ onLogin }) {
+const formatScore = (value) => (value === null || value === undefined ? "Pending" : `${Math.round(Number(value))}%`);
+const scoreTone = (value) => {
+  if (value === null || value === undefined) return "pending";
+  if (Number(value) >= 85) return "good";
+  if (Number(value) >= 65) return "watch";
+  return "risk";
+};
+
+const patientName = (patient) => patient?.name || patient?.Name || "Unknown patient";
+const doctorName = (doctor) => doctor?.name || doctor?.Name || "Unassigned";
+
+async function requestJson(path, { auth, method = "GET", body } = {}) {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method,
+    headers: {
+      ...(body ? { "Content-Type": "application/json" } : {}),
+      ...authHeaders(auth),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.detail || "Request failed.");
+  return data;
+}
+
+function LoginScreen({ targetRole, onLogin }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const roleLabel = targetRole === "doctor" ? "Doctor" : targetRole === "csr" ? "CSR" : "Admin";
 
   const submit = async (event) => {
     event.preventDefault();
     setBusy(true);
     setError("");
     try {
-      const response = await fetch(`${API_BASE}/auth/login`, {
+      const data = await requestJson("/auth/login", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password }),
+        body: { username, password },
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || "Login failed.");
       onLogin(data);
     } catch (err) {
       setError(err.message || "Login failed.");
@@ -74,12 +98,12 @@ function LoginScreen({ onLogin }) {
     <main className="login-shell">
       <form className="login-panel" onSubmit={submit}>
         <div>
-          <p className="eyebrow">Medical Concierge</p>
-          <h1>Staff sign in</h1>
-          <p className="muted">Use the admin or CSR account configured on the backend.</p>
+          <p className="eyebrow">Medical Concierge CRM</p>
+          <h1>{roleLabel} sign in</h1>
+          <p className="muted">{targetRole === "doctor" ? "Use your doctor ID or name and the portal password." : "Use the staff account configured on the backend."}</p>
         </div>
         <label>
-          Username
+          {targetRole === "doctor" ? "Doctor ID or name" : "Username"}
           <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" />
         </label>
         <label>
@@ -96,14 +120,18 @@ function LoginScreen({ onLogin }) {
 }
 
 function AppHeader({ auth, onLogout }) {
+  const title = auth.role === "admin" ? "Hospital CRM" : auth.role === "doctor" ? "Doctor Workspace" : "CSR Workspace";
+  const subtitle = auth.role === "admin" ? "Patient conversations, clinical notes, corrections, and service quality." : auth.role === "doctor" ? "Assigned patients and pre-consultation notes." : "Human handoff queue.";
+
   return (
     <header className="app-header">
       <div>
         <p className="eyebrow">Medical Concierge</p>
-        <h1>{auth.role === "admin" ? "Admin Dashboard" : "CSR Workspace"}</h1>
+        <h1>{title}</h1>
+        <p>{subtitle}</p>
       </div>
       <div className="session-chip">
-        <span>{auth.username}</span>
+        <span>{auth.doctor_name || auth.username}</span>
         <strong>{auth.role}</strong>
         <button onClick={onLogout} aria-label="Sign out">Sign out</button>
       </div>
@@ -111,7 +139,250 @@ function AppHeader({ auth, onLogout }) {
   );
 }
 
-function AdminDashboard({ auth }) {
+function SectionBar({ title, meta, action }) {
+  return (
+    <div className="section-bar">
+      <div>
+        <h2>{title}</h2>
+        {meta ? <p>{meta}</p> : null}
+      </div>
+      {action}
+    </div>
+  );
+}
+
+function EmptyState({ children }) {
+  return <div className="empty-state">{children}</div>;
+}
+
+function StatGrid({ items }) {
+  return (
+    <div className="stat-grid">
+      {items.map((item) => (
+        <article className="stat-card" key={item.label}>
+          <span>{item.label}</span>
+          <strong>{item.value}</strong>
+          {item.detail ? <small>{item.detail}</small> : null}
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function ScoreBadge({ label, value, source }) {
+  return (
+    <article className={`score-badge ${scoreTone(value)}`}>
+      <span>{label}</span>
+      <strong>{formatScore(value)}</strong>
+      {source ? <small>{source === "judge_proxy" ? "Judge proxy" : source}</small> : null}
+    </article>
+  );
+}
+
+function StatusPill({ value }) {
+  return <mark className={`status-pill ${value || "active"}`}>{value || "active"}</mark>;
+}
+
+function TranscriptView({ transcript, selectedIndex, onSelectIndex }) {
+  if (!transcript?.length) return <EmptyState>No chat transcript has been recorded for this session.</EmptyState>;
+  return (
+    <div className="transcript">
+      {transcript.map((item, index) => (
+        <button
+          className={`transcript-line ${item.sender} ${selectedIndex === index ? "selected" : ""}`}
+          key={`${item.at || "message"}-${index}`}
+          onClick={() => onSelectIndex?.(index)}
+          type="button"
+        >
+          <small>#{index + 1} {item.sender} - {item.channel || "chat"} - {formatDate(item.at)}</small>
+          <p>{item.text}</p>
+          {item.metadata?.judge ? <em>{item.metadata.judge.reason}</em> : null}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function CorrectionPanel({ corrections, selectedIndex, onSave }) {
+  const [category, setCategory] = useState("preference");
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const save = async () => {
+    const clean = note.trim();
+    if (!clean || busy) return;
+    setBusy(true);
+    try {
+      await onSave({ category, note: clean, target_message_index: selectedIndex ?? null });
+      setNote("");
+      setCategory("preference");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <aside className="correction-panel">
+      <div>
+        <p className="eyebrow">Correction Notes</p>
+        <h3>Preference tuning queue</h3>
+        <p className="muted">Notes saved here stay attached to this chat and are exported through the backend preference notes endpoint.</p>
+      </div>
+      <label>
+        Category
+        <select value={category} onChange={(event) => setCategory(event.target.value)}>
+          <option value="preference">Preference</option>
+          <option value="safety">Safety</option>
+          <option value="routing">Routing</option>
+          <option value="tone">Tone</option>
+          <option value="tooling">Tooling</option>
+        </select>
+      </label>
+      <label>
+        Note
+        <textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="Example: When the patient says severe chest tightness, route to urgent human review before booking." />
+      </label>
+      <div className="correction-meta">
+        <span>{selectedIndex === null || selectedIndex === undefined ? "Applies to full chat" : `Linked to message #${selectedIndex + 1}`}</span>
+        <button className="primary-action" onClick={save} disabled={busy || !note.trim()}>{busy ? "Saving..." : "Save note"}</button>
+      </div>
+      <div className="correction-list">
+        {(corrections || []).map((item) => (
+          <article key={item.id || `${item.at}-${item.note}`}>
+            <small>{item.category || "general"} - {formatDate(item.at)}</small>
+            <p>{item.note}</p>
+          </article>
+        ))}
+        {!corrections?.length ? <p className="muted">No corrections yet.</p> : null}
+      </div>
+    </aside>
+  );
+}
+
+function AdminChatWorkspace({ auth, crm, detail, selectedId, onSelect, onRefresh, onLoadDetail }) {
+  const [query, setQuery] = useState("");
+  const [selectedIndex, setSelectedIndex] = useState(null);
+  const sessions = useMemo(() => crm.sessions || [], [crm.sessions]);
+  const filtered = useMemo(() => {
+    const clean = query.trim().toLowerCase();
+    if (!clean) return sessions;
+    return sessions.filter((session) => {
+      const haystack = [
+        session.session_id,
+        session.prime_complaint,
+        patientName(session.patient),
+        doctorName(session.selected_doctor),
+        session.last_message,
+        session.status,
+      ].join(" ").toLowerCase();
+      return haystack.includes(clean);
+    });
+  }, [query, sessions]);
+
+  const saveCorrection = async (payload) => {
+    if (!selectedId) return;
+    await requestJson(`/admin/chats/${encodeURIComponent(selectedId)}/corrections`, {
+      auth,
+      method: "POST",
+      body: payload,
+    });
+    await onRefresh();
+    await onLoadDetail(selectedId);
+  };
+
+  return (
+    <section className="crm-layout">
+      <aside className="session-list">
+        <div className="session-search">
+          <label>
+            Search chats
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Patient, symptom, doctor, status" />
+          </label>
+        </div>
+        {filtered.map((session) => (
+          <button
+            className={`session-item ${session.session_id === selectedId ? "active" : ""}`}
+            key={session.session_id}
+            onClick={() => {
+              setSelectedIndex(null);
+              onSelect(session.session_id);
+            }}
+          >
+            <div>
+              <strong>{patientName(session.patient)}</strong>
+              <StatusPill value={session.status} />
+            </div>
+            <span>{session.prime_complaint || session.last_message || "No complaint recorded"}</span>
+            <small>{formatDate(session.last_updated || session.created_at)}</small>
+            <div className="mini-scores">
+              <span>F {formatScore(session.scores?.faithfulness)}</span>
+              <span>R {formatScore(session.scores?.relevance)}</span>
+            </div>
+          </button>
+        ))}
+        {!filtered.length ? <EmptyState>No matching sessions.</EmptyState> : null}
+      </aside>
+
+      <div className="session-detail">
+        {detail ? (
+          <>
+            <div className="detail-head">
+              <div>
+                <h2>{patientName(detail.summary?.patient)}</h2>
+                <p>{detail.summary?.prime_complaint || "No prime complaint recorded"} - {detail.summary?.transcript_count || 0} messages</p>
+              </div>
+              <StatusPill value={detail.summary?.status} />
+            </div>
+            <div className="detail-grid">
+              <article>
+                <span>Doctor</span>
+                <strong>{doctorName(detail.summary?.selected_doctor)}</strong>
+                <small>{detail.summary?.selected_doctor?.specialization || "Not selected"}</small>
+              </article>
+              <article>
+                <span>Patient phone</span>
+                <strong>{detail.summary?.patient?.phone || "Not captured"}</strong>
+                <small>{detail.summary?.patient?.id ? `Patient ID ${detail.summary.patient.id}` : "No profile link"}</small>
+              </article>
+              <ScoreBadge label="Faithfulness" value={detail.summary?.scores?.faithfulness} source={detail.summary?.scores?.source} />
+              <ScoreBadge label="Relevance" value={detail.summary?.scores?.relevance} source={detail.summary?.scores?.source} />
+            </div>
+            <div className="chat-review-grid">
+              <div className="review-main">
+                <SectionBar title="Conversation log" meta="Select a message before saving a targeted correction." />
+                <TranscriptView transcript={detail.transcript} selectedIndex={selectedIndex} onSelectIndex={setSelectedIndex} />
+              </div>
+              <CorrectionPanel corrections={detail.corrections} selectedIndex={selectedIndex} onSave={saveCorrection} />
+            </div>
+          </>
+        ) : (
+          <EmptyState>Select a patient conversation to inspect the transcript and quality scores.</EmptyState>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function AppointmentReportModal({ appointment, onClose }) {
+  if (!appointment) return null;
+  return (
+    <div className="modal-backdrop" role="presentation" onClick={onClose}>
+      <section className="report-modal" role="dialog" aria-modal="true" aria-label="Appointment report" onClick={(event) => event.stopPropagation()}>
+        <header>
+          <div>
+            <p className="eyebrow">Appointment #{appointment.id}</p>
+            <h2>{appointment.patient?.name || "Unknown patient"}</h2>
+            <p className="muted">Dr. {appointment.doctor?.name || "Unknown"} - {formatDate(appointment.slot?.start_time || appointment.created_at)}</p>
+          </div>
+          <button className="secondary-action" onClick={onClose}>Close</button>
+        </header>
+        <pre>{appointment.notes || "No report or notes recorded for this appointment."}</pre>
+      </section>
+    </div>
+  );
+}
+
+function AdminAppointments({ auth }) {
   const [appointments, setAppointments] = useState([]);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState("");
@@ -121,9 +392,7 @@ function AdminDashboard({ auth }) {
     setBusy(true);
     setError("");
     try {
-      const response = await fetch(`${API_BASE}/admin/appointments`, { headers: authHeaders(auth) });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || "Unable to load appointments.");
+      const data = await requestJson("/admin/appointments", { auth });
       setAppointments(data.appointments || []);
     } catch (err) {
       setError(err.message || "Unable to load appointments.");
@@ -138,16 +407,14 @@ function AdminDashboard({ auth }) {
 
   return (
     <section className="admin-dashboard">
-      <div className="section-bar">
-        <div>
-          <h2>Appointments</h2>
-          <p>{appointments.length} records</p>
-        </div>
-        <button className="secondary-action" onClick={loadAppointments}>Refresh</button>
-      </div>
-      {error ? <p className="form-error">{error}</p> : null}
-      {busy ? <div className="empty-state">Loading appointments...</div> : null}
-      {!busy && appointments.length === 0 ? <div className="empty-state">No appointments found.</div> : null}
+      <SectionBar
+        title="Appointments"
+        meta={`${appointments.length} records`}
+        action={<button className="secondary-action" onClick={loadAppointments}>Refresh</button>}
+      />
+      {error ? <p className="form-error in-panel">{error}</p> : null}
+      {busy ? <EmptyState>Loading appointments...</EmptyState> : null}
+      {!busy && appointments.length === 0 ? <EmptyState>No appointments found.</EmptyState> : null}
       {!busy && appointments.length > 0 ? (
         <div className="appointment-table">
           <div className="table-row table-head">
@@ -168,7 +435,7 @@ function AdminDashboard({ auth }) {
                 <strong>{appointment.patient?.name}</strong>
                 <small>{appointment.patient?.phone || "No phone"}</small>
               </span>
-              <span><mark>{appointment.status || "unknown"}</mark></span>
+              <span><StatusPill value={appointment.status || "unknown"} /></span>
               <span>
                 <button className="secondary-action compact-button" onClick={() => setSelectedReport(appointment)}>
                   View report
@@ -178,22 +445,135 @@ function AdminDashboard({ auth }) {
           ))}
         </div>
       ) : null}
-      {selectedReport ? (
-        <div className="modal-backdrop" role="presentation" onClick={() => setSelectedReport(null)}>
-          <section className="report-modal" role="dialog" aria-modal="true" aria-label="Appointment report" onClick={(event) => event.stopPropagation()}>
-            <header>
-              <div>
-                <p className="eyebrow">Appointment #{selectedReport.id}</p>
-                <h2>{selectedReport.patient?.name || "Unknown patient"}</h2>
-                <p className="muted">Dr. {selectedReport.doctor?.name || "Unknown"} - {formatDate(selectedReport.slot?.start_time || selectedReport.created_at)}</p>
-              </div>
-              <button className="secondary-action" onClick={() => setSelectedReport(null)}>Close</button>
-            </header>
-            <pre>{selectedReport.notes || "No report or notes recorded for this appointment."}</pre>
-          </section>
-        </div>
-      ) : null}
+      <AppointmentReportModal appointment={selectedReport} onClose={() => setSelectedReport(null)} />
     </section>
+  );
+}
+
+function PreferenceNotes({ auth }) {
+  const [notes, setNotes] = useState([]);
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState("");
+
+  const loadNotes = useCallback(async () => {
+    setBusy(true);
+    try {
+      const data = await requestJson("/admin/preference-notes", { auth });
+      setNotes(data.notes || []);
+      setError("");
+    } catch (err) {
+      setError(err.message || "Unable to load correction notes.");
+    } finally {
+      setBusy(false);
+    }
+  }, [auth]);
+
+  useEffect(() => {
+    loadNotes();
+  }, [loadNotes]);
+
+  return (
+    <section className="admin-dashboard">
+      <SectionBar title="Correction Library" meta={`${notes.length} notes ready for preference tuning`} action={<button className="secondary-action" onClick={loadNotes}>Refresh</button>} />
+      {error ? <p className="form-error in-panel">{error}</p> : null}
+      {busy ? <EmptyState>Loading correction notes...</EmptyState> : null}
+      {!busy && !notes.length ? <EmptyState>No correction notes have been saved yet.</EmptyState> : null}
+      <div className="notes-library">
+        {notes.map((note, index) => (
+          <article key={`${note.session_id}-${note.created_at}-${index}`}>
+            <div>
+              <strong>{note.category || "general"}</strong>
+              <span>{patientName(note.patient)}</span>
+            </div>
+            <p>{note.note}</p>
+            <small>{note.prime_complaint || "No complaint"} - {formatDate(note.created_at)}</small>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function AdminDashboard({ auth }) {
+  const [crm, setCrm] = useState({ sessions: [], stats: {} });
+  const [detail, setDetail] = useState(null);
+  const [selectedId, setSelectedId] = useState("");
+  const [activeTab, setActiveTab] = useState("chats");
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState("");
+
+  const loadCrm = useCallback(async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const data = await requestJson("/admin/crm", { auth });
+      setCrm(data);
+      if (!selectedId && data.sessions?.length) setSelectedId(data.sessions[0].session_id);
+    } catch (err) {
+      setError(err.message || "Unable to load CRM.");
+    } finally {
+      setBusy(false);
+    }
+  }, [auth, selectedId]);
+
+  const loadDetail = useCallback(async (sessionId) => {
+    if (!sessionId) {
+      setDetail(null);
+      return;
+    }
+    try {
+      const data = await requestJson(`/admin/chats/${encodeURIComponent(sessionId)}`, { auth });
+      setDetail(data);
+    } catch (err) {
+      setError(err.message || "Unable to load chat detail.");
+    }
+  }, [auth]);
+
+  useEffect(() => {
+    loadCrm();
+  }, [loadCrm]);
+
+  useEffect(() => {
+    if (selectedId) loadDetail(selectedId);
+  }, [loadDetail, selectedId]);
+
+  const stats = crm.stats || {};
+  return (
+    <div className="crm-shell">
+      <StatGrid
+        items={[
+          { label: "Patient chats", value: crm.count || 0, detail: "Captured sessions" },
+          { label: "Human handoffs", value: stats.handoffs || 0, detail: "Queue pressure" },
+          { label: "Bookings", value: stats.booked || 0, detail: "Confirmed visits" },
+          { label: "Faithfulness", value: formatScore(stats.avg_faithfulness), detail: "Average score" },
+          { label: "Relevance", value: formatScore(stats.avg_relevance), detail: "Average score" },
+          { label: "Corrections", value: stats.corrections || 0, detail: "Tuning notes" },
+        ]}
+      />
+      <nav className="dashboard-tabs" aria-label="Admin sections">
+        {["chats", "appointments", "corrections"].map((tab) => (
+          <button className={activeTab === tab ? "active" : ""} key={tab} onClick={() => setActiveTab(tab)}>
+            {tab === "chats" ? "Patient Chats" : tab === "appointments" ? "Appointments" : "Corrections"}
+          </button>
+        ))}
+        <button className="secondary-action" onClick={loadCrm}>Refresh CRM</button>
+      </nav>
+      {error ? <p className="form-error">{error}</p> : null}
+      {busy && activeTab === "chats" ? <EmptyState>Loading patient conversations...</EmptyState> : null}
+      {!busy && activeTab === "chats" ? (
+        <AdminChatWorkspace
+          auth={auth}
+          crm={crm}
+          detail={detail}
+          selectedId={selectedId}
+          onSelect={setSelectedId}
+          onRefresh={loadCrm}
+          onLoadDetail={loadDetail}
+        />
+      ) : null}
+      {activeTab === "appointments" ? <AdminAppointments auth={auth} /> : null}
+      {activeTab === "corrections" ? <PreferenceNotes auth={auth} /> : null}
+    </div>
   );
 }
 
@@ -212,9 +592,7 @@ function CsrHandoffConsole({ auth }) {
   const loadHandoffs = useCallback(async () => {
     if (!auth?.token) return;
     try {
-      const response = await fetch(`${API_BASE}/csr/handoffs`, { headers: authHeaders(auth) });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || "Unable to load handoffs.");
+      const data = await requestJson("/csr/handoffs", { auth });
       setHandoffs(data.handoffs || []);
       setError("");
     } catch (err) {
@@ -229,9 +607,7 @@ function CsrHandoffConsole({ auth }) {
       return;
     }
     try {
-      const response = await fetch(`${API_BASE}/csr/handoffs/${encodeURIComponent(sessionId)}`, { headers: authHeaders(auth) });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || "Unable to load handoff.");
+      const data = await requestJson(`/csr/handoffs/${encodeURIComponent(sessionId)}`, { auth });
       setDetail(data);
       setError("");
     } catch (err) {
@@ -262,13 +638,11 @@ function CsrHandoffConsole({ auth }) {
   const sendReply = async () => {
     if (!detail?.context?.session_id || !reply.trim()) return;
     try {
-      const response = await fetch(`${API_BASE}/human/message`, {
+      await requestJson("/human/message", {
+        auth,
         method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders(auth) },
-        body: JSON.stringify({ session_id: detail.context.session_id, message: reply.trim(), sender: "csr" }),
+        body: { session_id: detail.context.session_id, message: reply.trim(), sender: "csr" },
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail || "Unable to send reply.");
       setReply("");
       await loadDetail(detail.context.session_id);
       await loadHandoffs();
@@ -287,8 +661,8 @@ function CsrHandoffConsole({ auth }) {
           </div>
           <button className="icon-action" onClick={loadHandoffs} aria-label="Refresh handoffs">Refresh</button>
         </div>
-        {error ? <p className="form-error">{error}</p> : null}
-        {handoffs.length === 0 ? <div className="empty-state">No patients are waiting.</div> : null}
+        {error ? <p className="form-error in-panel">{error}</p> : null}
+        {handoffs.length === 0 ? <EmptyState>No patients are waiting.</EmptyState> : null}
         {handoffs.map((handoff) => (
           <button
             key={handoff.session_id}
@@ -309,23 +683,16 @@ function CsrHandoffConsole({ auth }) {
                 <h2>{detail.context?.patient?.name || "Patient session"}</h2>
                 <p>{detail.context?.patient?.phone || detail.context?.session_id}</p>
               </div>
-              <mark>{detail.handoff?.status || "active"}</mark>
+              <StatusPill value={detail.handoff?.status || "active"} />
             </div>
-            <div className="transcript">
-              {(detail.transcript || []).map((item, index) => (
-                <article className={`transcript-line ${item.sender}`} key={`${item.at}-${index}`}>
-                  <small>{item.sender} - {item.channel}</small>
-                  <p>{item.text}</p>
-                </article>
-              ))}
-            </div>
+            <TranscriptView transcript={detail.transcript} />
             <div className="csr-reply">
               <textarea value={reply} onChange={(event) => setReply(event.target.value)} placeholder="Reply as CSR..." />
               <button className="primary-action" onClick={sendReply}>Send reply</button>
             </div>
           </>
         ) : (
-          <div className="empty-state">Select a handoff to view the conversation.</div>
+          <EmptyState>Select a handoff to view the conversation.</EmptyState>
         )}
       </div>
     </section>
@@ -423,7 +790,7 @@ function PatientChatPanel() {
     wsRef.current = null;
   }, [stopAudio]);
 
-  useEffect(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), [messages, busy, callStatus]);
+  useEffect(() => endRef.current?.scrollIntoView?.({ behavior: "smooth" }), [messages, busy, callStatus]);
 
   useEffect(() => {
     if (!handoff) return undefined;
@@ -708,9 +1075,116 @@ function CsrWorkspace({ auth }) {
   );
 }
 
+function DoctorDashboard({ auth }) {
+  const [data, setData] = useState({ patients: [], doctor: {} });
+  const [selectedId, setSelectedId] = useState("");
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState("");
+
+  const loadPatients = useCallback(async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const next = await requestJson("/doctor/patients", { auth });
+      setData(next);
+      if (!selectedId && next.patients?.length) {
+        setSelectedId(String(next.patients[0].appointment?.id || next.patients[0].patient?.id || 0));
+      }
+    } catch (err) {
+      setError(err.message || "Unable to load doctor workspace.");
+    } finally {
+      setBusy(false);
+    }
+  }, [auth, selectedId]);
+
+  useEffect(() => {
+    loadPatients();
+  }, [loadPatients]);
+
+  const patients = data.patients || [];
+  const selected = patients.find((item) => String(item.appointment?.id || item.patient?.id || 0) === selectedId) || patients[0];
+
+  return (
+    <section className="doctor-dashboard">
+      <StatGrid
+        items={[
+          { label: "Assigned patients", value: patients.length, detail: data.doctor?.name || auth.doctor_name },
+          { label: "With notes", value: patients.filter((item) => item.clinical_notes).length, detail: "Ready for consult" },
+          { label: "Upcoming", value: patients.filter((item) => item.slot?.start_time).length, detail: "Scheduled visits" },
+        ]}
+      />
+      <SectionBar title="Patient Rounds" meta="Pre-consultation notes generated from the concierge triage flow." action={<button className="secondary-action" onClick={loadPatients}>Refresh</button>} />
+      {error ? <p className="form-error">{error}</p> : null}
+      {busy ? <EmptyState>Loading assigned patients...</EmptyState> : null}
+      {!busy && !patients.length ? <EmptyState>No patients are currently assigned to this doctor.</EmptyState> : null}
+      {!busy && patients.length ? (
+        <div className="doctor-workspace">
+          <aside className="doctor-patient-list">
+            {patients.map((item) => {
+              const id = String(item.appointment?.id || item.patient?.id || 0);
+              return (
+                <button className={id === selectedId ? "active" : ""} key={id} onClick={() => setSelectedId(id)}>
+                  <strong>{patientName(item.patient)}</strong>
+                  <span>{formatDate(item.slot?.start_time || item.appointment?.created_at)}</span>
+                  <small>{item.appointment?.status || "pending"}</small>
+                </button>
+              );
+            })}
+          </aside>
+          <div className="doctor-notes">
+            <div className="detail-head">
+              <div>
+                <h2>{patientName(selected?.patient)}</h2>
+                <p>{selected?.patient?.phone || "No phone"} - Appointment #{selected?.appointment?.id || "N/A"}</p>
+              </div>
+              <StatusPill value={selected?.appointment?.status || "pending"} />
+            </div>
+            <div className="detail-grid">
+              <article>
+                <span>Visit time</span>
+                <strong>{formatDate(selected?.slot?.start_time || selected?.appointment?.created_at)}</strong>
+                <small>{selected?.slot?.status || "No slot status"}</small>
+              </article>
+              <article>
+                <span>Patient profile</span>
+                <strong>{selected?.patient?.gender || "Gender not recorded"}</strong>
+                <small>{selected?.patient?.age ? `${selected.patient.age} years` : "Age not recorded"}</small>
+              </article>
+            </div>
+            <section className="clinical-note-panel">
+              <p className="eyebrow">Doctor Notes</p>
+              <pre>{selected?.clinical_notes || "No triage or appointment notes are attached yet."}</pre>
+            </section>
+            <section className="linked-sessions">
+              <h3>Linked concierge sessions</h3>
+              {(selected?.sessions || []).map((session) => (
+                <article key={session.session_id}>
+                  <div>
+                    <strong>{session.prime_complaint || "Conversation"}</strong>
+                    <StatusPill value={session.status} />
+                  </div>
+                  <p>{session.last_message || "No transcript preview"}</p>
+                  <small>Faithfulness {formatScore(session.scores?.faithfulness)} - Relevance {formatScore(session.scores?.relevance)}</small>
+                </article>
+              ))}
+              {!selected?.sessions?.length ? <p className="muted">No linked chat session was found for this appointment.</p> : null}
+            </section>
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 export default function App() {
   const path = window.location.pathname.toLowerCase();
-  const targetRole = path.startsWith("/admin") ? "admin" : path.startsWith("/csr") || path.startsWith("/staff") ? "csr" : "";
+  const targetRole = path.startsWith("/admin")
+    ? "admin"
+    : path.startsWith("/doctor")
+      ? "doctor"
+      : path.startsWith("/csr") || path.startsWith("/staff")
+        ? "csr"
+        : "";
   const [auth, setAuth] = useState(() => {
     try {
       return JSON.parse(window.localStorage.getItem(AUTH_KEY) || "null");
@@ -724,10 +1198,10 @@ export default function App() {
     setAuth(nextAuth);
   };
 
-  const logout = () => {
+  const logout = useCallback(() => {
     window.localStorage.removeItem(AUTH_KEY);
     setAuth(null);
-  };
+  }, []);
 
   useEffect(() => {
     const token = auth?.token;
@@ -745,7 +1219,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [auth?.role, auth?.token, targetRole]);
+  }, [auth?.role, auth?.token, logout, targetRole]);
 
   if (!targetRole) {
     return (
@@ -755,12 +1229,14 @@ export default function App() {
     );
   }
 
-  if (!auth || auth.role !== targetRole) return <LoginScreen onLogin={handleLogin} />;
+  if (!auth || auth.role !== targetRole) return <LoginScreen targetRole={targetRole} onLogin={handleLogin} />;
 
   return (
     <main className="app-shell">
       <AppHeader auth={auth} onLogout={logout} />
-      {targetRole === "admin" ? <AdminDashboard auth={auth} /> : <CsrWorkspace auth={auth} />}
+      {targetRole === "admin" ? <AdminDashboard auth={auth} /> : null}
+      {targetRole === "doctor" ? <DoctorDashboard auth={auth} /> : null}
+      {targetRole === "csr" ? <CsrWorkspace auth={auth} /> : null}
     </main>
   );
 }

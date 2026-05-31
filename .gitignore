@@ -77,3 +77,5 @@ coverage.xml
 
 backend/__pycache__
 backend/Nodes/__pycache__
+
+wa_auth

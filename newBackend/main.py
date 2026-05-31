@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
+import re
 import secrets
+import threading
 import uuid
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -15,7 +19,7 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import AIMessage, HumanMessage
 
 from config import settings, supabase
-from agents.orchestrator import load_booking_context, save_booking_context, orchestrator_graph
+from agents.orchestrator import BOOKING_CTX_DIR, load_booking_context, save_booking_context, orchestrator_graph
 from agents.voice_agent import voice_service
 from agents.pipecat_pipeline import PipecatCallPipeline
 from agents.judge_agent import SAFE_HANDOFF_REPLY, judge_agent_reply
@@ -43,7 +47,9 @@ _human_handoff: dict[str, bool] = {}
 _human_inbox: dict[str, list[dict[str, str]]] = defaultdict(list)
 _active_call_ws: dict[str, WebSocket] = {}
 _handoff_sessions: dict[str, dict[str, Any]] = {}
-_auth_sessions: dict[str, dict[str, str]] = {}
+_auth_sessions: dict[str, dict[str, Any]] = {}
+_session_locks_guard = threading.Lock()
+_session_locks: dict[str, threading.RLock] = {}
 
 _HUMAN_PATTERNS = tuple(
     p.strip().lower()
@@ -82,6 +88,12 @@ class HumanMessageRequest(BaseModel):
     sender: str = "human"
 
 
+class CorrectionRequest(BaseModel):
+    note: str = Field(..., min_length=1)
+    category: str = "general"
+    target_message_index: int | None = None
+
+
 class LoginRequest(BaseModel):
     username: str = Field(..., min_length=1)
     password: str = Field(..., min_length=1)
@@ -91,11 +103,26 @@ class LoginResponse(BaseModel):
     token: str
     role: str
     username: str
+    doctor_id: int | None = None
+    doctor_name: str | None = None
 
 
 def _wants_human(text: str) -> bool:
     t = (text or "").strip().lower()
     return any(p in t for p in _HUMAN_PATTERNS)
+
+
+@contextmanager
+def _session_turn_lock(session_id: str):
+    """Serialize one patient's full turn while allowing other patients in parallel."""
+    key = str(session_id or "").strip()
+    with _session_locks_guard:
+        lock = _session_locks.setdefault(key, threading.RLock())
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _handoff_state(start: bool) -> dict:
@@ -264,6 +291,247 @@ def _collect_by_id(rows: list[dict[str, Any]], key: str = "id") -> dict[Any, dic
     return {row.get(key): row for row in rows if row.get(key) is not None}
 
 
+def _coerce_int(value: Any) -> int | None:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _session_file_for_id(session_id: str) -> Any:
+    safe = re.sub(r"[^a-zA-Z0-9_\-]", "_", str(session_id or ""))
+    return BOOKING_CTX_DIR / f"{safe}.json"
+
+
+def _read_context_file(path: Any) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[CRM] Could not read session file {path}: {exc}")
+        return None
+    if not isinstance(data, dict):
+        return None
+    data.setdefault("session_id", path.stem)
+    return data
+
+
+def _load_all_booking_contexts() -> list[dict[str, Any]]:
+    contexts: list[dict[str, Any]] = []
+    try:
+        files = sorted(BOOKING_CTX_DIR.glob("*.json"))
+    except Exception as exc:
+        print(f"[CRM] Could not list booking contexts: {exc}")
+        return contexts
+    for path in files:
+        ctx = _read_context_file(path)
+        if ctx:
+            contexts.append(ctx)
+    contexts.sort(key=lambda item: item.get("last_updated") or item.get("created_at") or "", reverse=True)
+    return contexts
+
+
+def _load_existing_context(session_id: str) -> dict[str, Any]:
+    path = _session_file_for_id(session_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Session not found.")
+    return load_booking_context(session_id)
+
+
+def _normalize_score(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        match = re.search(r"-?\d+(?:\.\d+)?", str(value))
+        if not match:
+            return None
+        number = float(match.group(0))
+    if number <= 1:
+        number *= 100
+    return round(max(0, min(number, 100)), 1)
+
+
+def _score_from_mapping(mapping: dict[str, Any], names: tuple[str, ...]) -> float | None:
+    for name in names:
+        if name in mapping:
+            score = _normalize_score(mapping.get(name))
+            if score is not None:
+                return score
+    for key in ("evaluation", "evaluations", "metrics", "quality_scores", "ragas", "scores"):
+        nested = mapping.get(key)
+        if isinstance(nested, dict):
+            score = _score_from_mapping(nested, names)
+            if score is not None:
+                return score
+    return None
+
+
+def _explicit_quality_score(ctx: dict[str, Any], names: tuple[str, ...]) -> float | None:
+    score = _score_from_mapping(ctx, names)
+    if score is not None:
+        return score
+    for entry in ctx.get("transcript") or []:
+        metadata = entry.get("metadata") if isinstance(entry, dict) else None
+        if isinstance(metadata, dict):
+            score = _score_from_mapping(metadata, names)
+            if score is not None:
+                return score
+    return None
+
+
+def _judge_proxy_scores(ctx: dict[str, Any]) -> dict[str, Any]:
+    judged = []
+    for entry in ctx.get("transcript") or []:
+        metadata = entry.get("metadata") if isinstance(entry, dict) else None
+        judge = metadata.get("judge") if isinstance(metadata, dict) else None
+        if isinstance(judge, dict):
+            judged.append(judge)
+
+    if not judged:
+        return {"faithfulness": None, "relevance": None, "source": "pending", "judged_turns": 0}
+
+    faithful = [
+        item
+        for item in judged
+        if item.get("approved") is True and not item.get("accuracy_risk") and not item.get("medical_safety_risk")
+    ]
+    relevant = [item for item in judged if item.get("approved") is True and not item.get("medical_safety_risk")]
+    total = max(len(judged), 1)
+    return {
+        "faithfulness": round(len(faithful) / total * 100, 1),
+        "relevance": round(len(relevant) / total * 100, 1),
+        "source": "judge_proxy",
+        "judged_turns": len(judged),
+    }
+
+
+def _quality_scores(ctx: dict[str, Any]) -> dict[str, Any]:
+    faithfulness = _explicit_quality_score(ctx, ("faithfulness_score", "faithfulness", "faithful_score"))
+    relevance = _explicit_quality_score(ctx, ("relevance_score", "relevance", "answer_relevance", "answer_relevancy"))
+    source = "explicit" if faithfulness is not None or relevance is not None else "pending"
+    proxy = _judge_proxy_scores(ctx)
+    if faithfulness is None:
+        faithfulness = proxy["faithfulness"]
+    if relevance is None:
+        relevance = proxy["relevance"]
+    if source == "pending" and proxy["source"] != "pending":
+        source = proxy["source"]
+    return {
+        "faithfulness": faithfulness,
+        "relevance": relevance,
+        "source": source,
+        "judged_turns": proxy["judged_turns"],
+    }
+
+
+def _last_transcript_entry(ctx: dict[str, Any]) -> dict[str, Any]:
+    transcript = [item for item in (ctx.get("transcript") or []) if isinstance(item, dict)]
+    return transcript[-1] if transcript else {}
+
+
+def _session_status(ctx: dict[str, Any]) -> str:
+    if ctx.get("appointment", {}).get("confirmed"):
+        return "booked"
+    if ctx.get("human_handoff") or ctx.get("handoff_status"):
+        return "handoff"
+    if ctx.get("triage_completed"):
+        return "triaged"
+    return "active"
+
+
+def _session_summary(ctx: dict[str, Any]) -> dict[str, Any]:
+    transcript = [item for item in (ctx.get("transcript") or []) if isinstance(item, dict)]
+    last_entry = _last_transcript_entry(ctx)
+    corrections = list(ctx.get("llm_corrections") or [])
+    return {
+        "session_id": ctx.get("session_id"),
+        "created_at": ctx.get("created_at"),
+        "last_updated": ctx.get("last_updated"),
+        "status": _session_status(ctx),
+        "step": ctx.get("step"),
+        "prime_complaint": ctx.get("prime_complaint"),
+        "recommended_specialist": ctx.get("recommended_specialist"),
+        "triage_completed": ctx.get("triage_completed", False),
+        "triage_questions_asked": ctx.get("triage_questions_asked", 0),
+        "patient": ctx.get("patient") or {},
+        "selected_doctor": ctx.get("selected_doctor") or {},
+        "appointment": ctx.get("appointment") or {},
+        "transcript_count": len(transcript),
+        "last_message": last_entry.get("text", ""),
+        "last_sender": last_entry.get("sender", ""),
+        "scores": _quality_scores(ctx),
+        "corrections_count": len(corrections),
+        "latest_correction": corrections[-1] if corrections else None,
+        "has_report": bool(ctx.get("diagnostic_report")),
+        "handoff_status": ctx.get("handoff_status"),
+    }
+
+
+def _session_detail(ctx: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "summary": _session_summary(ctx),
+        "context": _public_ctx(ctx),
+        "transcript": ctx.get("transcript") or [],
+        "triage_qa": ctx.get("triage_qa") or [],
+        "diagnostic_report": ctx.get("diagnostic_report") or "",
+        "corrections": ctx.get("llm_corrections") or [],
+        "preference_tuning_notes": ctx.get("preference_tuning_notes") or [],
+        "final_symptom_match": ctx.get("final_symptom_match") or ctx.get("symptom_context_block") or "",
+    }
+
+
+def _find_doctor_for_login(username: str) -> dict[str, Any] | None:
+    if not supabase:
+        return None
+    cleaned = username.strip()
+    if not cleaned:
+        return None
+
+    try:
+        numeric_id = _coerce_int(cleaned)
+        if numeric_id is not None:
+            response = supabase.table("doctors").select("*").eq("id", numeric_id).limit(1).execute()
+            if response.data:
+                return response.data[0]
+
+        response = supabase.table("doctors").select("*").limit(1000).execute()
+        candidates = response.data or []
+    except Exception as exc:
+        print(f"[Auth] Doctor lookup failed: {exc}")
+        return None
+
+    lowered = cleaned.lower()
+    for doctor in candidates:
+        values = [
+            doctor.get("username"),
+            doctor.get("email"),
+            doctor.get("phone"),
+            doctor.get("name"),
+            doctor.get("Name"),
+        ]
+        if any(str(value or "").strip().lower() == lowered for value in values):
+            return doctor
+
+    for doctor in candidates:
+        name = str(doctor.get("name") or doctor.get("Name") or "").strip().lower()
+        if lowered and lowered in name:
+            return doctor
+    return None
+
+
+def _public_doctor(doctor: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": doctor.get("id"),
+        "name": doctor.get("name") or doctor.get("Name") or "Unknown",
+        "specialization": doctor.get("specialization") or doctor.get("Specialization") or "",
+    }
+
+
 def process_with_langgraph(session_id: str, message: str, channel: str, target_lang: str = "en") -> dict:
     """Push a message through LangGraph using session_id as the persistent thread."""
     _record_transcript(session_id, sender="patient", text=message, channel=channel)
@@ -320,21 +588,40 @@ def login(request: LoginRequest) -> LoginResponse:
     username = request.username.strip()
     password = request.password
     role = None
+    auth_payload: dict[str, Any] | None = None
     if username == settings.admin_username and secrets.compare_digest(password, settings.admin_password):
         role = "admin"
+        auth_payload = {"username": username, "role": role}
     elif username == settings.csr_username and secrets.compare_digest(password, settings.csr_password):
         role = "csr"
+        auth_payload = {"username": username, "role": role}
+    elif secrets.compare_digest(password, settings.doctor_portal_password):
+        doctor = _find_doctor_for_login(username)
+        if doctor:
+            role = "doctor"
+            public_doctor = _public_doctor(doctor)
+            auth_payload = {
+                "username": public_doctor["name"],
+                "role": role,
+                "doctor_id": public_doctor["id"],
+                "doctor_name": public_doctor["name"],
+            }
     if not role:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password.")
 
     token = secrets.token_urlsafe(32)
-    _auth_sessions[token] = {"username": username, "role": role}
-    return LoginResponse(token=token, role=role, username=username)
+    _auth_sessions[token] = auth_payload or {"username": username, "role": role}
+    return LoginResponse(token=token, **_auth_sessions[token])
 
 
 @app.get("/auth/me")
-def auth_me(user: dict[str, str] = Depends(_get_auth_user)) -> dict:
-    return {"username": user["username"], "role": user["role"]}
+def auth_me(user: dict[str, Any] = Depends(_get_auth_user)) -> dict:
+    return {
+        "username": user["username"],
+        "role": user["role"],
+        "doctor_id": user.get("doctor_id"),
+        "doctor_name": user.get("doctor_name"),
+    }
 
 
 @app.get("/admin/appointments")
@@ -382,6 +669,201 @@ def admin_appointments(_: dict[str, str] = Depends(_require_role("admin"))) -> d
     return {"appointments": rows, "count": len(rows)}
 
 
+@app.get("/admin/crm")
+def admin_crm(_: dict[str, Any] = Depends(_require_role("admin"))) -> dict:
+    sessions = [_session_summary(ctx) for ctx in _load_all_booking_contexts()]
+    active = [item for item in sessions if item.get("status") == "active"]
+    handoffs = [item for item in sessions if item.get("status") == "handoff"]
+    booked = [item for item in sessions if item.get("status") == "booked"]
+    scored = [item for item in sessions if item.get("scores", {}).get("faithfulness") is not None]
+    avg_faithfulness = (
+        round(sum(item["scores"]["faithfulness"] for item in scored) / len(scored), 1)
+        if scored else None
+    )
+    relevant = [item for item in sessions if item.get("scores", {}).get("relevance") is not None]
+    avg_relevance = (
+        round(sum(item["scores"]["relevance"] for item in relevant) / len(relevant), 1)
+        if relevant else None
+    )
+    return {
+        "sessions": sessions,
+        "count": len(sessions),
+        "stats": {
+            "active": len(active),
+            "handoffs": len(handoffs),
+            "booked": len(booked),
+            "corrections": sum(int(item.get("corrections_count") or 0) for item in sessions),
+            "avg_faithfulness": avg_faithfulness,
+            "avg_relevance": avg_relevance,
+        },
+    }
+
+
+@app.get("/admin/chats/{session_id}")
+def admin_chat_detail(session_id: str, _: dict[str, Any] = Depends(_require_role("admin"))) -> dict:
+    ctx = _load_existing_context(session_id)
+    return _session_detail(ctx)
+
+
+@app.post("/admin/chats/{session_id}/corrections")
+def admin_add_correction(
+    session_id: str,
+    request: CorrectionRequest,
+    user: dict[str, Any] = Depends(_require_role("admin")),
+) -> dict:
+    ctx = _load_existing_context(session_id)
+    corrections = list(ctx.get("llm_corrections") or [])
+    entry = {
+        "id": str(uuid.uuid4()),
+        "at": _now_iso(),
+        "author": user.get("username", "admin"),
+        "category": request.category.strip() or "general",
+        "target_message_index": request.target_message_index,
+        "note": request.note.strip(),
+    }
+    corrections.append(entry)
+    ctx["llm_corrections"] = corrections
+    ctx["preference_tuning_notes"] = [
+        {
+            "category": item.get("category", "general"),
+            "note": item.get("note", ""),
+            "session_id": session_id,
+            "created_at": item.get("at"),
+        }
+        for item in corrections
+        if item.get("note")
+    ]
+    save_booking_context(session_id, ctx)
+    return {"ok": True, "correction": entry, "session": _session_summary(ctx)}
+
+
+@app.get("/admin/preference-notes")
+def admin_preference_notes(_: dict[str, Any] = Depends(_require_role("admin"))) -> dict:
+    notes: list[dict[str, Any]] = []
+    for ctx in _load_all_booking_contexts():
+        for item in ctx.get("preference_tuning_notes") or []:
+            if isinstance(item, dict):
+                notes.append(
+                    {
+                        **item,
+                        "session_id": item.get("session_id") or ctx.get("session_id"),
+                        "patient": ctx.get("patient") or {},
+                        "prime_complaint": ctx.get("prime_complaint"),
+                    }
+                )
+    notes.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    return {"notes": notes, "count": len(notes)}
+
+
+@app.get("/doctor/me")
+def doctor_me(user: dict[str, Any] = Depends(_require_role("doctor"))) -> dict:
+    return {
+        "doctor": {
+            "id": user.get("doctor_id"),
+            "name": user.get("doctor_name") or user.get("username"),
+        }
+    }
+
+
+@app.get("/doctor/patients")
+def doctor_patients(user: dict[str, Any] = Depends(_require_role("doctor"))) -> dict:
+    doctor_id = _coerce_int(user.get("doctor_id"))
+    if doctor_id is None:
+        raise HTTPException(status_code=403, detail="Doctor account is not linked to a doctor record.")
+
+    contexts = _load_all_booking_contexts()
+    def local_doctor_rows() -> dict:
+        matched = [
+            ctx for ctx in contexts
+            if _coerce_int((ctx.get("selected_doctor") or {}).get("id")) == doctor_id
+        ]
+        return {
+            "doctor": {"id": doctor_id, "name": user.get("doctor_name") or user.get("username")},
+            "patients": [
+                {
+                    "appointment": ctx.get("appointment") or {},
+                    "patient": ctx.get("patient") or {},
+                    "slot": {},
+                    "clinical_notes": ctx.get("diagnostic_report") or "\n\n".join(ctx.get("triage_qa") or []),
+                    "sessions": [_session_summary(ctx)],
+                }
+                for ctx in matched
+            ],
+            "count": len(matched),
+        }
+
+    if not supabase:
+        return local_doctor_rows()
+
+    try:
+        appointments = (
+            supabase.table("appointments")
+            .select("*")
+            .eq("doctor_id", doctor_id)
+            .limit(500)
+            .execute()
+            .data
+            or []
+        )
+        patients = _collect_by_id(supabase.table("patients").select("*").limit(1000).execute().data or [])
+        slots = _collect_by_id(supabase.table("slots").select("*").limit(1500).execute().data or [])
+    except Exception as exc:
+        print(f"[DoctorCRM] Database unavailable, using local context fallback: {exc}")
+        return local_doctor_rows()
+
+    rows = []
+    for appt in appointments:
+        patient = patients.get(appt.get("patient_id"), {})
+        slot = slots.get(appt.get("slot_id"), {})
+        appointment_id = appt.get("id")
+        patient_id = appt.get("patient_id")
+        related_contexts = [
+            ctx for ctx in contexts
+            if _coerce_int((ctx.get("selected_doctor") or {}).get("id")) == doctor_id
+            and (
+                _coerce_int((ctx.get("appointment") or {}).get("booking_id")) == _coerce_int(appointment_id)
+                or _coerce_int((ctx.get("patient") or {}).get("id")) == _coerce_int(patient_id)
+            )
+        ]
+        related_contexts.sort(key=lambda item: item.get("last_updated") or item.get("created_at") or "", reverse=True)
+        fallback_notes = ""
+        if related_contexts:
+            latest = related_contexts[0]
+            fallback_notes = latest.get("diagnostic_report") or "\n\n".join(latest.get("triage_qa") or [])
+        rows.append(
+            {
+                "appointment": {
+                    "id": appointment_id,
+                    "status": appt.get("status"),
+                    "created_at": appt.get("created_at"),
+                    "notes": appt.get("notes") or "",
+                },
+                "patient": {
+                    "id": patient.get("id") or patient_id,
+                    "name": patient.get("name") or patient.get("Name") or "Unknown",
+                    "phone": patient.get("phone") or "",
+                    "age": patient.get("age"),
+                    "gender": patient.get("gender"),
+                },
+                "slot": {
+                    "id": slot.get("id") or appt.get("slot_id"),
+                    "start_time": slot.get("start_time"),
+                    "end_time": slot.get("end_time"),
+                    "status": slot.get("status"),
+                },
+                "clinical_notes": appt.get("notes") or fallback_notes,
+                "sessions": [_session_summary(ctx) for ctx in related_contexts],
+            }
+        )
+
+    rows.sort(key=lambda item: item.get("slot", {}).get("start_time") or item.get("appointment", {}).get("created_at") or "", reverse=True)
+    return {
+        "doctor": {"id": doctor_id, "name": user.get("doctor_name") or user.get("username")},
+        "patients": rows,
+        "count": len(rows),
+    }
+
+
 @app.get("/csr/handoffs")
 def csr_handoffs(_: dict[str, str] = Depends(_require_role("csr"))) -> dict:
     sessions = sorted(_handoff_sessions.values(), key=lambda item: item.get("updated_at", ""), reverse=True)
@@ -404,22 +886,23 @@ def csr_handoff_detail(session_id: str, _: dict[str, str] = Depends(_require_rol
 @app.post("/chat")
 def chat(request: ChatRequest) -> dict:
     session_id = request.session_id or str(uuid.uuid4())
-    state = process_with_langgraph(session_id, request.user_input, request.channel)
-    state = _finalize_agent_reply(
-        session_id=session_id,
-        user_message=request.user_input,
-        channel=request.channel,
-        state=state,
-    )
-    messages = state.get("messages", [])
-    reply_text = messages[-1].content if messages else "I couldn't process that."
+    with _session_turn_lock(session_id):
+        state = process_with_langgraph(session_id, request.user_input, request.channel)
+        state = _finalize_agent_reply(
+            session_id=session_id,
+            user_message=request.user_input,
+            channel=request.channel,
+            state=state,
+        )
+        messages = state.get("messages", [])
+        reply_text = messages[-1].content if messages else "I couldn't process that."
 
-    return {
-        "session_id": session_id,
-        "reply": reply_text,
-        "triage_active": state.get("triage_active", False),
-        "human_handoff": state.get("human_handoff", False),
-    }
+        return {
+            "session_id": session_id,
+            "reply": reply_text,
+            "triage_active": state.get("triage_active", False),
+            "human_handoff": state.get("human_handoff", False),
+        }
 
 
 @app.get("/health")
@@ -459,15 +942,16 @@ async def voice_message(request: VoiceRequest) -> dict:
         transcript = raw_transcript
 
     target_lang = _session_lang.get(session_id, "en")
-    state = process_with_langgraph(session_id, transcript, "voice_message", target_lang)
-    state = _finalize_agent_reply(
-        session_id=session_id,
-        user_message=transcript,
-        channel="voice_message",
-        state=state,
-    )
-    messages = state.get("messages", [])
-    reply_text = messages[-1].content if messages else "I'm sorry, I couldn't process that."
+    with _session_turn_lock(session_id):
+        state = process_with_langgraph(session_id, transcript, "voice_message", target_lang)
+        state = _finalize_agent_reply(
+            session_id=session_id,
+            user_message=transcript,
+            channel="voice_message",
+            state=state,
+        )
+        messages = state.get("messages", [])
+        reply_text = messages[-1].content if messages else "I'm sorry, I couldn't process that."
     audio_reply = await voice_service.synthesize_base64_wav(reply_text) if str(reply_text).strip() else ""
 
     return {
@@ -487,10 +971,11 @@ async def human_message(
     _: dict[str, str] = Depends(_require_role("csr", "admin")),
 ) -> dict:
     session_id = request.session_id
-    _human_handoff[session_id] = True
-    _mark_handoff(session_id, status_value="active", reason="CSR joined the conversation.")
-    _human_inbox[session_id].append({"sender": request.sender, "message": request.message, "at": _now_iso()})
-    _record_transcript(session_id, sender=request.sender or "human", text=request.message, channel="human")
+    with _session_turn_lock(session_id):
+        _human_handoff[session_id] = True
+        _mark_handoff(session_id, status_value="active", reason="CSR joined the conversation.")
+        _human_inbox[session_id].append({"sender": request.sender, "message": request.message, "at": _now_iso()})
+        _record_transcript(session_id, sender=request.sender or "human", text=request.message, channel="human")
     ws = _active_call_ws.get(session_id)
     if ws:
         try:
@@ -517,13 +1002,14 @@ async def call_socket(websocket: WebSocket, session_id: str) -> None:
     _active_call_ws[session_id] = websocket
 
     def process_call_turn(call_session_id: str, message: str, channel: str, target_lang: str = "en") -> dict:
-        state = process_with_langgraph(call_session_id, message, channel, target_lang)
-        return _finalize_agent_reply(
-            session_id=call_session_id,
-            user_message=message,
-            channel=channel,
-            state=state,
-        )
+        with _session_turn_lock(call_session_id):
+            state = process_with_langgraph(call_session_id, message, channel, target_lang)
+            return _finalize_agent_reply(
+                session_id=call_session_id,
+                user_message=message,
+                channel=channel,
+                state=state,
+            )
 
     pipeline = PipecatCallPipeline(
         websocket=websocket,

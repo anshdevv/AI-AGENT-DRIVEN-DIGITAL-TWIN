@@ -27,6 +27,7 @@ import time
 import json
 import re
 import os
+import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -50,7 +51,7 @@ except ZoneInfoNotFoundError:
 # BOOKING CONTEXT — per-session JSON sidecar
 # ═══════════════════════════════════════════════════════════════════
 
-BOOKING_CTX_DIR = Path("booking_context")
+BOOKING_CTX_DIR = Path(__file__).resolve().parents[1] / "booking_context"
 BOOKING_CTX_DIR.mkdir(exist_ok=True)
 
 
@@ -122,7 +123,18 @@ def save_booking_context(session_id: str, ctx: dict) -> None:
     ctx["last_updated"] = datetime.now(PKT).isoformat()
     try:
         path = _booking_ctx_path(session_id)
-        path.write_text(json.dumps(ctx, indent=2, ensure_ascii=False), encoding="utf-8")
+        payload = json.dumps(ctx, indent=2, ensure_ascii=False)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp.write(payload)
+            tmp_path = Path(tmp.name)
+        tmp_path.replace(path)
         print(f"💾 [BookingCtx] step={ctx['step']} → saved {path.name}")
     except Exception as e:
         print(f"❌ [BookingCtx] Save failed: {e}")

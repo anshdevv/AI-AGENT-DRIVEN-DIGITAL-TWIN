@@ -1,0 +1,119 @@
+{
+  "session_id": "8976e7a9-c890-4a86-ad74-132039b3d708",
+  "created_at": "2026-05-14T21:46:44.120683+05:00",
+  "last_updated": "2026-05-14T21:49:52.188923+05:00",
+  "step": "collect_patient",
+  "prime_complaint": "headache",
+  "recommended_specialist": null,
+  "triage_completed": false,
+  "triage_questions_asked": 0,
+  "triage_qa": [],
+  "accumulated_symptoms": [],
+  "symptom_context_block": null,
+  "final_symptom_match": null,
+  "patient": {
+    "id": null,
+    "name": null,
+    "phone": null
+  },
+  "selected_doctor": {
+    "id": null,
+    "name": null,
+    "specialization": null
+  },
+  "pending_slot": {
+    "date": null,
+    "time": null
+  },
+  "appointment": {
+    "date": null,
+    "time": null,
+    "confirmed": false,
+    "booking_id": null
+  },
+  "transcript": [
+    {
+      "at": "2026-05-14T21:46:44.118675+05:00",
+      "sender": "patient",
+      "text": "hi",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:46:45.213706+05:00",
+      "sender": "assistant",
+      "text": "Hello! How can I assist you today? If you're feeling unwell or have any concerns, please share them with me so I can help.",
+      "channel": "chat",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Low-risk non-medical turn; judge skipped."
+        }
+      }
+    },
+    {
+      "at": "2026-05-14T21:46:52.609345+05:00",
+      "sender": "patient",
+      "text": "i am having a headache",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:47:32.731195+05:00",
+      "sender": "assistant",
+      "text": "Please provide your phone number so I can check your existing profile or create a new one.",
+      "channel": "chat",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-14T21:47:40.650312+05:00",
+      "sender": "patient",
+      "text": "i want to talk to a human",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:47:40.719628+05:00",
+      "sender": "assistant",
+      "text": "Sure, I am routing you to a human care specialist now. Please continue here and they will reply shortly.",
+      "channel": "chat",
+      "metadata": {
+        "judge": null
+      }
+    },
+    {
+      "at": "2026-05-14T21:47:56.849689+05:00",
+      "sender": "csr",
+      "text": "hi i am here to assist you",
+      "channel": "human",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:48:12.000672+05:00",
+      "sender": "patient",
+      "text": "oh hello how are you",
+      "channel": "chat",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-14T21:49:52.028613+05:00",
+      "sender": "patient",
+      "text": "i have heart attack",
+      "channel": "chat",
+      "metadata": {}
+    }
+  ],
+  "patient_language": "en",
+  "human_handoff": true,
+  "handoff_status": "active",
+  "handoff_reason": "CSR joined the conversation."
+}

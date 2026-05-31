@@ -1,0 +1,174 @@
+{
+  "session_id": "923102010910@s.whatsapp.net",
+  "created_at": "2026-05-30T20:03:50.469538+05:00",
+  "last_updated": "2026-05-30T20:10:48.364952+05:00",
+  "step": "collect_doctor",
+  "prime_complaint": "appointment booking request",
+  "recommended_specialist": "Cardiologist",
+  "triage_completed": true,
+  "triage_questions_asked": 0,
+  "triage_qa": [
+    "Q: I'm glad we found your profile, Muhammad Hamza! To ensure you see the right specialist, could you please describe the symptoms or reason for your visit? For example: \"I've had a headache for three days\" or \"I need a routine checkup\". This will help us recommend the most appropriate doctor for your needs.\nA: I've had a headache for three days\""
+  ],
+  "accumulated_symptoms": [
+    "I've had a headache for three days\""
+  ],
+  "symptom_context_block": "── SYMPTOM LOOKUP CONTEXT (from medical datasets) ──\nSeverity estimate   : Mild\nRecommendation      : OTC Drug\nSuggested specialist: Cardiologist\n\nTop candidate conditions:\n  1. Hypertension  (score 100%)\n     Matched symptoms : headache\n     Precautions      : meditation; salt baths; reduce stress; get proper sleep\n  2. Migraine  (score 100%)\n     Matched symptoms : headache\n     Precautions      : meditation; reduce stress; use poloroid glasses in sun; consult doctor\n  3. Paralysis Brain Hemorrhage  (score 100%)\n     Matched symptoms : headache\n     Precautions      : massage; eat healthy; exercise; consult doctor\n────────────────────────────────────────────────────",
+  "final_symptom_match": "── SYMPTOM LOOKUP CONTEXT (from medical datasets) ──\nSeverity estimate   : Mild\nRecommendation      : OTC Drug\nSuggested specialist: Cardiologist\n\nTop candidate conditions:\n  1. Hypertension  (score 10%)\n     Matched symptoms : headache\n     Precautions      : meditation; salt baths; reduce stress; get proper sleep\n  2. Migraine  (score 10%)\n     Matched symptoms : headache\n     Precautions      : meditation; reduce stress; use poloroid glasses in sun; consult doctor\n  3. Paralysis Brain Hemorrhage  (score 10%)\n     Matched symptoms : headache\n     Precautions      : massage; eat healthy; exercise; consult doctor\n────────────────────────────────────────────────────",
+  "patient": {
+    "id": 2,
+    "name": "Muhammad hamza",
+    "phone": "03102010910"
+  },
+  "selected_doctor": {
+    "id": null,
+    "name": null,
+    "specialization": "Cardiologist"
+  },
+  "pending_slot": {
+    "date": null,
+    "time": null
+  },
+  "appointment": {
+    "date": null,
+    "time": null,
+    "confirmed": false,
+    "booking_id": null
+  },
+  "transcript": [
+    {
+      "at": "2026-05-30T20:03:50.466371+05:00",
+      "sender": "patient",
+      "text": "Hello, مجھے appointment book کرنا ہے۔",
+      "channel": "voice_message",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-30T20:04:04.980469+05:00",
+      "sender": "assistant",
+      "text": "I'm glad to hear the triage is complete! To proceed with booking your appointment with a General Physician, I'll need your phone number to check our records. Could you please share your contact number with me?",
+      "channel": "voice_message",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-30T20:04:21.664239+05:00",
+      "sender": "patient",
+      "text": "03102010910",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-30T20:04:48.914229+05:00",
+      "sender": "assistant",
+      "text": "I'm glad we found your profile, Muhammad Hamza! To ensure you see the right specialist, could you please describe the symptoms or reason for your visit? For example: \"I've had a headache for three days\" or \"I need a routine checkup\". This will help us recommend the most appropriate doctor for your needs.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-30T20:05:10.785118+05:00",
+      "sender": "patient",
+      "text": "I've had a headache for three days\"",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-30T20:06:32.667730+05:00",
+      "sender": "assistant",
+      "text": "Here is the available cardiologist:\n\n**Dr. Ahmed Khan**  \n12 years of experience | Consultation Fee: Rs. 3000  \n\nWould you like to proceed with Dr. Ahmed Khan for your appointment? (yes/no)",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-30T20:06:52.673451+05:00",
+      "sender": "patient",
+      "text": "yes",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-30T20:08:37.516051+05:00",
+      "sender": "assistant",
+      "text": "Here are the available slots with Dr. Ahmed Khan on **Monday, June 1, 2026**:  \n🕘 09:00 AM | 🕐 09:30 AM | 🕑 10:00 AM | 🕒 10:30 AM | 🕓 11:00 AM | 🕔 11:30 AM (and 2 more afternoon slots).  \n\nPlease share your preferred time, and I’ll confirm the booking for you.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Low-risk non-medical turn; judge skipped."
+        }
+      }
+    },
+    {
+      "at": "2026-05-30T20:09:02.861263+05:00",
+      "sender": "patient",
+      "text": "9 am",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-30T20:09:42.278851+05:00",
+      "sender": "assistant",
+      "text": "Here is your appointment summary:  \n**Doctor:** Dr. Ahmed Khan (Cardiologist)  \n**Date:** Monday, June 1, 2026  \n**Time:** 09:00 AM  \n\nShall I confirm this booking for you? (yes/no)",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-30T20:09:50.235259+05:00",
+      "sender": "patient",
+      "text": "yes",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-30T20:10:48.346933+05:00",
+      "sender": "assistant",
+      "text": "[END_CALL]",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Low-risk non-medical turn; judge skipped."
+        }
+      }
+    }
+  ],
+  "patient_language": "en",
+  "triage_severity": "Mild",
+  "patient_history_block": "── PATIENT HISTORY (last 5 visits) ──\nLast 5 note(s) for patient 2:\n  [2026-04-25T00:01:42.028646+00:00] Appt#12 — =========================================\n     PRE-CONSULTATION SOAP NOTE\n=========================================\nDATE                : 2026-04-25 05:03 PKT\nATTENDING PHYSICIAN : Dr.Afaf Irfan\nSPECIALTY           : General Physician\n\nPATIENT\n  Name  : Muhammad hamza\n  Phone : 03102010910\n\n─────────────────────────────────────────\nS — SUBJECTIVE\n─────────────────────────────────────────\nChief Complaint: severe headache\nHistory of Present Illness (HPI): Patient reports a headache that has been present for a couple of hours. The pain comes and goes. Loud noises make the headache worse, while drinking tea provides some relief. The patient has not taken any medication for the headache.\nTriage Q&A (clinical pre-screening):\n  Q1: How long have you been experiencing this headache?\n  A1: For a couple of hours.\n  Q2: Is the headache constant, or does it come and go?\n  A2: The pain comes and goes.\n  Q3: Does anything seem to make the headache worse?\n  A3: Loud noises.\n  Q4: Does anything seem to make the headache better?\n  A4: Drinking tea.\n  Q5: Have you taken any medication for the headache?\n  A5: No, I have not.\n\nPast Medical / Surgical History: Not provided\n\n─────────────────────────────────────────\nO — OBJECTIVE\n─────────────────────────────────────────\nVital Signs    : Not recorded (pre-consultation triage only)\nPhysical Exam  : Deferred — to be completed by attending physician\n\nSymptom Severity  : Mild\nSymptom Match     : ── SYMPTOM LOOKUP CONTEXT (from medical datasets) ──\nSeverity estimate   : Mild\nRecommendation      : OTC Drug\nSuggested specialist: General Physician\n\nTop candidate conditions:\n  1. Drug Reaction  (score 4%)\n     Matched symptoms : headache\n     Precautions      : stop irritation; consult nearest hospital; stop taking drug; follow up\n  2. Hypertension  (score 4%)\n     Matched symptoms : headache\n     Precautions      : meditation; salt baths; reduce stress; get proper sleep\n  3. Migraine  (score 4%)\n     Matched symptoms : headache\n     Precautions      : meditation; reduce stress; use poloroid glasses in sun; consult doctor\n────────────────────────────────────────────────────\n\n─────────────────────────────────────────\nA — ASSESSMENT\n─────────────────────────────────────────\nClinical Impression: Mild headache, likely tension-type headache or migraine. Differential includes drug reaction and hypertension, though less likely given the limited information.\nRouting Rationale : First visit / non-severe → General Physician first\n\n─────────────────────────────────────────\nP — PLAN\n─────────────────────────────────────────\nRecommended Specialist : General Physician\nBooking Status         : CONFIRMED — Booking ID 12  (2026-04-27 at 12:00)\n\nPrecautions / Red Flags to Discuss: Discuss with attending physician.\n\nNext Steps:\n  1. Attending physician to perform full history and physical examination.\n  2. Order investigations as clinically indicated.\n  3. Review and update this note after consultation.\n=========================================\nPRECAUTIONS         : Discuss with attending physician.\n\nTRIAGE Q&A (MedGemma clinical questions + patient answers — use for HPI):\nQ1: How long have you been experiencing this headache?\nA1: For a couple of hours.\nQ2: Is the headache constant, or does it come and go?\nA2: The pain comes and goes.\nQ3: Does anything seem to make the headache worse?\nA3: Loud noises.\nQ4: Does anything seem to make the headache better?\nA4: Drinking tea.\nQ5: Have you taken any medication for the headache?\nA5: No, I have not.\n\nCLINICAL SUMMARY FROM TRIAGE:\nSee triage Q&A above.\n  [2026-04-24T08:54:07.191732+00:00] Appt#9 — =========================================\n     PRE-CONSULTATION SOAP NOTE\n=========================================\nDATE                : 2026-04-24 13:55 PKT\nATTENDING PHYSICIAN : Dr.Afaf Irfan\nSPECIALTY           : General Physician\n\nPATIENT\n  Name  : Muhammad hamza\n  Phone : 03102010910\n\n─────────────────────────────────────────\nS — SUBJECTIVE\n─────────────────────────────────────────\nChief Complaint: severe headache\nHistory of Present Illness (HPI): Patient reports a headache that has been going on for a couple of hours. The headache comes and goes. It is aggravated by moving his head. He reports that drinking tea helped.\nTriage Q&A (clinical pre-screening):\n  Q1: How long have you been experiencing this headache?\n  A1: its been going on for a couple of hours\n  Q2: Is the headache a constant pain, or does it come and go?\n  A2: it comes and goes\n  Q3: Does anything seem to make the headache worse, like certain movements or activities?\n  A3: moving around my head\n  Q4: Are you experiencing any other symptoms along with the headache, such as nausea, vomiting, or vision changes?\n  A4: no other symptoms\n  Q5: Have you taken any medications for the headache, and did they help?\n  A5: i had tea and it made it helped\n\nPast Medical / Surgical History: Not provided\n\n─────────────────────────────────────────\nO — OBJECTIVE\n─────────────────────────────────────────\nVital Signs    : Not recorded (pre-consultation triage only)\nPhysical Exam  : Deferred — to be completed by attending physician\n\nSymptom Severity  : Mild\nSymptom Match     : ── SYMPTOM LOOKUP CONTEXT (from medical datasets) ──\nSeverity estimate   : Mild\nRecommendation      : OTC Drug\nSuggested specialist: General Physician\n\nTop candidate conditions:\n  1. Drug Reaction  (score 3%)\n     Matched symptoms : headache\n     Precautions      : stop irritation; consult nearest hospital; stop taking drug; follow up\n  2. Hypertension  (score 3%)\n     Matched symptoms : headache\n     Precautions      : meditation; salt baths; reduce stress; get proper sleep\n  3. Migraine  (score 3%)\n     Matched symptoms : headache\n     Precautions      : meditation; reduce stress; use poloroid glasses in sun; consult doctor\n────────────────────────────────────────────────────\n\n─────────────────────────────────────────\nA — ASSESSMENT\n─────────────────────────────────────────\nClinical Impression: Mild headache, likely tension-type headache or migraine.\nRouting Rationale : First visit / non-severe → General Physician first\n\n─────────────────────────────────────────\nP — PLAN\n─────────────────────────────────────────\nRecommended Specialist : General Physician\nBooking Status         : CONFIRMED — Booking ID 9  (2026-04-27 at 09:30)\n\nPrecautions / Red Flags to Discuss: Discuss with attending physician.\n\nNext Steps:\n  1. Attending physician to perform full history and physical examination.\n  2. Order investigations as clinically indicated.\n  3. Review and update this note after consultation.\n=========================================\nPRECAUTIONS         : Discuss with attending physician.\n\nTRIAGE Q&A (MedGemma clinical questions + patient answers — use for HPI):\nQ1: How long have you been experiencing this headache?\nA1: its been going on for a couple of hours\nQ2: Is the headache a constant pain, or does it come and go?\nA2: it comes and goes\nQ3: Does anything seem to make the headache worse, like certain movements or activities?\nA3: moving around my head\nQ4: Are you experiencing any other symptoms along with the headache, such as nausea, vomiting, or vision changes?\nA4: no other symptoms\nQ5: Have you taken any medications for the headache, and did they help?\nA5: i had tea and it made it helped\n\nCLINICAL SUMMARY FROM TRIAGE:\nSee triage Q&A above.\n  [2026-04-20T22:15:36.285591+00:00] Appt#8 — \n  [2026-04-06T20:23:23.881342+00:00] Appt#5 — Q: What is the main problem you want the doctor to review today?\nA: My back is just hurting very badly.\nQ: When did it start?\nA: It started 2 days ago.\nQ: Is it getting better, worse, or staying the same?\nA: It's staying the same.\nQ: How severe is it right now on a scale of 1 to 10?\nA: An 8.\nQ: Do you have fever, vomiting, bleeding, or trouble breathing with it?\nA: None.\nQ: Do you have any major medical condition or are you pregnant?\nA: Uh, no.\nQ: Have you taken any medicine or received any treatment for this already?\nA: So far, no.\nQ: Is there anything else the doctor should know before the visit?\nA: No.\n  [2026-04-06T20:03:02.099745+00:00] Appt#3 — Q: What is the main problem you want the doctor to review today?\nA: headache\nQ: When did it start?\nA: yesterday\nQ: Is it getting better, worse, or staying the same?\nA: worse\nQ: How severe is it right now on a scale of 1 to 10?\nA: 6\nQ: Do you have fever, vomiting, bleeding, or trouble breathing with it?\nA: fever\nQ: Do you have any major medical condition or are you pregnant?\nA: none\nQ: Have you taken any medicine or received any treatment for this already?\nA: no\nQ: Is there anything else the doctor should know before the visit?\nA: no\n────────────────────",
+  "triage_start_msg_index": 0,
+  "routing_reason": "Returning patient (same complaint) → specialist (Cardiologist)",
+  "diagnostic_report": "=========================================\n      PRE-CONSULTATION CLINICAL REPORT\n=========================================\nATTENDING PHYSICIAN : Unknown\nSPECIALTY           : Cardiologist\n\nPATIENT:\n  Name  : Muhammad hamza\n  Phone : 03102010910\n\nCHIEF COMPLAINT:\n  headache\n\nPAST MEDICAL HISTORY:\n  Not provided\n\nTRIAGE Q&A:\n  Q: I'm glad we found your profile, Muhammad Hamza! To ensure you see the right specialist, could you please describe the symptoms or reason for your visit? For example: \"I've had a headache for three days\" or \"I need a routine checkup\". This will help us recommend the most appropriate doctor for your needs.\nA: I've had a headache for three days\"\n\nCLINICAL SUMMARY FROM TRIAGE:\n  See triage Q&A above.\n\nRECOMMENDED SPECIALIST:\n  Cardiologist\n\nROUTING REASON:\n  Returning patient (same complaint) → specialist (Cardiologist)\n\nSEVERITY:\n  Mild\n\nPRECAUTIONS TO DISCUSS:\n  Discuss with attending physician.\n=========================================\n(Generated by deterministic fallback)",
+  "diagnostic_generated_at": "2026-05-30T20:10:48.342843+05:00",
+  "medgemma_succeeded": false
+}

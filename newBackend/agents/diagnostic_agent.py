@@ -35,7 +35,7 @@ try:
 except ZoneInfoNotFoundError:
     PKT = timezone(timedelta(hours=5))
 
-BOOKING_CTX_DIR = Path("booking_context")
+BOOKING_CTX_DIR = Path(__file__).resolve().parents[1] / "booking_context"
 
 # ── MedGemma client ───────────────────────────────────────────────────────────
 _med_llm: ChatOllama | None = None

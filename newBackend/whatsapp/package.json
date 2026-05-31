@@ -1,0 +1,16 @@
+{
+  "name": "medical-concierge-whatsapp",
+  "version": "1.0.0",
+  "description": "Unofficial WhatsApp bridge (Baileys) relaying patient messages to the FastAPI /chat pipeline.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc13",
+    "axios": "^1.7.7",
+    "pino": "^9.5.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

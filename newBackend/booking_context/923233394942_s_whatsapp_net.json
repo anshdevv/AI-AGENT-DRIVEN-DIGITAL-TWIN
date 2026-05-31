@@ -1,0 +1,318 @@
+{
+  "session_id": "923233394942@s.whatsapp.net",
+  "created_at": "2026-05-30T19:56:17.877436+05:00",
+  "last_updated": "2026-05-31T18:19:46.367857+05:00",
+  "step": "collect_slot",
+  "prime_complaint": "headache",
+  "recommended_specialist": "General Physician",
+  "triage_completed": true,
+  "triage_questions_asked": 0,
+  "triage_qa": [
+    "Q: Hello! How can I assist you today?\nA: i have pain in head"
+  ],
+  "accumulated_symptoms": [
+    "i have pain in head"
+  ],
+  "symptom_context_block": "── SYMPTOM LOOKUP CONTEXT (from medical datasets) ──\nSeverity estimate   : Mild\nRecommendation      : OTC Drug\nSuggested specialist: Cardiologist\n\nTop candidate conditions:\n  1. Hypertension  (score 100%)\n     Matched symptoms : headache\n     Precautions      : meditation; salt baths; reduce stress; get proper sleep\n  2. Migraine  (score 100%)\n     Matched symptoms : headache\n     Precautions      : meditation; reduce stress; use poloroid glasses in sun; consult doctor\n  3. Paralysis Brain Hemorrhage  (score 100%)\n     Matched symptoms : headache\n     Precautions      : massage; eat healthy; exercise; consult doctor\n────────────────────────────────────────────────────",
+  "final_symptom_match": "── SYMPTOM LOOKUP CONTEXT (from medical datasets) ──\nSeverity estimate   : Mild\nRecommendation      : OTC Drug\nSuggested specialist: Cardiologist\n\nTop candidate conditions:\n  1. Hypertension  (score 17%)\n     Matched symptoms : headache\n     Precautions      : meditation; salt baths; reduce stress; get proper sleep\n  2. Migraine  (score 17%)\n     Matched symptoms : headache\n     Precautions      : meditation; reduce stress; use poloroid glasses in sun; consult doctor\n  3. Paralysis Brain Hemorrhage  (score 17%)\n     Matched symptoms : headache\n     Precautions      : massage; eat healthy; exercise; consult doctor\n────────────────────────────────────────────────────",
+  "patient": {
+    "id": 1,
+    "name": "ansh dev udassi",
+    "phone": "03233394942"
+  },
+  "selected_doctor": {
+    "id": 7,
+    "name": "Dr.Afaf Irfan",
+    "specialization": "General Physician"
+  },
+  "pending_slot": {
+    "date": null,
+    "time": null
+  },
+  "appointment": {
+    "date": null,
+    "time": null,
+    "confirmed": false,
+    "booking_id": null
+  },
+  "transcript": [
+    {
+      "at": "2026-05-30T19:56:17.877436+05:00",
+      "sender": "patient",
+      "text": "hi",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-30T19:56:20.593671+05:00",
+      "sender": "assistant",
+      "text": "Hello! How can I assist you today? If you're feeling unwell or have any concerns, please let me know so I can help arrange the right care for you.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Low-risk non-medical turn; judge skipped."
+        }
+      }
+    },
+    {
+      "at": "2026-05-30T20:15:00.143821+05:00",
+      "sender": "patient",
+      "text": "hi bae",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-30T20:15:01.193127+05:00",
+      "sender": "assistant",
+      "text": "Hello! 😊 How can I assist you today? To get started, could you please share your phone number so I can check if you're already registered with us? If not, I'd be happy to create a new profile for you.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Low-risk non-medical turn; judge skipped."
+        }
+      }
+    },
+    {
+      "at": "2026-05-30T20:15:09.927857+05:00",
+      "sender": "patient",
+      "text": "have headache",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-30T20:15:42.854211+05:00",
+      "sender": "assistant",
+      "text": "[SYMPTOM_LOGGED: headache]  \nGot it — you're experiencing a headache. To proceed with booking your appointment, could you please share your phone number so I can check your profile? If you're new here, I'll create a record for you.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-30T20:15:56.660136+05:00",
+      "sender": "patient",
+      "text": "03233394942",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-30T20:16:43.869600+05:00",
+      "sender": "assistant",
+      "text": "Hello Ansh! I see you're already registered with us. 🌟 To better assist with your headache, could you tell me how long you've been experiencing it? This will help us determine the best doctor for your case.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-30T20:17:08.332556+05:00",
+      "sender": "patient",
+      "text": "2 days",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-30T20:17:17.398423+05:00",
+      "sender": "assistant",
+      "text": "I'm having trouble. Please repeat that.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Low-risk non-medical turn; judge skipped."
+        }
+      }
+    },
+    {
+      "at": "2026-05-31T16:01:36.605637+05:00",
+      "sender": "patient",
+      "text": "hi",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-31T16:01:39.797480+05:00",
+      "sender": "assistant",
+      "text": "Hello! How can I assist you today?",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Low-risk non-medical turn; judge skipped."
+        }
+      }
+    },
+    {
+      "at": "2026-05-31T16:01:55.075382+05:00",
+      "sender": "patient",
+      "text": "i have pain in head",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-31T16:03:22.444950+05:00",
+      "sender": "assistant",
+      "text": "Would you like to proceed with Dr. Afaf Irfan for your consultation? I can confirm their profile details and then check their availability for appointment slots.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-31T18:14:19.872799+05:00",
+      "sender": "patient",
+      "text": "Heya",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-31T18:14:26.207774+05:00",
+      "sender": "assistant",
+      "text": "Would you like to proceed with Dr. Afaf Irfan for your appointment? Please confirm, and I'll check their full profile and availability.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-31T18:14:32.218693+05:00",
+      "sender": "patient",
+      "text": "No",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-31T18:15:17.302515+05:00",
+      "sender": "assistant",
+      "text": "It seems there are no other General Physicians available at this time. Dr. Afaf Irfan (ID: 7) is the only specialist in this category. Would you like to proceed with her for your appointment?",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-31T18:15:17.332291+05:00",
+      "sender": "patient",
+      "text": "?",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-31T18:16:46.375182+05:00",
+      "sender": "assistant",
+      "text": "Would you like to book your appointment for **Monday, 2026-06-01** (today) when Dr. Afaf Irfan is available from 9:00 AM to 6:00 PM? Let me check the available time slots for you.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Judge request failed, local safety checks passed: HTTP Error 403: Forbidden"
+        }
+      }
+    },
+    {
+      "at": "2026-05-31T18:16:46.413082+05:00",
+      "sender": "patient",
+      "text": "Okay then who is available?",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-31T18:17:45.774568+05:00",
+      "sender": "assistant",
+      "text": "I'm having trouble. Please repeat that.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Low-risk non-medical turn; judge skipped."
+        }
+      }
+    },
+    {
+      "at": "2026-05-31T18:17:45.808094+05:00",
+      "sender": "patient",
+      "text": "Yes",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-31T18:19:19.934839+05:00",
+      "sender": "assistant",
+      "text": "I'm having trouble. Please repeat that.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Low-risk non-medical turn; judge skipped."
+        }
+      }
+    },
+    {
+      "at": "2026-05-31T18:19:20.010007+05:00",
+      "sender": "patient",
+      "text": "What trouble",
+      "channel": "whatsapp",
+      "metadata": {}
+    },
+    {
+      "at": "2026-05-31T18:19:46.362411+05:00",
+      "sender": "assistant",
+      "text": "I'm having trouble. Please repeat that.",
+      "channel": "whatsapp",
+      "metadata": {
+        "judge": {
+          "approved": true,
+          "accuracy_risk": false,
+          "medical_safety_risk": false,
+          "reason": "Low-risk non-medical turn; judge skipped."
+        }
+      }
+    }
+  ],
+  "patient_language": "en",
+  "triage_severity": "Mild",
+  "patient_history_block": "── PATIENT HISTORY (last 5 visits) ──\nLast 1 note(s) for patient 1:\n  [2026-04-06T13:35:54.003396+00:00] Appt#1 — Here's a summary of\n────────────────────",
+  "triage_start_msg_index": 0,
+  "routing_reason": "First visit / non-severe → General Physician first"
+}
