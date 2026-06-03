@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage
 from langchain_ollama import ChatOllama
+# from rag.dialect_middleware import dialect_middleware   # DISABLED — re-enable when pipeline is stable
 
 from agents.llm_config import get_llm
 from agents.symptom_lookup import lookup, format_for_prompt
@@ -87,14 +88,16 @@ def _persist_booking_context(ctx: dict) -> None:
         print(f"❌ [TriagePersist] Failed to save ctx: {e}")
 
 
-# Dynamic limits by severity — Severe gets escalated faster
+# Dynamic limits by severity — matches triage pipeline design
 MAX_QUESTIONS_BY_SEVERITY = {
-    "Severe":   4,
-    "Moderate": 6,
-    "Mild":     6,
-    "Unknown":  8,
+    "Emergency": 2,    # confirm + escalate only
+    "Severe":    5,    # fast — focus on character and radiation
+    "Moderate":  8,    # full OLDCARTS
+    "Mild":      7,
+    "Low":       7,
+    "Unknown":   10,   # most questions needed to determine severity
 }
-MAX_TRIAGE_QUESTIONS = 8  # absolute fallback ceiling
+MAX_TRIAGE_QUESTIONS = 10  # absolute fallback ceiling
 
 
 # ── Prompt loader ─────────────────────────────────────────────────────────────
@@ -121,6 +124,60 @@ def _get_med_llm() -> ChatOllama:
         print("🔧 [Triage] Connecting to Ollama medgemma:4b ...")
         _med_llm = ChatOllama(model="medgemma:4b", temperature=0.0)
     return _med_llm
+
+
+def _build_patient_context_block(ctx: dict) -> str:
+    """
+    Build the structured PATIENT PROFILE block injected into MedGemma's prompt.
+    Uses demographics from ctx['patient'] and history text from ctx['patient_history_data'].
+    Called every triage turn so MedGemma always has full context.
+    """
+    import re
+
+    p    = ctx.get("patient", {})
+    hist = (ctx.get("patient_history_data") or "")
+
+    age         = p.get("age")
+    gender      = (p.get("gender")         or "Unknown").capitalize()
+    marital     = (p.get("marital_status") or "Unknown").capitalize()
+    age_str     = f"{int(age)} y/o" if age is not None else "Unknown"
+
+    def _extract(label: str) -> str:
+        m = re.search(rf"{label}\s*:\s*([^\n]+)", hist, re.IGNORECASE)
+        val = m.group(1).strip() if m else ""
+        if not val or val.lower() in ("none reported", "not recorded", ""):
+            return "None reported"
+        return val
+
+    lines = [
+        "── PATIENT PROFILE ──────────────────────────────────",
+        f"  Age / Gender        : {age_str}, {gender}",
+        f"  Marital status      : {marital}",
+        f"  Chronic conditions  : {_extract('Chronic conditions')}",
+        f"  Current medications : {_extract('Medications')}",
+        f"  Drug allergies      : {_extract('Drug allergies')}",
+        f"  General allergies   : {_extract('General allergies')}",
+        f"  Family history      : {_extract('Family history')}",
+        f"  Smoking / alcohol   : {_extract('Smoking')}",
+    ]
+
+    is_female = gender.lower() in ("female", "f", "woman", "girl")
+    if is_female:
+        menstrual = _extract("Menstrual")
+        lmp       = _extract("LMP") if _extract("LMP") != "None reported" else _extract("Last menstrual")
+        if menstrual != "None reported":
+            lines.append(f"  Menstrual history   : {menstrual}")
+        if lmp != "None reported":
+            lines.append(f"  Last period (LMP)   : {lmp}")
+        pregnancy = _extract("Pregnancy status")
+        obs       = _extract("Obstetric")
+        if pregnancy != "None reported":
+            lines.append(f"  Pregnancy status    : {pregnancy}")
+        if obs != "None reported":
+            lines.append(f"  Obstetric history   : {obs}")
+
+    lines.append("─────────────────────────────────────────────────────")
+    return "\n".join(lines)
 
 
 # ── Qwen client (rephrasing only — warm & patient-facing) ─────────────────────
@@ -559,30 +616,44 @@ def triage_node(state: dict) -> dict:
     triage_qa = _record_qa_pair(state, triage_qa)
 
     # ── Build MedGemma system prompt ──────────────────────────────
-    base_prompt    = _load_triage_prompt()
-    past_history   = profile.get("past_history", "Not provided")
-    doctor_name    = (
-        profile.get("booked_doctor")
-        or ctx.get("selected_doctor", {}).get("name", "Unknown")
-    )
-    specialization = (
-        profile.get("doctor_specialization")
-        or ctx.get("selected_doctor", {}).get("specialization", "General Physician")
-    )
-    questions_left = max_questions - questions_asked
+    base_prompt     = _load_triage_prompt()
+    questions_left  = max_questions - questions_asked
     severity_so_far = ctx.get("triage_severity", "Unknown")
+    patient_context = _build_patient_context_block(ctx)
+
+    # ── Orchestrator-controlled OLDCARTS dimensions ───────────────
+    # Computed once on turn 0 and cached in ctx. Each turn injects
+    # the specific dimension so MedGemma only has ONE job per turn.
+    from agents.orchestrator import _compute_triage_dimensions as _ctd
+    if questions_asked == 0 or not ctx.get("triage_dimensions"):
+        dimensions = _ctd(symptom or "", ctx)
+        ctx["triage_dimensions"] = dimensions
+        _persist_booking_context(ctx)
+    else:
+        dimensions = ctx.get("triage_dimensions") or _ctd(symptom or "", ctx)
+
+    dim_idx = min(questions_asked, len(dimensions) - 1)
+    current_dim_key, current_dim_question = dimensions[dim_idx]
+    label = current_dim_key.replace("_", " ").title()
+
+    # ── Conversation so far (last 4 Q&A pairs) ────────────────────
+    qa_pairs = ctx.get("triage_qa", [])
+    qa_block = "\n".join(f"  {pair}" for pair in qa_pairs[-4:]) if qa_pairs else "  (none yet)"
 
     sys_prompt_text = (
         f"{base_prompt}\n\n"
-        f"PATIENT CONTEXT:\n"
-        f"  Complaint        : {symptom or 'Not specified'}\n"
-        f"  Medical History  : {past_history}\n"
-        f"  Doctor           : Dr. {doctor_name} ({specialization})\n"
-        f"  Severity (so far): {severity_so_far}\n\n"
-        f"{symptom_context_block}\n"
-        f"{patient_history_block}\n"
-        f"IMPORTANT: {questions_left} question(s) left (severity={severity_so_far} → max={max_questions}). "
-        f"Ask ONE focused clinical question, or output [TRIAGE_COMPLETE] if you have enough info."
+        f"{patient_context}\n\n"
+        f"CURRENT VISIT:\n"
+        f"  Chief complaint  : {symptom or 'Not specified'}\n"
+        f"  Severity so far  : {severity_so_far}\n\n"
+        f"CONVERSATION SO FAR:\n{qa_block}\n\n"
+        f"YOUR TASK THIS TURN ({dim_idx + 1} of {len(dimensions)}):\n"
+        f"  Dimension : {label}\n"
+        f"  Ask       : \"{current_dim_question}\"\n\n"
+        f"Ask this ONE question naturally in the patient's language. "
+        f"{questions_left} question(s) remaining.\n"
+        f"If red flag confirmed → [EMERGENCY_REFERRAL]\n"
+        f"If done → [TRIAGE_COMPLETE] then CLINICAL_SUMMARY."
     )
 
     # ── STEP 1: MedGemma — clinical reasoning ─────────────────────

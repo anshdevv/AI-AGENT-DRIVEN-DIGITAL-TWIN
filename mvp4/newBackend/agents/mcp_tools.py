@@ -111,6 +111,8 @@ KNOWN_SUPABASE_TABLES = [
     "slots",
     "appointments",
     "appointment_events",
+    "patient_history",
+    "human_waitlist",            # human agent queue
 ]
 SUPPORTED_SPECIALIZATIONS_FALLBACK = [
     "Cardiologist",
@@ -1128,21 +1130,255 @@ def get_doctors_by_specialization(specialization: str) -> str:
         
     except Exception as e:
         return f"Database error while searching for doctors: {e}"
+
+
+# =====================================================================
+# PATIENT HISTORY TOOLS
+# =====================================================================
+
+@tool
+def update_patient_demographics(
+    patient_id: int,
+    age: int | None = None,
+    gender: str | None = None,
+    marital_status: str | None = None,
+) -> str:
+    """
+    Update age, gender, and/or marital_status on an existing patient record.
+    Call this during the history intake phase when collecting demographic info.
+    Only updates fields that are explicitly provided.
+    """
+    print(f"🛠️ [Tool] update_patient_demographics: patient_id={patient_id} age={age} gender={gender} marital={marital_status}")
+    if not supabase:
+        return "Database not connected."
+    payload: dict = {}
+    if age is not None:
+        payload["age"] = age
+    if gender is not None:
+        payload["gender"] = gender.strip().lower()
+    if marital_status is not None:
+        payload["marital_status"] = marital_status.strip().lower()
+    if not payload:
+        return "No fields provided to update."
+    try:
+        supabase.table("patients").update(payload).eq("id", patient_id).execute()
+        updated = ", ".join(f"{k}={v}" for k, v in payload.items())
+        return f"Patient demographics updated successfully for patient_id {patient_id}: {updated}."
+    except Exception as e:
+        return f"Error updating patient demographics: {e}"
+
+@tool
+def get_patient_history(patient_id: int) -> str:
+
+    """
+    Check if a patient has medical history on file.
+    Returns the full history record if found, or indicates none exists.
+    Call this after lookup_customer_profile to decide whether to collect history.
+    """
+    print(f"🛠️ [Tool] get_patient_history: patient_id={patient_id}")
+    if not supabase:
+        return "Database not connected."
+    try:
+        response = (
+            supabase.table("patient_history")
+            .select("*")
+            .eq("patient_id", patient_id)
+            .limit(1)
+            .execute()
+        )
+        if response.data:
+            h = response.data[0]
+            return (
+                f"Patient history found:\n"
+                f"  Chronic conditions : {h.get('chronic_conditions') or 'None reported'}\n"
+                f"  Medications        : {h.get('medications') or 'None reported'}\n"
+                f"  Drug allergies     : {h.get('drug_allergies') or 'None reported'}\n"
+                f"  Family history     : {h.get('family_history') or 'None reported'}\n"
+                f"  Smoking / alcohol  : {h.get('smoking_status') or 'Not recorded'}\n"
+                f"  Last updated       : {h.get('last_updated') or 'Unknown'}"
+            )
+        return f"No medical history on file for patient_id {patient_id}."
+    except Exception as e:
+        return f"Could not retrieve patient history: {e}"
+
+
+@tool
+def save_patient_history(
+    patient_id: int,
+    chronic_conditions: str | None = None,
+    medications: str | None = None,
+    drug_allergies: str | None = None,
+    general_allergies: str | None = None,
+    family_history: str | None = None,
+    smoking_status: str | None = None,
+    menstrual_history: str | None = None,
+    lmp_date: str | None = None,
+    pregnancy_status: str | None = None,
+    obstetric_history: str | None = None,
+    fall_history: str | None = None,
+    vaccination_status: str | None = None,
+) -> str:
+    """
+    Save or update a patient's medical history.
+    Upserts on patient_id — safe to call even if a record already exists.
+    Call this after collecting nurse-style history questions.
+    Provide only the fields you have collected — omit the rest.
+    """
+    print(f"🛠️ [Tool] save_patient_history: patient_id={patient_id}")
+    if not supabase:
+        return "Database not connected."
+
+    payload: dict = {
+        "patient_id":   patient_id,
+        "last_updated": datetime.now(PKT).isoformat(),
+    }
+    for field, val in [
+        ("chronic_conditions", chronic_conditions),
+        ("medications",        medications),
+        ("drug_allergies",     drug_allergies),
+        ("general_allergies",  general_allergies),
+        ("family_history",     family_history),
+        ("smoking_status",     smoking_status),
+        ("menstrual_history",  menstrual_history),
+        ("lmp_date",           lmp_date),
+        ("pregnancy_status",   pregnancy_status),
+        ("obstetric_history",  obstetric_history),
+        ("fall_history",       fall_history),
+        ("vaccination_status", vaccination_status),
+    ]:
+        if val is not None:
+            payload[field] = val
+
+    try:
+        response = (
+            supabase.table("patient_history")
+            .upsert(payload, on_conflict="patient_id")
+            .execute()
+        )
+        if response.data:
+            return f"Patient history saved successfully for patient_id {patient_id}."
+        return "Failed to save patient history — no data returned."
+    except Exception as e:
+        return f"Error saving patient history: {e}"
+
+
+# =====================================================================
+# TOOL LIST — import this in your orchestrator
+# =====================================================================
+
+
+
+# =====================================================================
+# HUMAN WAITLIST TOOLS
+# =====================================================================
+
+@tool
+def add_to_waitlist(
+    session_id: str,
+    patient_id: int | None = None,
+    patient_name: str | None = None,
+    phone: str | None = None,
+    complaint: str | None = None,
+) -> str:
+    """
+    Add a patient to the human agent waitlist.
+    Returns their position and estimated wait time.
+    Call this after the patient confirms they want to speak with a human.
+    """
+    print(f"🛠️ [Tool] add_to_waitlist: session_id={session_id}")
+    if not supabase:
+        return "Database not connected."
+    try:
+        # Count how many are already waiting
+        pending = (
+            supabase.table("human_waitlist")
+            .select("id", count="exact")
+            .eq("status", "waiting")
+            .execute()
+        )
+        position = (pending.count or 0) + 1
+        wait_minutes = position * 5   # ~5 min per person
+
+        supabase.table("human_waitlist").insert({
+            "session_id":   session_id,
+            "patient_id":   patient_id,
+            "patient_name": patient_name,
+            "phone":        phone,
+            "complaint":    complaint,
+            "status":       "waiting",
+            "position":     position,
+            "created_at":   datetime.now(PKT).isoformat(),
+        }).execute()
+
+        return (
+            f"Added to waitlist. Position: {position}. "
+            f"Estimated wait time: approximately {wait_minutes} minutes."
+        )
+    except Exception as e:
+        return f"Error adding to waitlist: {e}"
+
+
+@tool
+def get_waitlist_position(session_id: str) -> str:
+    """
+    Get the current queue position and estimated wait for a session.
+    """
+    if not supabase:
+        return "Database not connected."
+    try:
+        result = (
+            supabase.table("human_waitlist")
+            .select("position, status, created_at")
+            .eq("session_id", session_id)
+            .eq("status", "waiting")
+            .limit(1)
+            .execute()
+        )
+        if result.data:
+            r = result.data[0]
+            wait = r["position"] * 5
+            return f"Position: {r['position']}. Estimated wait: ~{wait} minutes. Status: {r['status']}."
+        return "Session not found in waitlist or already answered."
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@tool
+def cancel_waitlist(session_id: str) -> str:
+    """
+    Remove a patient from the human waitlist (they changed their mind).
+    """
+    if not supabase:
+        return "Database not connected."
+    try:
+        supabase.table("human_waitlist").update({"status": "cancelled"}).eq("session_id", session_id).execute()
+        return f"Removed from waitlist. Continuing with automated booking."
+    except Exception as e:
+        return f"Error cancelling waitlist: {e}"
+
+
 # =====================================================================
 # TOOL LIST — import this in your orchestrator
 # =====================================================================
 
 ALL_TOOLS = [
-    get_doctors_by_specialization, # <--- ADD IT HERE
+    recommend_specialist_tool,
+    get_doctors_by_specialization,
     search_knowledge,
     list_database_tables,
     query_database_table,
     lookup_customer_profile,
     register_customer_profile,
+    update_patient_demographics,
     get_doctor_profile,
     find_provider_availability,
     get_doctor_schedule,
     create_booking,
     get_recent_case_notes,
     save_case_notes,
+    get_patient_history,
+    save_patient_history,
+    add_to_waitlist,
+    cancel_waitlist,
+    get_waitlist_position,
 ]

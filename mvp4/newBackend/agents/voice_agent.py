@@ -35,7 +35,7 @@ _ENGLISH_CODES = {"en", "english"}
 _HF_WHISPER_MODEL = "openai/whisper-large-v3"
 
 # Testing-only language lock. Set False when you want language auto-detection again.
-FORCE_ENGLISH_TEST = True
+FORCE_ENGLISH_TEST = False
 
 
 def _detect_lang_from_text(text: str) -> str:
