@@ -40,6 +40,7 @@ from agents.llm_config import get_llm
 from agents.mcp_tools import ALL_TOOLS
 from agents.triage_agent import triage_node
 from agents.diagnostic_agent import diagnostic_node
+from agents.chat_memory import store_message, search_relevant
 
 try:
     PKT = ZoneInfo("Asia/Karachi")
@@ -152,7 +153,7 @@ _QUESTION_FOR_FIELD: dict[str, str] = {
         "or other environmental triggers?"
     ),
     "family_history":    "Does heart disease, diabetes, or cancer run in your family?",
-    "smoking_status":    "Do you smoke or drink alcohol?",
+    "smoking_status":    "Do you currently smoke or use any tobacco products?",
     # Female, age 12–55 (no marital gate — periods are not marital-dependent)
     "menstrual_history": (
         "How is your menstrual cycle? Is it regular, and do you experience "
@@ -177,7 +178,7 @@ _QUESTION_FOR_FIELD: dict[str, str] = {
 _FIELD_COMPLETE_CRITERIA: dict[str, str] = {
     "age":               "a number",
     "gender":            "male or female",
-    "marital_status":    "married, single, widowed, or divorced",
+    "marital_status":    "married or single — ONLY these two options, no others",
     "chronic_conditions":"a list of conditions OR confirmation of 'none'",
     "medications":       "a list of medications OR confirmation of 'none'",
     "drug_allergies":    "a list OR confirmation of 'none'",
@@ -232,7 +233,8 @@ def _compute_required_history_fields(patient: dict, history_data: str | None) ->
         required.append("age")
     if not gender:
         required.append("gender")
-    if not marital:
+    # Only ask marital status for adults — never ask a minor
+    if not marital and (age is None or int(age) >= 18):
         required.append("marital_status")
 
     # ── Base medical history (patient_history table) ──────────────────────────
@@ -543,10 +545,9 @@ def _advance_step(ctx: dict) -> None:
     # ── History confirmed — proceed to triage ────────────────────────────────
     if not ctx.get("triage_completed"):
         ctx["step"] = "collect_patient"
-        print(f"🔀 [AdvanceStep] → step = 'collect_patient' (history done, triage pending)")
-        print(f"🔀 [AdvanceStep] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+        ctx["triage_completed"] = False
+        ctx["triage_active"] = True
         return
-
     if not d["id"]:
         ctx["step"] = "collect_doctor"
         print(f"🔀 [AdvanceStep] → step = 'collect_doctor' ❌ missing doctor.id")
@@ -625,6 +626,10 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
             lines.append("  ▶ SUB-STEP 1: Ask for phone number.")
             lines.append("    Greet the patient warmly and ask: 'Could I get your phone number?'")
             lines.append("    Even if they mentioned a symptom — ask for phone first.")
+            lines.append("    BUT: if patient mentioned a complaint in this message, include:")
+            lines.append("    [SYMPTOM_LOGGED: <their complaint>]")
+            lines.append("    at the very start of your reply — the system will store and hide it.")
+            lines.append("    Example: '[SYMPTOM_LOGGED: headache] Could I get your phone number?'")
 
         elif phone and not pid:
             lines.append(f"  ✓ Phone collected: {phone}")
@@ -653,6 +658,7 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
                 turns_left = _MAX_TURNS_PER_HISTORY_FIELD - turns_used
                 lines.append(f"    Turn {turns_used}/{_MAX_TURNS_PER_HISTORY_FIELD} on this field — {turns_left} turn(s) remaining before auto-advance")
                 lines.append(f"    Initial question: '{question}'")
+                lines.append(f"    ⛔ Ask this EXACTLY as written. Do not rephrase or add options.")
                 lines.append(f"    Complete when you have: {criteria}")
                 lines.append("")
                 lines.append("  IMPORTANT RULES for this field:")
@@ -676,20 +682,30 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
 
             else:
                 lines.append(f"  ✓ ALL FIELDS COLLECTED for {p.get('name')}.")
-                lines.append("  ▶ Now ask: 'What brings you in today?'")
-                lines.append("    When the patient mentions a symptom output:")
-                lines.append("    [SYMPTOM_LOGGED: <symptom>]")
-                lines.append("    [START_TRIAGE]")
+                lines.append("  ▶ Ask: 'What brings you in today?'")
+                lines.append("  When the patient mentions a complaint, output ONLY these two lines:")
+                lines.append("  [SYMPTOM_LOGGED: <their complaint>]")
+                lines.append("  [START_TRIAGE]")
+                lines.append("  ⛔ Output NOTHING else. No triage questions. No explanations.")
+                lines.append("  ⛔ The triage system takes over completely after START_TRIAGE.")
 
     # ── GUARD: only trigger triage when step is collect_patient AND flag is unset.
-    # If step has already advanced (collect_doctor, collect_slot, etc.) triage
-    # clearly happened — don't re-trigger it even if the flag was somehow lost.
     elif not ctx.get("triage_completed") and step == "collect_patient":
-        lines.append("YOUR NEXT ACTION: Medical Triage.")
-        lines.append("  If the user mentions ANY medical symptom, you MUST output exactly:")
-        lines.append("  [SYMPTOM_LOGGED: <symptom>]")
-        lines.append("  [START_TRIAGE]")
-        lines.append("  DO NOT ask for phone number, name, or try to book until triage is finished!")
+        hint = ctx.get("initial_complaint_hint")
+        lines.append("YOUR NEXT ACTION: Start medical triage.")
+        if hint:
+            lines.append(f"  ✓ Patient already mentioned their complaint: '{hint}'")
+            lines.append(f"  DO NOT ask 'what brings you in today?' — use the hint.")
+            lines.append(f"  Say: 'I see you came in for {hint}. Let me start your assessment.'")
+            lines.append(f"  Then immediately output:")
+            lines.append(f"  [SYMPTOM_LOGGED: {hint}]")
+            lines.append(f"  [START_TRIAGE]")
+        else:
+            lines.append("  Ask: 'What brings you in today?'")
+            lines.append("  When the patient mentions a symptom, output BOTH:")
+            lines.append("  [SYMPTOM_LOGGED: <symptom>]")
+            lines.append("  [START_TRIAGE]")
+        lines.append("  ⛔ Triage MUST happen before any booking.")
 
     elif step == "collect_patient":
         if not ctx.get("triage_completed"):
@@ -859,6 +875,7 @@ _PHASE_TOOL_NAMES: dict[str, list[str]] = {
         "get_doctors_by_specialization",
         "get_doctor_profile",
         "get_doctor_schedule",
+        "find_provider_availability",   # needed when patient names a date before step advances
     ],
     # Booking phase — find available slot
     "collect_slot": [
@@ -1143,6 +1160,30 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
                 ctx["patient"]["marital_status"] = m.group(1).strip().lower()
                 changed = True
                 print(f"   → patient.marital_status = '{ctx['patient']['marital_status']}'")
+
+    elif tool_name == "register_customer_profile":
+        # ── Extract patient.id and name from registration success ─────────────
+        # e.g. "Patient registered successfully. ID: 7, Name: ahsan"
+        # Without this, patient.id stays None after registration, the directive
+        # never computes required_history_fields, and the supervisor asks all
+        # demographic questions at once instead of one at a time.
+        print(f"   result preview: {result_str[:300]}")
+        m = re.search(r"\bID[:\s]+(\d+)\b", result_str, re.IGNORECASE)
+        if m and not ctx["patient"]["id"]:
+            ctx["patient"]["id"] = int(m.group(1))
+            changed = True
+            print(f"   → patient.id = {ctx['patient']['id']} (from registration)")
+        m = re.search(r"\bName[:\s]+([A-Za-z][A-Za-z ]{1,40}?)(?:\.|,|\n|$)", result_str, re.IGNORECASE)
+        if m and not ctx["patient"]["name"]:
+            ctx["patient"]["name"] = m.group(1).strip()
+            changed = True
+            print(f"   → patient.name = '{ctx['patient']['name']}' (from registration)")
+        if not ctx["patient"]["phone"]:
+            phone = tool_args.get("phone")
+            if phone:
+                ctx["patient"]["phone"] = str(phone)
+                changed = True
+                print(f"   → patient.phone = '{phone}' (from registration args)")
 
     elif tool_name in ("get_doctor_profile", "get_doctor_schedule"):
         print(f"   result preview: {result_str[:300]}")
@@ -1760,6 +1801,69 @@ def _try_extract_pending_slot(state: dict, ctx: dict, session_id: str) -> None:
 # SUPERVISOR NODE
 # ═══════════════════════════════════════════════════════════════════
 
+def _try_auto_save_demographic(ctx: dict, msg: str, session_id: str) -> None:
+    """
+    For simple one-word demographic fields (age, gender, marital_status),
+    extract the answer from the patient's message and save it directly.
+    This prevents the LLM from skipping the tool call and jumping to the next field.
+    Only fires when the current required field is one of these three.
+    """
+    required = ctx.get("required_history_fields")
+    if not required:
+        return
+    current_field = required[0]
+    if current_field not in ("age", "gender", "marital_status"):
+        return
+
+    patient_id = ctx["patient"].get("id")
+    if not patient_id:
+        return
+
+    msg_lower = msg.strip().lower()
+    payload: dict | None = None
+
+    if current_field == "age":
+        m = re.search(r"\b(\d{1,3})\b", msg_lower)
+        if m and 0 < int(m.group(1)) < 130:
+            payload = {"age": int(m.group(1))}
+
+    elif current_field == "gender":
+        if re.search(r"\bmale\b|\bman\b|\bboy\b|\bmard\b", msg_lower) and "female" not in msg_lower:
+            payload = {"gender": "male"}
+        elif re.search(r"\bfemale\b|\bwoman\b|\bgirl\b|\baurat\b|\bkhatoon\b", msg_lower):
+            payload = {"gender": "female"}
+
+    elif current_field == "marital_status":
+        if re.search(r"\bsingle\b|\bunmarried\b|\bbachelor\b|\bnot married\b", msg_lower):
+            payload = {"marital_status": "single"}
+        elif re.search(r"\bmarried\b|\bshadi\b|\bnikah\b", msg_lower):
+            payload = {"marital_status": "married"}
+
+    if not payload:
+        return
+
+    try:
+        from agents.mcp_tools import update_patient_demographics as _upd
+        result = _upd.invoke({"patient_id": patient_id, **payload})
+        if "updated successfully" in result.lower():
+            for field, val in payload.items():
+                ctx["patient"][field] = val
+            ctx["required_history_fields"] = _compute_required_history_fields(
+                ctx["patient"], ctx.get("patient_history_data")
+            )
+            coll = ctx.setdefault("collected_this_session", [])
+            for f in payload:
+                if f not in coll:
+                    coll.append(f)
+            counts = ctx.setdefault("history_field_turn_count", {})
+            for f in payload:
+                counts[f] = 0
+            save_booking_context(session_id, ctx)
+            print(f"🤖 [AutoSave] {payload} auto-saved for patient_id={patient_id}")
+    except Exception as e:
+        print(f"⚠️  [AutoSave] Failed: {e}")
+
+
 def supervisor_node(state: ConversationState) -> dict:
     now          = datetime.now(PKT)
     today_str    = now.strftime("%A, %Y-%m-%d")
@@ -1794,6 +1898,33 @@ def supervisor_node(state: ConversationState) -> dict:
         _enforce_history_field_limits(ctx)
         save_booking_context(session_id, ctx)
 
+    # ── Chat memory: persist user message + retrieve relevant past context ────
+    patient_id    = ctx["patient"].get("id")
+    last_user_msg = _last_human_text(raw_messages)
+    if last_user_msg:
+        store_message(session_id, patient_id, "user", last_user_msg)
+    relevant_history = search_relevant(patient_id, last_user_msg) if patient_id and last_user_msg else ""
+
+    # ── Auto-detect phone number in last message ──────────────────────────────
+    # When patient gives their phone number, ctx["patient"]["phone"] is still None
+    # because lookup_customer_profile hasn't been called yet. Without this, the
+    # directive keeps showing "ask for phone" and the supervisor asks for name instead.
+    if (not ctx["patient"]["phone"]
+            and not ctx["patient"]["id"]
+            and last_user_msg
+            and re.match(r"^[\+\d][\d\s\-]{8,14}$", last_user_msg.strip())):
+        ctx["patient"]["phone"] = last_user_msg.strip()
+        save_booking_context(session_id, ctx)
+        print(f"📱 [AutoPhone] Detected phone in message: '{ctx['patient']['phone']}'")
+
+    # ── Auto-save demographic fields algorithmically ───────────────────────────
+    # LLM sometimes skips update_patient_demographics and moves to next question.
+    # For age/gender/marital_status, extract and save directly from patient message.
+    if (ctx.get("step") == "collect_patient_history"
+            and ctx["patient"].get("id")
+            and last_user_msg):
+        _try_auto_save_demographic(ctx, last_user_msg, session_id)
+
     booking_directive = _get_booking_directive(ctx, today_str, tomorrow_str)
 
     prompt_path   = Path(__file__).parent.parent / "prompts" / "supervisor_system.md"
@@ -1814,6 +1945,8 @@ PATIENT LANGUAGE: {ctx.get("patient_language", "en")}
 
 {booking_directive}
 
+{relevant_history}
+
 ABSOLUTE PROHIBITIONS:
   Never call a tool with null/unknown values.
   Never call lookup_customer_profile if patient.id is set above.
@@ -1832,9 +1965,13 @@ SPECIAL TAGS (output these exact strings when needed):
     print("📡 [Supervisor] Calling LLM…")
     current_step = ctx.get("step", "collect_patient_history")
     try:
-        # When human handoff is pending, include waitlist tools regardless of step
         if ctx.get("human_handoff_pending") or ctx.get("step") == "await_human":
             llm_to_use = _get_llm_with_handoff_tools(current_step)
+        elif current_step == "collect_patient" and not ctx.get("triage_completed"):
+            # Pre-triage: no tools — supervisor just asks "what brings you in today?"
+            # Having recommend_specialist_tool bound causes the model to call it instead
+            llm_to_use = get_llm(temperature=0.1)
+            print("🔧 [LLM] Pre-triage collect_patient — no tools bound")
         else:
             llm_to_use = _get_llm_for_step(current_step)
         response = _invoke_with_retry(llm_to_use, [sys_prompt] + safe_messages)
@@ -1879,9 +2016,19 @@ SPECIAL TAGS (output these exact strings when needed):
         # Store for later so patient doesn't have to repeat the complaint
         if not ctx.get("initial_complaint_hint"):
             ctx["initial_complaint_hint"] = symptom
-            save_booking_context(session_id, ctx)
             print(f"📝 [Supervisor] 💾 Complaint hint stored: '{symptom}' (will be used post-history)")
         print(f"📝 [Supervisor] ⛔ SYMPTOM_LOGGED suppressed during history phase: '{symptom}'")
+        # Strip both tags but keep the full response — legitimate questions must not be cut
+        cleaned = re.sub(r"\[SYMPTOM_LOGGED:[^\]]*\]", "", response_text)
+        cleaned = re.sub(r"\[START_TRIAGE\]", "", cleaned).strip()
+        response  = AIMessage(content=cleaned)
+        save_booking_context(session_id, ctx)
+        # If all history fields are done, advance step NOW so next turn fires triage properly
+        required = ctx.get("required_history_fields")
+        if required is not None and len(required) == 0:
+            _advance_step(ctx)
+            save_booking_context(session_id, ctx)
+            print(f"📝 [Supervisor] ✅ Step advanced to '{ctx['step']}' — triage fires next turn")
 
     # ── Human handoff detection ───────────────────────────────────────────────
     if "[HUMAN_REQUESTED]" in response_text:
@@ -1896,7 +2043,11 @@ SPECIAL TAGS (output these exact strings when needed):
         save_booking_context(session_id, ctx)
         print(f"🧑 [Supervisor] Human handoff confirmed — step = await_human")
 
-    if "[START_TRIAGE]" in response_text and ctx.get("step") != "collect_patient_history":
+    if "[START_TRIAGE]" in response_text and ctx.get("triage_completed"):
+        cleaned = re.sub(r"\[START_TRIAGE\]", "", response_text).strip()
+        print("🚦 [Supervisor] ⛔ START_TRIAGE suppressed — triage already complete")
+        response = AIMessage(content=cleaned)
+    elif "[START_TRIAGE]" in response_text and ctx.get("step") != "collect_patient_history":
         triage_active = True
         print("🚦 [Supervisor] triage_active = True — muting supervisor reply, triage_node will speak")
         response = AIMessage(content="")
@@ -1953,6 +2104,11 @@ SPECIAL TAGS (output these exact strings when needed):
         print(f"   response_text was: {repr(response_text[:300])}")
         print(f"   step={ctx.get('step')}  triage_active={triage_active}  interaction_completed={interaction_completed}")
 
+    # ── Chat memory: persist assistant response ───────────────────────────────
+    assistant_text = str(response.content).strip()
+    if assistant_text and patient_id:
+        store_message(session_id, patient_id, "assistant", assistant_text)
+
     return {
         "messages":              [response],
         "extracted_symptom":     extracted_symptom,
@@ -1966,15 +2122,16 @@ SPECIAL TAGS (output these exact strings when needed):
 # ═══════════════════════════════════════════════════════════════════
 # ROUTING
 # ═══════════════════════════════════════════════════════════════════
+def entry_router(state):
+    ctx = state.get("booking_context", {})
 
-def entry_router(state: ConversationState) -> str:
-    if state.get("triage_active"):
-        print("🔀 [Entry] → triage_node")
-        return "triage_node"
-    if state.get("interaction_completed"):
-        print("🔀 [Entry] → diagnostic_node")
+    # Run diagnostics ONCE, right after triage completes.
+    if ctx.get("triage_completed") and not ctx.get("diagnostic_report"):
         return "diagnostic_node"
-    print("🔀 [Entry] → supervisor_node")
+
+    if ctx.get("triage_active") or ctx.get("step") == "collect_patient":
+        return "triage_node"
+
     return "supervisor_node"
 
 

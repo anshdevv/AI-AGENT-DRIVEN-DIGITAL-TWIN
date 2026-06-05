@@ -298,7 +298,7 @@ def _build_triage_messages(state: dict, sys_prompt_text: str) -> list:
             str(m.content) for m in all_msgs[:triage_start_idx] if m.type == "human"
         ).strip()
         if not pre_triage_text:
-            pre_triage_text = state.get("extracted_symptom", "I have a medical complaint.")
+           pre_triage_text = state.get("extracted_symptom") or "I have a medical complaint."
         raw_history.append({"role": "user", "content": pre_triage_text})
         print(f"   [MedGemmaHistory] Turn-1 seed → complaint: '{pre_triage_text[:80]}'")
 
@@ -724,7 +724,7 @@ def _complete_triage(
     ctx = _force_english_for_testing(ctx)
 
     # ── FINAL LOOKUP: use ALL accumulated symptoms ────────────────
-    initial     = ctx.get("prime_complaint", "")
+    initial = ctx.get("prime_complaint") or ""
     all_answers = ctx.get("accumulated_symptoms", [])
     full_text   = initial + " " + " ".join(all_answers)
     all_tokens  = [s.strip() for s in full_text.replace(",", " ").split() if s.strip()]
@@ -789,8 +789,15 @@ def _complete_triage(
     _save_triage_to_supabase(ctx, clinical_summary, qa_pairs)
 
     ctx["triage_completed"]       = True
+    ctx["triage_active"]          = False   # clear so entry_router stops routing to triage_node
     ctx["triage_questions_asked"] = ctx.get("triage_questions_asked", 0)
     ctx["triage_qa"]              = qa_pairs
+
+    # Advance to correct booking step — check if doctor already selected
+    if ctx.get("selected_doctor", {}).get("id"):
+        ctx["step"] = "collect_slot"
+    else:
+        ctx["step"] = "collect_doctor"
 
     # ── CRITICAL: flush to disk NOW so the next API turn sees triage_completed=True.
     # Without this, _persist_booking_context() was called earlier (when appending
