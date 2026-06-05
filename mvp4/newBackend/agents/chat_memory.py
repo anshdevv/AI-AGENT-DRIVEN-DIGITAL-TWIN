@@ -87,6 +87,33 @@ def store_message(
         print(f"⚠️  [ChatMemory] store_message failed: {e}")
 
 
+def backfill_session_patient_id(session_id: str, patient_id: int) -> None:
+    """
+    When patient_id is first resolved (after lookup_customer_profile),
+    retroactively set patient_id on all earlier rows from this session
+    that were stored with patient_id=NULL.
+    This ensures the initial complaint and early messages are searchable.
+    """
+    if not session_id or not patient_id:
+        return
+    try:
+        from config import supabase
+        if not supabase:
+            return
+        result = (
+            supabase.table("chat_history")
+            .update({"patient_id": patient_id})
+            .eq("session_id", session_id)
+            .is_("patient_id", "null")
+            .execute()
+        )
+        count = len(result.data) if result.data else 0
+        if count:
+            print(f"🧠 [ChatMemory] Backfilled patient_id={patient_id} on {count} early message(s)")
+    except Exception as e:
+        print(f"⚠️  [ChatMemory] backfill_session_patient_id failed: {e}")
+
+
 def search_relevant(
     patient_id: int,
     query: str,

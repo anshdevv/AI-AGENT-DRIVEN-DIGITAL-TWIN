@@ -41,6 +41,8 @@ from agents.voice_agent import voice_service
 #     return _judge
 
 
+import re
+
 app = FastAPI(title="Medical Concierge Agent (LangGraph Edition)")
 
 app.add_middleware(
@@ -50,6 +52,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Internal tag / think-block sanitiser ──────────────────────────────────────
+_INTERNAL_TAGS = re.compile(
+    r"<think>.*?</think>"               # Qwen reasoning blocks
+    r"|(\[SYMPTOM_LOGGED:[^\]]*\])"     # pipeline control tags
+    r"|(\[START_TRIAGE\])"
+    r"|(\[RECOMMEND_SPECIALIST\])"
+    r"|(\[END_CALL\])"
+    r"|(\[TRANSFER_TO_HUMAN\])"
+    r"|(\[HUMAN_CONFIRMED\])"
+    r"|(\[HUMAN_REQUESTED\])",
+    re.DOTALL,
+)
+
+def _sanitize_reply(text: str) -> str:
+    """Remove internal pipeline tags and Qwen think blocks before sending to client."""
+    cleaned = _INTERNAL_TAGS.sub("", text).strip()
+    return cleaned if cleaned else ""
 
 # ── Session language store ─────────────────────────────────────────────────────
 _session_lang: dict[str, str] = {}
@@ -101,6 +121,7 @@ def chat(request: ChatRequest) -> dict:
 
     messages = state.get("messages", [])
     reply_text = messages[-1].content if messages else "I couldn't process that."
+    reply_text = _sanitize_reply(reply_text) or "One moment please."
 
     # ── Judge evaluation — DISABLED ───────────────────────────────────────────
     # judge = _get_judge()
@@ -161,7 +182,7 @@ async def voice_message(request: VoiceRequest) -> dict:
     target_lang = _session_lang.get(session_id, "en")
     state       = process_with_langgraph(session_id, transcript, "voice_message", target_lang)
     messages    = state.get("messages", [])
-    reply_text  = messages[-1].content if messages else "I'm sorry, I couldn't process that."
+    reply_text  = _sanitize_reply(messages[-1].content if messages else '') or "I'm sorry, I couldn't process that."
 
     # ── Judge evaluation — DISABLED ───────────────────────────────────────────
     # judge = _get_judge()
@@ -266,7 +287,7 @@ async def call_socket(websocket: WebSocket, session_id: str) -> None:
                 target_lang = _session_lang.get(session_id, "en")
                 state       = process_with_langgraph(session_id, transcript, "call", target_lang)
                 messages    = state.get("messages", [])
-                reply_text  = messages[-1].content if messages else "I'm sorry, I couldn't process that."
+                reply_text  = _sanitize_reply(messages[-1].content if messages else '') or "I'm sorry, I couldn't process that."
 
                 # Judge disabled:
                 # judge = _get_judge()

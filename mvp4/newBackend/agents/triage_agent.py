@@ -559,6 +559,26 @@ def triage_node(state: dict) -> dict:
 
     print(f"   symptom='{symptom}'  questions_asked={questions_asked}")
 
+    # ── Routine / wellness visit fast-track ──────────────────────
+    _ROUTINE_KW = {
+        "routine", "checkup", "check-up", "check up", "annual", "wellness",
+        "follow-up", "follow up", "followup", "preventive", "screening",
+    }
+    is_routine = any(kw in (symptom or "").lower() for kw in _ROUTINE_KW)
+    if is_routine and questions_asked >= 1:
+        print("🏥 [Triage] Routine visit — completing after red-flag screen")
+        from agents.triage_agent import _detect_explicit_doctor_request
+        explicit = _detect_explicit_doctor_request(state)
+        specialist = explicit or "General Physician"
+        summary = (
+            f"CLINICAL_SUMMARY:\n"
+            f"- Chief complaint      : {symptom}\n"
+            f"- Visit type           : Routine / preventive\n"
+            f"- Red flags screened   : negative\n"
+            f"- Suggested specialist : {specialist}"
+        )
+        return _complete_triage(state, summary, triage_qa, profile, ctx)
+
     # ── Accumulate patient responses each turn ────────────────────
     messages = list(state.get("messages", []))
     last_human = next(
@@ -701,6 +721,7 @@ def triage_node(state: dict) -> dict:
     print(f"💬 [Qwen→Patient] → {polished[:200]}")
 
     ctx["triage_questions_asked"] = questions_asked + 1
+    _persist_booking_context(ctx)   # persist AFTER increment so disk has correct counter
 
     return {
         "messages":        [AIMessage(content=polished)],

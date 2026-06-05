@@ -40,7 +40,7 @@ from agents.llm_config import get_llm
 from agents.mcp_tools import ALL_TOOLS
 from agents.triage_agent import triage_node
 from agents.diagnostic_agent import diagnostic_node
-from agents.chat_memory import store_message, search_relevant
+from agents.chat_memory import store_message, search_relevant, backfill_session_patient_id
 
 try:
     PKT = ZoneInfo("Asia/Karachi")
@@ -220,11 +220,14 @@ def _compute_required_history_fields(patient: dict, history_data: str | None) ->
     hd      = (history_data or "").lower()
 
     def _has(keyword: str) -> bool:
+        """
+        Returns True if this field's label appears in the history string.
+        Presence means the field exists in the DB row (even if the value is 'none').
+        'None reported' IS a valid collected answer — don't re-ask it.
+        """
         if not hd or keyword not in hd:
             return False
-        idx = hd.find(keyword)
-        snippet = hd[idx:idx + 60]
-        return "none reported" not in snippet and "not recorded" not in snippet
+        return True   # label present → field was collected
 
     required: list[str] = []
 
@@ -248,7 +251,8 @@ def _compute_required_history_fields(patient: dict, history_data: str | None) ->
         required.append("general_allergies")
     if not _has("family history"):
         required.append("family_history")
-    if not _has("smoking"):
+    # Age gate: don't ask an under-14 about smoking
+    if not _has("smoking") and (age is None or int(age) >= 14):
         required.append("smoking_status")
 
     # ── Demographic gates ─────────────────────────────────────────────────────
@@ -284,48 +288,57 @@ def _compute_required_history_fields(patient: dict, history_data: str | None) ->
 
 
 
-# ── Maximum turns allowed per history field before force-advancing ────────────
-_MAX_TURNS_PER_HISTORY_FIELD = 3
+# ── Maximum total turns in the history phase before force-completing ───────────
+_MAX_TOTAL_HISTORY_TURNS = 15
 
 
 def _enforce_history_field_limits(ctx: dict) -> None:
     """
-    Hard algorithmic gate against infinite loops in history collection.
-
-    Called once per supervisor turn while step == collect_patient_history.
-    Increments the turn counter for the currently active field.
-    If the counter reaches _MAX_TURNS_PER_HISTORY_FIELD, the field is
-    force-removed from required_history_fields and added to skipped_history_fields
-    so the pipeline always moves forward regardless of Qwen's behaviour.
-
-    The soft signal to Qwen (in the directive) says 'ask follow-ups' — but this
-    function is the hard enforcement that ensures the field limit is respected.
+    Hard gate against infinite loops in history collection.
+    Tracks TOTAL phase turns — not per-field — because the LLM asks fields in its
+    own order, so per-field counting desynchronises from what Qwen actually asked.
+    At the limit, force-saves defaults for all remaining fields and moves on.
     """
     required = ctx.get("required_history_fields")
     if not required:
-        return   # nothing to enforce
+        return
 
-    current_field = required[0]
-    counts = ctx.setdefault("history_field_turn_count", {})
-    counts[current_field] = counts.get(current_field, 0) + 1
+    total = ctx.get("history_total_turns", 0) + 1
+    ctx["history_total_turns"] = total
 
     print(
-        f"🔢 [HistoryGate] field='{current_field}'  "
-        f"turn {counts[current_field]}/{_MAX_TURNS_PER_HISTORY_FIELD}"
+        f"🔢 [HistoryGate] total_turn={total}/{_MAX_TOTAL_HISTORY_TURNS}  "
+        f"remaining_fields={required}"
     )
 
-    if counts[current_field] >= _MAX_TURNS_PER_HISTORY_FIELD:
+    if total >= _MAX_TOTAL_HISTORY_TURNS:
         print(
-            f"⏭️  [HistoryGate] '{current_field}' hit {_MAX_TURNS_PER_HISTORY_FIELD}-turn limit "
-            f"— force-advancing to next field"
+            f"⏭️  [HistoryGate] Hit {_MAX_TOTAL_HISTORY_TURNS}-turn phase limit "
+            f"— force-saving defaults for remaining: {required}"
         )
-        required.pop(0)
-        ctx["required_history_fields"] = required
-        counts[current_field] = 0   # reset so it doesn't immediately re-trigger if re-added
+        patient_id = ctx.get("patient", {}).get("id")
+        if patient_id:
+            _DEMO = {"age", "gender", "marital_status"}
+            save_args = {"patient_id": patient_id}
+            for field in list(required):
+                if field not in _DEMO:
+                    save_args[field] = "not provided"
+            if len(save_args) > 1:
+                try:
+                    from agents.mcp_tools import save_patient_history as _sph
+                    _sph.invoke(save_args)
+                    print(f"   → Force-saved defaults: {list(save_args.keys())}")
+                except Exception as e:
+                    print(f"   ⚠️  Force-save failed: {e}")
+
         skipped = ctx.setdefault("skipped_history_fields", [])
-        if current_field not in skipped:
-            skipped.append(current_field)
-        print(f"   Skipped: {skipped}  |  Remaining: {required}")
+        for field in required:
+            if field not in skipped:
+                skipped.append(field)
+        ctx["required_history_fields"] = []
+        ctx["patient_history_available"] = True
+        ctx["patient_history_checked"]   = True
+        print(f"   Skipped: {skipped}  |  Remaining: []")
 
 
 
@@ -643,33 +656,36 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
             remaining = ctx.get("required_history_fields", [])
             collected = ctx.get("collected_this_session", [])
 
+            # Show known demographics so the LLM doesn't re-ask them
+            known_demo = []
+            if p.get("age"):            known_demo.append(f"age={p['age']}")
+            if p.get("gender"):         known_demo.append(f"gender={p['gender']}")
+            if p.get("marital_status"): known_demo.append(f"marital_status={p['marital_status']}")
+
             if remaining:
                 current_field = remaining[0]
-                question      = _QUESTION_FOR_FIELD.get(
-                    current_field, f"Please tell me about: {current_field}"
-                )
-                criteria = _FIELD_COMPLETE_CRITERIA.get(current_field, "a clear answer")
+                question  = _QUESTION_FOR_FIELD.get(current_field, f"Please tell me about: {current_field}")
+                criteria  = _FIELD_COMPLETE_CRITERIA.get(current_field, "a clear answer")
 
                 lines.append(f"  ✓ Patient: {p.get('name')} (ID={pid})")
+                if known_demo:
+                    lines.append(f"  ✓ Already known — DO NOT re-ask: {', '.join(known_demo)}")
                 lines.append(f"  ✓ Collected this session: {collected or 'none yet'}")
                 lines.append(f"  ▶ Currently collecting: [{current_field}]")
 
-                turns_used = ctx.get("history_field_turn_count", {}).get(current_field, 0)
-                turns_left = _MAX_TURNS_PER_HISTORY_FIELD - turns_used
-                lines.append(f"    Turn {turns_used}/{_MAX_TURNS_PER_HISTORY_FIELD} on this field — {turns_left} turn(s) remaining before auto-advance")
-                lines.append(f"    Initial question: '{question}'")
-                lines.append(f"    ⛔ Ask this EXACTLY as written. Do not rephrase or add options.")
+                total_turns = ctx.get("history_total_turns", 0)
+                lines.append(f"    Phase turn {total_turns}/{_MAX_TOTAL_HISTORY_TURNS}")
+                lines.append(f"    Question: '{question}'")
+                lines.append(f"    ⛔ Ask this EXACTLY as written.")
                 lines.append(f"    Complete when you have: {criteria}")
                 lines.append("")
-                lines.append("  IMPORTANT RULES for this field:")
+                lines.append("  RULES:")
                 lines.append("  1. Ask the question if not yet asked.")
-                lines.append("  2. If the patient's answer is PARTIAL — only answered part of")
-                lines.append(f"     what's needed — ask ONE natural follow-up to get the rest.")
-                lines.append("  3. Only call save_patient_history when the COMPLETE criteria")
-                lines.append("     above is satisfied. Not before.")
-                lines.append("  4. Do NOT jump to the next topic until this field is saved.")
-                lines.append("  5. If the patient goes off-topic, gently redirect:")
-                lines.append(f"     'I'll note that — just to finish up, {question}'")
+                lines.append("  2. If answer is partial, ask ONE follow-up to complete it.")
+                lines.append("  3. ⛔ Call save_patient_history IMMEDIATELY after patient answers.")
+                lines.append("     Do NOT batch multiple fields — save each one right away.")
+                lines.append("  4. Do NOT move to the next field until this one is saved.")
+                lines.append(f"  5. If off-topic, redirect: 'I'll note that — {question}'")
                 lines.append("")
 
                 _DEMOGRAPHIC_FIELDS = {"age", "gender", "marital_status"}
@@ -712,17 +728,19 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
             hint = ctx.get("initial_complaint_hint")
             lines.append("YOUR NEXT ACTION: Start medical triage.")
             lines.append(f"  Patient {p.get('name') or 'identified'} — history collection complete.")
+            lines.append("  ⚠️  The previous conversation messages were HISTORY COLLECTION.")
+            lines.append("  ⚠️  The patient's last message was their answer to a history question.")
+            lines.append("  ⚠️  Do NOT treat the last message as their chief complaint.")
             if hint:
-                lines.append(f"  ✓ Patient already mentioned their complaint: '{hint}'")
+                lines.append(f"  ✓ Patient already mentioned their complaint earlier: '{hint}'")
                 lines.append(f"  DO NOT ask 'what brings you in today?' — use the hint above.")
-                lines.append(f"  You may say: 'I see you came in for {hint}. Let me start your assessment.'")
-                lines.append(f"  Then immediately output:")
+                lines.append(f"  Output EXACTLY:")
                 lines.append(f"  [SYMPTOM_LOGGED: {hint}]")
                 lines.append(f"  [START_TRIAGE]")
             else:
-                lines.append("  Ask: 'What brings you in today?'")
-                lines.append("  When the patient mentions a symptom output BOTH:")
-                lines.append("  [SYMPTOM_LOGGED: <symptom>]")
+                lines.append("  Ask ONE question: 'What brings you in today?'")
+                lines.append("  When the patient answers, output BOTH:")
+                lines.append("  [SYMPTOM_LOGGED: <their complaint>]")
                 lines.append("  [START_TRIAGE]")
             lines.append("  ⛔ Triage MUST happen before any booking. DO NOT skip to doctor selection.")
 
@@ -961,7 +979,7 @@ def _get_slot_extractor_llm():
 # HELPERS
 # ═══════════════════════════════════════════════════════════════════
 
-MAX_HISTORY_MESSAGES = 20   # Raised from 12 — triage now runs up to 8 rounds
+MAX_HISTORY_MESSAGES = 30   # Raised: history phase + triage easily exceeds 20
 MAX_TOOLS_PER_TURN   = 2    # Hard cap — prevents Groq 400 from long tool chains
 
 _YES_RE = re.compile(
@@ -1133,6 +1151,8 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
                 ctx["patient"]["id"] = int(m.group(1))
                 changed = True
                 print(f"   → patient.id = {ctx['patient']['id']}")
+                # Backfill patient_id on early messages stored before ID was known
+                backfill_session_patient_id(ctx.get("session_id", ""), ctx["patient"]["id"])
             else:
                 print(f"   ⚠️  COULD NOT extract patient.id — regex found nothing in: {result_str[:200]}")
         if not ctx["patient"]["name"]:
@@ -1173,6 +1193,7 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
             ctx["patient"]["id"] = int(m.group(1))
             changed = True
             print(f"   → patient.id = {ctx['patient']['id']} (from registration)")
+            backfill_session_patient_id(ctx.get("session_id", ""), ctx["patient"]["id"])
         m = re.search(r"\bName[:\s]+([A-Za-z][A-Za-z ]{1,40}?)(?:\.|,|\n|$)", result_str, re.IGNORECASE)
         if m and not ctx["patient"]["name"]:
             ctx["patient"]["name"] = m.group(1).strip()
@@ -1335,23 +1356,25 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
             ctx["patient_history_available"] = True
             ctx["patient_history_checked"]   = True
 
-            # Mark saved fields as collected
+            # Mark saved fields as collected — remove from both required AND skipped
             _HISTORY_FIELDS = {
                 "chronic_conditions", "medications", "drug_allergies",
                 "general_allergies", "family_history", "smoking_status",
                 "pregnancy_status", "lmp_date", "menstrual_history",
                 "obstetric_history", "fall_history", "vaccination_status",
             }
-            reqs = ctx.get("required_history_fields") or []
-            coll = ctx.get("collected_this_session", [])
+            reqs    = ctx.get("required_history_fields") or []
+            coll    = ctx.get("collected_this_session", [])
+            skipped = ctx.get("skipped_history_fields", [])
             for field in _HISTORY_FIELDS:
-                if tool_args.get(field) is not None and field in reqs:
-                    reqs.remove(field)
-                    if field not in coll:
-                        coll.append(field)
+                if tool_args.get(field) is not None:
+                    if field in reqs:    reqs.remove(field)
+                    if field in skipped: skipped.remove(field)
+                    if field not in coll: coll.append(field)
             ctx["required_history_fields"] = reqs
             ctx["collected_this_session"]   = coll
-            # Reset turn counter for saved fields so re-collection gets a fresh count
+            ctx["skipped_history_fields"]   = skipped
+            # Reset turn counter for saved fields
             counts = ctx.setdefault("history_field_turn_count", {})
             for field in _HISTORY_FIELDS:
                 if tool_args.get(field) is not None:
@@ -1904,6 +1927,20 @@ def supervisor_node(state: ConversationState) -> dict:
     if last_user_msg:
         store_message(session_id, patient_id, "user", last_user_msg)
     relevant_history = search_relevant(patient_id, last_user_msg) if patient_id and last_user_msg else ""
+    if relevant_history:
+        print(f"🧠 [Memory] Retrieved relevant past context ({len(relevant_history)} chars)")
+
+    # ── Programmatic complaint hint capture ───────────────────────────────────
+    # If this is the very first turn (no patient.id yet) and the message looks like
+    # a complaint (not a phone number), store it as initial_complaint_hint so the
+    # LLM never needs to ask "what brings you in today?" again.
+    if (not ctx["patient"].get("id")
+            and not ctx.get("initial_complaint_hint")
+            and last_user_msg
+            and not re.match(r"^[\+\d][\d\s\-]{8,14}$", last_user_msg.strip())):
+        ctx["initial_complaint_hint"] = last_user_msg.strip()
+        save_booking_context(session_id, ctx)
+        print(f"💡 [AutoHint] Stored initial complaint hint: '{last_user_msg[:80]}'")
 
     # ── Auto-detect phone number in last message ──────────────────────────────
     # When patient gives their phone number, ctx["patient"]["phone"] is still None
@@ -1925,6 +1962,28 @@ def supervisor_node(state: ConversationState) -> dict:
             and last_user_msg):
         _try_auto_save_demographic(ctx, last_user_msg, session_id)
 
+    # ── Programmatic complaint shortcut ───────────────────────────────────────
+    # If step=collect_patient and we already have the complaint from the history
+    # phase hint, skip the LLM round-trip and fire triage immediately.
+    if (ctx.get("step") == "collect_patient"
+            and not ctx.get("triage_completed")
+            and not ctx.get("prime_complaint")
+            and ctx.get("initial_complaint_hint")):
+        hint = ctx["initial_complaint_hint"]
+        ctx["prime_complaint"]  = hint
+        ctx["triage_active"]    = True
+        _advance_step(ctx)
+        save_booking_context(session_id, ctx)
+        print(f"🚦 [Supervisor] Complaint hint '{hint}' auto-applied — routing to triage")
+        return {
+            "messages":              [AIMessage(content="")],
+            "booking_context":       ctx,
+            "triage_active":         True,
+            "interaction_completed": False,
+            "extracted_symptom":     hint,
+            "session_id":            session_id,
+        }
+
     booking_directive = _get_booking_directive(ctx, today_str, tomorrow_str)
 
     prompt_path   = Path(__file__).parent.parent / "prompts" / "supervisor_system.md"
@@ -1943,9 +2002,9 @@ DATE CONTEXT (Pakistan Standard Time):
 PATIENT LANGUAGE: {ctx.get("patient_language", "en")}
 {"IMPORTANT: The patient speaks Urdu. You MUST reply in simple everyday Urdu (nastaliq script). NOT Roman Urdu, NOT English. Natural spoken Urdu only." if ctx.get("patient_language") in ("ur", "urdu") else "Reply in plain conversational English only. Do not use Urdu, Roman Urdu, Hindi, or mixed-script text."}
 
-{booking_directive}
+{f"── MEMORY: RELEVANT PAST CONTEXT (verified before this turn) ──{chr(10)}{relevant_history}" if relevant_history else ""}
 
-{relevant_history}
+{booking_directive}
 
 ABSOLUTE PROHIBITIONS:
   Never call a tool with null/unknown values.
@@ -1994,6 +2053,13 @@ SPECIAL TAGS (output these exact strings when needed):
             print("🚫 [Supervisor] Tool call blocked by validator")
             response = blocked
 
+    # Strip <think>...</think> blocks that Qwen sometimes leaks into its response
+    raw_content = str(response.content)
+    cleaned_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
+    if cleaned_content != raw_content:
+        print("🧹 [Supervisor] Stripped <think> block from response")
+        response = AIMessage(content=cleaned_content, tool_calls=getattr(response, "tool_calls", None) or [])
+
     response_text         = str(response.content)
     extracted_symptom     = state.get("extracted_symptom")
     triage_active         = state.get("triage_active") or False
@@ -2009,6 +2075,13 @@ SPECIAL TAGS (output these exact strings when needed):
             _advance_step(ctx)
             save_booking_context(session_id, ctx)
         print(f"📝 [Supervisor] symptom='{symptom}'")
+        # Programmatically trigger triage — never rely on LLM emitting [START_TRIAGE]
+        if not ctx.get("triage_completed"):
+            triage_active = True
+            ctx["triage_active"] = True
+            response = AIMessage(content="")   # triage_node will speak
+            save_booking_context(session_id, ctx)
+            print("🚦 [Supervisor] Triage auto-triggered programmatically after SYMPTOM_LOGGED")
     elif "[SYMPTOM_LOGGED:" in response_text and ctx.get("step") == "collect_patient_history":
         start   = response_text.find("[SYMPTOM_LOGGED:") + 16
         end     = response_text.find("]", start)
@@ -2021,7 +2094,8 @@ SPECIAL TAGS (output these exact strings when needed):
         # Strip both tags but keep the full response — legitimate questions must not be cut
         cleaned = re.sub(r"\[SYMPTOM_LOGGED:[^\]]*\]", "", response_text)
         cleaned = re.sub(r"\[START_TRIAGE\]", "", cleaned).strip()
-        response  = AIMessage(content=cleaned)
+        # CRITICAL: preserve tool_calls so the router still goes to tool_executor
+        response = AIMessage(content=cleaned, tool_calls=getattr(response, "tool_calls", None) or [])
         save_booking_context(session_id, ctx)
         # If all history fields are done, advance step NOW so next turn fires triage properly
         required = ctx.get("required_history_fields")
