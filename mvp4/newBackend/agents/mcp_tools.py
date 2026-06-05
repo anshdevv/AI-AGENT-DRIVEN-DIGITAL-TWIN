@@ -378,26 +378,59 @@ def _apply_query_filter(query: Any, column: str, op: str, value: Any) -> Any:
     raise ValueError(f"Unsupported filter op: {op}")
 
 
+def _day_of_week_from_date(value: datetime) -> int:
+    # Schema convention: 0=Sunday (PostgreSQL EXTRACT DOW).
+    # Python weekday() is 0=Mon..6=Sun → +1 mod 7 → 0=Sun..6=Sat.
+    return (value.weekday() + 1) % 7
+
+
 def _get_schedule_rows(doctor_id: int, weekday: int) -> list[dict[str, Any]]:
+    """
+    Fetch availability rows for doctor_id on the given weekday index.
+
+    Tries the passed weekday first (0=Sunday convention, matching PostgreSQL DOW).
+    If nothing is returned, automatically retries with the 0=Monday convention
+    (Python weekday()) so the code works regardless of which numbering the DB
+    was originally populated with.
+    """
     if not supabase:
         return []
-    print(f"   [ScheduleRows] Querying doctor_availability: doctor_id={doctor_id}, day_of_week={weekday}")
-    response = (
-        supabase.table("doctor_availability")
-        .select("*")
-        .eq("doctor_id", doctor_id)
-        .eq("day_of_week", weekday)
-        .execute()
-    )
-    rows = sorted(
-        list(response.data or []),
-        key=lambda row: (
-            str(row.get("start_time", "")),
-            str(row.get("end_time", "")),
-        ),
-    )
-    print(f"   [ScheduleRows] Found {len(rows)} row(s): {[{'start': r.get('start_time'), 'end': r.get('end_time'), 'duration': r.get('slot_duration_minutes')} for r in rows]}")
-    return rows
+
+    def _query(day_val: int) -> list[dict[str, Any]]:
+        print(f"   [ScheduleRows] Querying doctor_availability: "
+              f"doctor_id={doctor_id}, day_of_week={day_val} ({_day_of_week_name(day_val)})")
+        resp = (
+            supabase.table("doctor_availability")
+            .select("*")
+            .eq("doctor_id", doctor_id)
+            .eq("day_of_week", day_val)
+            .execute()
+        )
+        rows = sorted(
+            list(resp.data or []),
+            key=lambda r: (str(r.get("start_time", "")), str(r.get("end_time", ""))),
+        )
+        print(f"   [ScheduleRows] Found {len(rows)} row(s): "
+              f"{[{'start': r.get('start_time'), 'end': r.get('end_time')} for r in rows]}")
+        return rows
+
+    rows = _query(weekday)
+    if rows:
+        return rows
+
+    # Nothing found — the DB might use 0=Monday (Python weekday()) instead
+    # of 0=Sunday (PostgreSQL DOW). Retry with the alternative index.
+    alt_weekday = (weekday - 1) % 7   # undo the +1 shift: back to Python weekday()
+    if alt_weekday != weekday:
+        print(f"   [ScheduleRows] ⚠️  0 rows for index {weekday} — retrying with "
+              f"alt index {alt_weekday} (0=Monday convention)")
+        alt_rows = _query(alt_weekday)
+        if alt_rows:
+            print(f"   [ScheduleRows] ✅ Alt convention matched — "
+                  f"DB uses 0=Monday. Consider updating your day_of_week values.")
+            return alt_rows
+
+    return []
 
 
 def _build_bookable_slots(
@@ -444,12 +477,18 @@ def _build_bookable_slots(
     for slot in slot_response.data or []:
         if not _is_blocking_slot(slot, active_appointment_slot_ids):
             continue
-        blocked_windows.append(
-            (
-                datetime.fromisoformat(str(slot["start_time"])),
-                datetime.fromisoformat(str(slot["end_time"])),
-            )
-        )
+        try:
+            raw_start = datetime.fromisoformat(str(slot["start_time"]))
+            raw_end   = datetime.fromisoformat(str(slot["end_time"]))
+            # Supabase may return naive UTC strings — make them timezone-aware so
+            # the overlap comparison with PKT-aware slot_start doesn't crash.
+            if raw_start.tzinfo is None:
+                raw_start = raw_start.replace(tzinfo=timezone.utc)
+            if raw_end.tzinfo is None:
+                raw_end = raw_end.replace(tzinfo=timezone.utc)
+            blocked_windows.append((raw_start, raw_end))
+        except (ValueError, KeyError) as exc:
+            print(f"   [BuildSlots] ⚠️  Could not parse blocked slot times: {exc}")
     print(f"   [BuildSlots] Blocked windows: {[(str(s), str(e)) for s, e in blocked_windows]}")
 
     bookable_slots: list[dict[str, Any]] = []
@@ -778,6 +817,46 @@ def get_doctor_profile(doctor_name: str | None = None, doctor_id: int | None = N
     return "\n".join(lines) if schedule else "\n".join(lines) + "\n  No schedule found."
 
 
+def _format_slots_grouped(slots: list[dict[str, Any]]) -> str:
+    """
+    Format a list of bookable slot dicts into a clean morning / afternoon / evening
+    block so the patient can see every available time at a glance.
+
+    Output example:
+      Morning   (06:00–11:59): 09:00, 09:15, 09:30, 09:45, 10:00, 10:30
+      Afternoon (12:00–16:59): 14:00, 14:15, 14:30, 15:00
+      Evening   (17:00–21:59): 17:00, 17:30, 18:00
+    """
+    morning: list[str]   = []
+    afternoon: list[str] = []
+    evening: list[str]   = []
+
+    for slot in slots:
+        try:
+            dt  = datetime.fromisoformat(str(slot["start_time"]))
+            fmt = dt.strftime("%H:%M")
+            h   = dt.hour
+        except (ValueError, KeyError):
+            continue
+        if 6 <= h < 12:
+            morning.append(fmt)
+        elif 12 <= h < 17:
+            afternoon.append(fmt)
+        elif 17 <= h < 22:
+            evening.append(fmt)
+        # slots outside 06:00–21:59 are silently skipped (unlikely in a clinic)
+
+    groups: list[str] = []
+    if morning:
+        groups.append(f"    Morning   (06:00–11:59): {', '.join(morning)}")
+    if afternoon:
+        groups.append(f"    Afternoon (12:00–16:59): {', '.join(afternoon)}")
+    if evening:
+        groups.append(f"    Evening   (17:00–21:59): {', '.join(evening)}")
+
+    return "\n".join(groups) if groups else "    (no slots in standard hours)"
+
+
 @tool
 def find_provider_availability(
     specialization: str | None = None,
@@ -873,16 +952,13 @@ def find_provider_availability(
             time_note = None
 
         if matching_slots:
-            display_slots = [_format_slot_start(s) for s in matching_slots[:6]]
-            extra_count   = len(all_slots) - len(display_slots) if not target_time else 0
-            available.append((provider, display_slots, len(all_slots), time_note, extra_count))
+            available.append((provider, matching_slots, all_slots, time_note))
 
     if not available:
         day_name  = target_date.strftime("%A")
         date_str  = target_date.strftime("%Y-%m-%d")
         if target_time:
-            # Show all slots even though requested time has no match
-            # Re-run without time filter for a helpful "here's what IS available" message
+            # Requested time not found — re-run without filter so user sees what IS free
             fallback = []
             for provider in providers:
                 rows = _get_schedule_rows(provider["id"], target_weekday)
@@ -890,23 +966,29 @@ def find_provider_availability(
                     continue
                 slots = _build_bookable_slots(doctor_id=provider["id"], target_date=target_date, schedule_rows=rows)
                 if slots:
-                    fallback.append((provider, [_format_slot_start(s) for s in slots[:6]], len(slots)))
+                    fallback.append((provider, slots, slots, None))
             if fallback:
-                lines = [f"No slot at {time} on {day_name} ({date_str}). Available slots:"]
-                for provider, display_slots, total in fallback:
-                    extra = f" (+{total - len(display_slots)} more)" if total > len(display_slots) else ""
-                    lines.append(f"  Dr. {provider.get('name')} ({provider.get('specialization')}): {', '.join(display_slots)}{extra}")
+                lines = [f"No slot at {time} on {day_name} ({date_str}). Here are all free slots:"]
+                for provider, matching, all_s, _ in fallback:
+                    lines.append(f"  Dr. {provider.get('name')} | {provider.get('specialization')} | {len(all_s)} slot(s)")
+                    lines.append(_format_slots_grouped(all_s))
                 return "\n".join(lines)
         return f"No available slots found on {day_name} ({date_str})."
 
     lines = [f"Available slots on {target_date.strftime('%A, %Y-%m-%d')}:"]
-    for provider, display_slots, total, time_note, extra_count in available:
-        note_str  = f" {time_note}" if time_note else ""
-        extra_str = f" (+{extra_count} more)" if extra_count > 0 else ""
+    for provider, matching_slots, all_slots, time_note in available:
         lines.append(
-            f"  Dr. {provider.get('name')} ({provider.get('specialization')}): "
-            f"{', '.join(display_slots)}{extra_str}{note_str}"
+            f"  Dr. {provider.get('name')} | {provider.get('specialization')} "
+            f"| {len(all_slots)} slot(s) free"
         )
+        if time_note:
+            lines.append(f"  Note: {time_note}")
+        # When a specific time was requested, just confirm that slot
+        if target_time and len(matching_slots) == 1:
+            lines.append(f"  Slot: {_format_slot_start(matching_slots[0])}")
+        else:
+            # Show all free slots grouped by time of day so the patient can pick
+            lines.append(_format_slots_grouped(all_slots))
     return "\n".join(lines)
 
 
@@ -1012,17 +1094,38 @@ def create_booking(patient_id: int, doctor_id: int, date: str, time: str) -> str
     # Create appointment record
     try:
         appointment_payload = {
-            "slot_id": slot_record["id"],
-            "doctor_id": doctor_id,
-            "patient_id": patient_id,
-            "status": "booked",
+            "slot_id":          slot_record["id"],
+            "doctor_id":        doctor_id,
+            "patient_id":       patient_id,
+            "status":           "booked",
+            # Store date + time directly so appointments can be read without joining slots.
+            # Requires two TEXT/DATE/TIME columns in your Supabase appointments table:
+            #   appointment_date  TEXT  (e.g. '2026-06-08')
+            #   appointment_time  TEXT  (e.g. '11:00')
+            "appointment_date": target_date.strftime("%Y-%m-%d"),
+            "appointment_time": target_time.strftime("%H:%M"),
         }
         response = supabase.table("appointments").insert(appointment_payload).execute()
         appointment = response.data[0] if response.data else None
     except Exception as e:
-        # Roll back slot
-        supabase.table("slots").update({"status": "available"}).eq("id", slot_record["id"]).execute()
-        return f"Failed to create appointment: {e}"
+        # If the new columns don't exist yet, retry without them so booking still works
+        try:
+            fallback_payload = {
+                "slot_id":    slot_record["id"],
+                "doctor_id":  doctor_id,
+                "patient_id": patient_id,
+                "status":     "booked",
+            }
+            response    = supabase.table("appointments").insert(fallback_payload).execute()
+            appointment = response.data[0] if response.data else None
+            if appointment:
+                print(f"   ⚠️  appointment_date/time columns missing — added without them. "
+                      f"Run: ALTER TABLE appointments ADD COLUMN appointment_date TEXT; "
+                      f"ALTER TABLE appointments ADD COLUMN appointment_time TEXT;")
+        except Exception as e2:
+            # Roll back slot
+            supabase.table("slots").update({"status": "available"}).eq("id", slot_record["id"]).execute()
+            return f"Failed to create appointment: {e2}"
 
     if not appointment:
         supabase.table("slots").update({"status": "available"}).eq("id", slot_record["id"]).execute()

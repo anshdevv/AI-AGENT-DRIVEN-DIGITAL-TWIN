@@ -1,61 +1,49 @@
 # agents/llm_config.py
+# ─────────────────────────────────────────────────────────────────
+# Switch providers via .env:
+#   LLM_PROVIDER=groq      → Groq API (qwen/qwen3-32b by default)
+#   LLM_PROVIDER=deepseek  → DeepSeek API (deepseek-chat by default)
+# ─────────────────────────────────────────────────────────────────
 from __future__ import annotations
+import os
 
-import sys
-from pathlib import Path
+_PROVIDER    = os.getenv("LLM_PROVIDER",   "groq").strip().lower()
+_GROQ_MODEL  = os.getenv("GROQ_MODEL",     "qwen/qwen3-32b").strip()
+_DS_MODEL    = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip()
 
-from langchain_groq import ChatGroq
+print(f"🤖 [LLMConfig] Provider='{_PROVIDER}'  "
+      f"model='{_DS_MODEL if _PROVIDER == 'deepseek' else _GROQ_MODEL}'")
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-from config import settings
 
 def get_llm(temperature: float = 0.1):
-    """Returns a configured ChatGroq instance pointing to Groq's API."""
-    if not settings.groq_api_key:
-        print("⚠️ GROQ_API_KEY is missing! Check your .env file.")
-        
-    # The official Groq model ID for Qwen 3 32B is "qwen/qwen3-32b"
-    return ChatGroq(
-        model="qwen/qwen3-32b", 
-        temperature=temperature,
-        api_key=settings.groq_api_key,
-    )
-
-# ==========================================
-# 🧪 QUICK TEST SCRIPT
-# ==========================================
-if __name__ == "__main__":
-    print("\n🔧 Config Check (Groq):")
-    print(f"   Model Target  : qwen/qwen3-32b")
-    print(f"   API Key set   : {'✅ Yes' if settings.groq_api_key else '❌ No'}")
-    print(f"\n⏳ Connecting to Groq API...\n")
-
-    try:
-        test_llm = get_llm(temperature=0.1)
-
-        print("📡 Sending test message...")
-        response = test_llm.invoke(
-            "Hello! Are you online? Please reply with exactly: 'Yes, I am online and ready.'"
+    if _PROVIDER == "deepseek":
+        from langchain_openai import ChatOpenAI
+        from config import settings
+        key = getattr(settings, "deepseek_api_key", None) or os.getenv("DEEPSEEK_API_KEY", "")
+        if not key:
+            print("⚠️  [LLMConfig] DEEPSEEK_API_KEY is missing in .env!")
+        return ChatOpenAI(
+            model=_DS_MODEL,
+            temperature=0,
+            api_key=key,
+            base_url="https://api.deepseek.com",
+        )
+    else:
+        from langchain_groq import ChatGroq
+        from config import settings
+        if not settings.groq_api_key:
+            print("⚠️  [LLMConfig] GROQ_API_KEY is missing in .env!")
+        return ChatGroq(
+            model=_GROQ_MODEL,
+            temperature=temperature,
+            api_key=settings.groq_api_key,
         )
 
-        print("✅ SUCCESS! The LLM is connected.")
-        print(f"🤖 AI Says: {response.content}")
-        print("\n🚀 You are ready to run main.py!")
 
+if __name__ == "__main__":
+    try:
+        llm = get_llm()
+        r   = llm.invoke("Reply with: 'online'")
+        print(f"✅ {_PROVIDER} → {r.content[:60]}")
     except Exception as e:
-        error_msg = str(e).lower()
-        
-        if "401" in error_msg or "unauthorized" in error_msg:
-            print("❌ AUTH ERROR: Your GROQ_API_KEY is invalid or expired.")
-            print("👉 Get a new key at: https://console.groq.com/keys")
-
-        elif "404" in error_msg or "not found" in error_msg:
-            print("❌ MODEL NOT FOUND: The requested model doesn't exist on Groq.")
-            print("👉 Check the Groq console for supported model IDs.")
-
-        elif "rate" in error_msg or "429" in error_msg:
-            print("❌ RATE LIMITED: Too many requests. Wait a moment and try again.")
-
-        else:
-            print(f"❌ ERROR: Could not connect to the LLM.")
-            print(f"   Details: {e}")
+        print(f"❌ {e}")

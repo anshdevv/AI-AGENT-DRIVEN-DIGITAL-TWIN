@@ -41,6 +41,14 @@ from agents.mcp_tools import ALL_TOOLS
 from agents.triage_agent import triage_node
 from agents.diagnostic_agent import diagnostic_node
 from agents.chat_memory import store_message, search_relevant, backfill_session_patient_id
+from agents.policy_rag  import search_policy
+import os 
+
+# ── Feature flags (set in .env to disable expensive features) ─────────────
+_USE_SYMPTOM_LOOKUP = os.getenv("USE_SYMPTOM_LOOKUP", "true").lower() != "false"
+_USE_LLM_JUDGE      = os.getenv("USE_LLM_JUDGE",      "false").lower() == "true"
+print(f"🔧 [Features] symptom_lookup={'ON' if _USE_SYMPTOM_LOOKUP else 'OFF'}  "
+      f"llm_judge={'ON' if _USE_LLM_JUDGE else 'OFF'}")
 
 try:
     PKT = ZoneInfo("Asia/Karachi")
@@ -288,57 +296,59 @@ def _compute_required_history_fields(patient: dict, history_data: str | None) ->
 
 
 
-# ── Maximum total turns in the history phase before force-completing ───────────
-_MAX_TOTAL_HISTORY_TURNS = 15
+# ── Per-field turn limit: after this many turns on one field, force-advance ──
+_MAX_TURNS_PER_HISTORY_FIELD = 3
 
 
 def _enforce_history_field_limits(ctx: dict) -> None:
     """
-    Hard gate against infinite loops in history collection.
-    Tracks TOTAL phase turns — not per-field — because the LLM asks fields in its
-    own order, so per-field counting desynchronises from what Qwen actually asked.
-    At the limit, force-saves defaults for all remaining fields and moves on.
+    Per-field turn limit. Tracks how many turns have elapsed while
+    required_history_fields[0] is the current field. After 3 turns
+    without a save, force-saves "not provided" and removes the field.
+
+    This prevents the model staying on one field forever without saving,
+    while still allowing the auto-save to resolve it naturally first.
+    The per-turn counter resets whenever auto-save successfully clears
+    a field (see _try_auto_save_history_field).
     """
     required = ctx.get("required_history_fields")
     if not required:
         return
 
-    total = ctx.get("history_total_turns", 0) + 1
-    ctx["history_total_turns"] = total
+    current_field = required[0]
+    counts = ctx.setdefault("history_field_turn_count", {})
+    counts[current_field] = counts.get(current_field, 0) + 1
+    turn = counts[current_field]
 
     print(
-        f"🔢 [HistoryGate] total_turn={total}/{_MAX_TOTAL_HISTORY_TURNS}  "
+        f"🔢 [HistoryGate] field='{current_field}'  turn {turn}/{_MAX_TURNS_PER_HISTORY_FIELD}  "
         f"remaining_fields={required}"
     )
 
-    if total >= _MAX_TOTAL_HISTORY_TURNS:
-        print(
-            f"⏭️  [HistoryGate] Hit {_MAX_TOTAL_HISTORY_TURNS}-turn phase limit "
-            f"— force-saving defaults for remaining: {required}"
-        )
-        patient_id = ctx.get("patient", {}).get("id")
-        if patient_id:
-            _DEMO = {"age", "gender", "marital_status"}
-            save_args = {"patient_id": patient_id}
-            for field in list(required):
-                if field not in _DEMO:
-                    save_args[field] = "not provided"
-            if len(save_args) > 1:
-                try:
-                    from agents.mcp_tools import save_patient_history as _sph
-                    _sph.invoke(save_args)
-                    print(f"   → Force-saved defaults: {list(save_args.keys())}")
-                except Exception as e:
-                    print(f"   ⚠️  Force-save failed: {e}")
+    if turn < _MAX_TURNS_PER_HISTORY_FIELD:
+        return
 
-        skipped = ctx.setdefault("skipped_history_fields", [])
-        for field in required:
-            if field not in skipped:
-                skipped.append(field)
-        ctx["required_history_fields"] = []
-        ctx["patient_history_available"] = True
-        ctx["patient_history_checked"]   = True
-        print(f"   Skipped: {skipped}  |  Remaining: []")
+    # ── Force-advance ─────────────────────────────────────────────────────────
+    print(f"⏭️  [HistoryGate] '{current_field}' hit {_MAX_TURNS_PER_HISTORY_FIELD}-turn limit — force-advancing")
+    patient_id = ctx.get("patient", {}).get("id")
+    _DEMO = {"age", "gender", "marital_status"}
+    if patient_id and current_field not in _DEMO:
+        try:
+            from agents.mcp_tools import save_patient_history as _sph
+            _sph.invoke({"patient_id": patient_id, current_field: "not provided"})
+            print(f"   → Force-saved '{current_field}'='not provided'")
+        except Exception as e:
+            print(f"   ⚠️  Force-save failed: {e}")
+
+    reqs = list(ctx.get("required_history_fields") or [])
+    skipped = ctx.setdefault("skipped_history_fields", [])
+    if current_field in reqs:
+        reqs.remove(current_field)
+    if current_field not in skipped:
+        skipped.append(current_field)
+    ctx["required_history_fields"] = reqs
+    counts[current_field] = 0
+    print(f"   Skipped: {skipped}  |  Remaining: {reqs}")
 
 
 
@@ -455,23 +465,44 @@ def _compute_triage_dimensions(complaint: str, ctx: dict) -> list[tuple[str, str
 
 def _determine_routing(ctx: dict) -> str:
     """
-    GP-first rule:
-      First visit (or new complaint) → General Physician
-      Second visit with same complaint specialization → recommended specialist
-      Emergency flag → EMERGENCY
-
-    Uses recent_case_notes (fetched automatically after patient lookup)
-    and the triage-recommended specialist to decide.
+    Routing rules (per clinical advice):
+      - Emergency                           → EMERGENCY (human escalation)
+      - Severe/Critical, first visit        → recommended specialist + human flag
+      - Mild/Moderate, first visit          → General Physician
+      - Returning, same complaint           → recommended specialist
+      - Returning, different complaint      → General Physician
     """
     if ctx.get("routing_decision"):
-        return ctx["routing_decision"]   # already decided this session
+        return ctx["routing_decision"]
 
-    recommended = ctx.get("recommended_specialist") or ""
+    recommended = (ctx.get("recommended_specialist") or "General Physician").strip()
     notes       = (ctx.get("recent_case_notes") or "").lower()
+    severity    = (ctx.get("triage_severity") or "Unknown").lower()
 
-    # Emergency always overrides
-    if "emergency" in recommended.lower():
+    # Emergency always overrides everything
+    if "emergency" in recommended.lower() or severity in ("emergency", "critical"):
         return "EMERGENCY"
+
+    # Severe first visit → go direct to specialist, also set human flag
+    if severity == "severe":
+        if not ctx.get("human_handoff_pending"):
+            ctx["human_handoff_pending"] = True
+            print(f"   [Routing] Severe case — flagging for human/doctor attention")
+        spec = recommended if recommended.lower() not in ("general physician", "gp", "") else "Specialist"
+        print(f"   [Routing] Severe → {spec} (+ human flag set)")
+        return spec
+
+    # No prior notes → first visit → GP
+    if not notes or "no case notes" in notes or "no recent" in notes:
+        return "General Physician"
+
+    # Prior notes exist — returning patient with same specialist complaint?
+    if recommended and recommended.lower() not in ("general physician", "gp", ""):
+        specialist_keyword = recommended.split("/")[0].strip().lower()
+        if specialist_keyword and specialist_keyword in notes:
+            return recommended
+
+    return "General Physician"
 
     # No prior notes → definitely first visit → GP
     if not notes or "no case notes" in notes or "no recent" in notes:
@@ -579,7 +610,10 @@ def _advance_step(ctx: dict) -> None:
     if not ctx.get("triage_completed"):
         ctx["step"] = "collect_patient"
         ctx["triage_completed"] = False
-        ctx["triage_active"] = True
+        # DO NOT set triage_active=True here. triage_active is only set by the
+        # supervisor when the patient gives their complaint and the supervisor
+        # outputs [START_TRIAGE]. Setting it here bypasses the supervisor entirely
+        # and triage starts with symptom=None because no complaint was captured.
         return
     if not d["id"]:
         ctx["step"] = "collect_doctor"
@@ -666,7 +700,15 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
 
         elif phone and not pid:
             lines.append(f"  ✓ Phone collected: {phone}")
-            lines.append("  ▶ SUB-STEP 2: Call lookup_customer_profile now.")
+            # Detect if lookup already ran and returned 'not found' (flag set in tool extract)
+            if ctx.get("patient_lookup_failed"):
+                lines.append("  ✓ Lookup ran — patient is NEW (not in system).")
+                lines.append("  ▶ Ask for their name (first name is fine).")
+                lines.append("  ▶ Then call: register_customer_profile(name=<name>, phone=<phone>)")
+                lines.append("  ⛔ ONLY name and phone in this call. Nothing else.")
+                lines.append("  ⛔ Age/gender come LATER via update_patient_demographics.")
+            else:
+                lines.append("  ▶ SUB-STEP 2: Call lookup_customer_profile now.")
 
         elif pid and ctx.get("required_history_fields") is None:
             lines.append(f"  ✓ Patient identified: {p.get('name')} (ID={pid})")
@@ -693,8 +735,8 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
                 lines.append(f"  ✓ Collected this session: {collected or 'none yet'}")
                 lines.append(f"  ▶ Currently collecting: [{current_field}]")
 
-                total_turns = ctx.get("history_total_turns", 0)
-                lines.append(f"    Phase turn {total_turns}/{_MAX_TOTAL_HISTORY_TURNS}")
+                field_turns = ctx.get("history_field_turn_count", {}).get(current_field, 0)
+                lines.append(f"    Field turn {field_turns}/{_MAX_TURNS_PER_HISTORY_FIELD} (auto-advances if unanswered)")
                 lines.append(f"    Question: '{question}'")
                 lines.append(f"    ⛔ Ask this EXACTLY as written.")
                 lines.append(f"    Complete when you have: {criteria}")
@@ -729,6 +771,12 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
     elif not ctx.get("triage_completed") and step == "collect_patient":
         hint = ctx.get("initial_complaint_hint")
         lines.append("YOUR NEXT ACTION: Start medical triage.")
+        # Tell the LLM what history was collected so it doesn't say "no history on file"
+        _hist = ctx.get("patient_history_data") or ""
+        if _hist and "history found" in _hist.lower():
+            lines.append(f"  ✓ Medical history on file (already collected — do NOT say 'no history on file').")
+        elif ctx.get("history_checked"):
+            lines.append(f"  ✓ History check complete.")
         if hint:
             lines.append(f"  ✓ Patient already mentioned their complaint: '{hint}'")
             lines.append(f"  DO NOT ask 'what brings you in today?' — use the hint.")
@@ -795,28 +843,50 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
     elif step == "collect_doctor":
         spec = ctx.get("recommended_specialist", "")
         if d["id"]:
-            # Doctor already resolved — should not normally land here, but be safe
-            lines.append("YOUR NEXT ACTION: Doctor is already selected — do NOT call any doctor tools.")
-            lines.append(f"  Doctor: Dr. {d['name']} (ID={d['id']}, {d['specialization']})")
-            lines.append("  Just ask the patient which date they prefer for their appointment.")
+            # Doctor already resolved — guide toward slot selection naturally
+            lines.append("YOUR NEXT ACTION: Transition smoothly into booking.")
+            lines.append(f"  The triage has recommended: {d['specialization']}.")
+            lines.append(f"  Doctor found: Dr. {d['name']} ({d['specialization']}, ID={d['id']}).")
+            lines.append("  Present this as a warm recommendation — not a done deal:")
+            lines.append(f"  e.g. 'Based on your assessment, I'd suggest Dr. {d['name']}, a {d['specialization']}.")
+            lines.append(f"       Shall we check available slots?'")
+            lines.append("  Once patient agrees, ask which day they prefer (today or tomorrow).")
         else:
-            lines.append("YOUR NEXT ACTION: Find and select a doctor.")
-            lines.append(f"  1. Call get_doctors_by_specialization(specialization='{spec}') to list available doctors.")
-            lines.append("  2. If only one doctor is returned, auto-select them and immediately ask for a preferred date.")
-            lines.append("  3. If multiple doctors, present them and ask the patient to pick one.")
-            lines.append("  ⛔ DO NOT call get_doctor_profile — the ID is extracted automatically from the list.")
+            lines.append("YOUR NEXT ACTION: Find a doctor and present as a recommendation.")
+            lines.append(f"  1. Call get_doctors_by_specialization(specialization='{spec}').")
+            lines.append("  2. Present the result warmly: 'Based on your assessment, I'd suggest...'")
+            lines.append("  3. If only one doctor, recommend them and ask if patient wants to proceed.")
+            lines.append("  4. If multiple doctors, briefly describe each and let patient choose.")
+            lines.append("  ⛔ DO NOT call get_doctor_profile.")
             lines.append("  ⛔ DO NOT call get_doctors_by_specialization more than once.")
 
     elif step == "collect_slot":
         d_name     = d.get("name", "Unknown")
         d_id       = d.get("id")
         schedule   = ctx.get("doctor_schedule", [])
+        pending_date = ctx["pending_slot"].get("date")
+        slots_fetched = ctx.get("slots_fetched_for_date")
 
         lines.append("YOUR NEXT ACTION: Help the patient pick a date and time slot.")
         lines.append(f"  TODAY = {today} | TOMORROW = {tomorrow}")
         lines.append("")
 
-        if schedule:
+        if pending_date and not slots_fetched:
+            # Date is known but availability hasn't been checked — must call tool NOW
+            lines.append(f"  ✅ Patient chose date: {pending_date}")
+            lines.append(f"  ▶ CALL NOW: find_provider_availability(doctor_id={d_id}, date='{pending_date}')")
+            lines.append("  ⛔ DO NOT ask anything — call the tool immediately.")
+        elif slots_fetched and ctx.get("availability_result"):
+            # Availability already pre-fetched — present naturally, let patient pick
+            lines.append(f"  ✅ I've checked Dr. {d_name}'s schedule for {slots_fetched}.")
+            lines.append(f"  Available times:")
+            lines.append(f"  {ctx['availability_result'][:800]}")
+            lines.append("")
+            lines.append("  WORKFLOW:")
+            lines.append("  1. Present the slots warmly: 'Here are the available times with Dr. [Name]:'")
+            lines.append("  2. Ask patient to pick one: 'Which time works best for you?'")
+            lines.append("  3. Once they pick → show full summary and ask 'Shall I confirm this booking? (Yes/No)'")
+        elif schedule:
             lines.append(f"  ✅ Dr. {d_name}'s weekly schedule (already fetched — DO NOT call get_doctor_profile again):")
             for entry in schedule:
                 lines.append(f"     {entry['day']}: {entry['start']} – {entry['end']}")
@@ -848,11 +918,20 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
         lines.append("  These tags are only valid before triage. Emitting them now will break the flow.")
 
     elif step == "await_confirmation":
-        lines.append("YOUR NEXT ACTION: Show summary. Ask 'Shall I confirm? (yes/no)'. Call NO tools.")
+        lines.append("YOUR NEXT ACTION: Confirm the appointment.")
         lines.append(f"  Patient : {p['name']} (ID={p['id']})")
         lines.append(f"  Doctor  : Dr. {d['name']} (ID={d['id']})")
         lines.append(f"  Date    : {s['date']} at {s['time']}")
-        lines.append("  DO NOT call create_booking — code handles it after YES.")
+        lines.append("")
+        lines.append("  WORKFLOW:")
+        lines.append("  1. If the patient has NOT yet said yes/no → show the summary above and ask:")
+        lines.append("     'Shall I confirm this appointment? (yes/no)'")
+        lines.append("  2. If the patient says YES → call create_booking immediately:")
+        lines.append(f"     create_booking(patient_id={p['id']}, doctor_id={d['id']}, date='{s['date']}', time='{s['time']}')")
+        lines.append("  3. If create_booking succeeds → warmly confirm and wait for next message.")
+        lines.append("  4. If create_booking fails (slot taken) → tell the patient that slot is gone,")
+        lines.append("     show the updated free slots from the tool result, and ask them to pick again.")
+        lines.append("  ⛔ Only call create_booking — no other tools at this step.")
 
     elif step == "completed":
         lines.append("YOUR NEXT ACTION: Booking is confirmed.")
@@ -1040,14 +1119,15 @@ def _trim_messages(messages: list) -> list:
 
 def _build_safe_messages(raw: list) -> list:
     """
-    Prepare message history for Qwen (supervisor).
-    Removes:
-      - AIMessages that have tool_calls (replaced with content-only version)
-      - ToolMessages that have no preceding AIMessage with tool_calls (orphans)
-      - Empty AIMessages (blank content, no tool_calls) — these are triage silencers
-    This prevents Groq 400 'tool_use_failed' from malformed tool sequences in history.
+    Prepare message history for the supervisor LLM.
+    Rules:
+      - AI messages WITH tool_calls are kept as-is (stripping them breaks the
+        tool_call_id pairing that DeepSeek and Groq both require).
+      - ToolMessages with no matching preceding tool_call are dropped (orphans).
+      - Duplicate ToolMessages for the same tool_call_id are deduplicated.
+      - Empty AI messages (blank content, no tool_calls) are dropped.
     """
-    # First pass: which tool_call IDs are legitimately present?
+    # Collect all valid tool_call IDs from AI messages
     valid_tool_call_ids: set[str] = set()
     for msg in raw:
         if msg.type == "ai" and getattr(msg, "tool_calls", None):
@@ -1055,22 +1135,21 @@ def _build_safe_messages(raw: list) -> list:
                 valid_tool_call_ids.add(tc.get("id", ""))
 
     safe = []
+    _seen_tool_ids: set[str] = set()
     for msg in raw:
         if msg.type == "ai":
-            if getattr(msg, "tool_calls", None):
-                # Flatten — keep content only, drop the tool_calls
-                content = str(msg.content) if msg.content else ""
-                safe.append(AIMessage(content=content))
-            elif not str(msg.content).strip():
-                # Empty AI message (e.g. triage silencer) — skip entirely
+            if not str(msg.content).strip() and not getattr(msg, "tool_calls", None):
+                # Empty AI message with no tool_calls — drop (triage silencer etc.)
                 continue
-            else:
-                safe.append(msg)
+            safe.append(msg)   # keep tool_calls intact — required by DeepSeek + Groq
         elif msg.type == "tool":
-            # Only include if there was a matching tool_call AIMessage
             tid = getattr(msg, "tool_call_id", None)
             if tid and tid in valid_tool_call_ids:
-                safe.append(msg)
+                if tid in _seen_tool_ids:
+                    print(f"✂️  [SafeMsg] Dropped duplicate ToolMessage tool_call_id={tid}")
+                else:
+                    _seen_tool_ids.add(tid)
+                    safe.append(msg)
             else:
                 print(f"✂️  [SafeMsg] Dropped orphaned ToolMessage tool_call_id={tid}")
         else:
@@ -1096,13 +1175,34 @@ def _last_human_text(messages: list) -> str:
 
 
 def _invoke_with_retry(llm, msgs: list, retries: int = 2, delay: float = 3.0):
-    last_exc = None
+    """
+    Invoke the LLM with up to `retries` extra attempts.
+
+    Retries on:
+      - Connection / network errors (ReadError, 10054, etc.)
+      - Effectively-empty responses: Qwen3 sometimes returns ONLY a
+        <think>…</think> block with no visible content. After the caller
+        strips that block the response appears blank, which triggers the
+        downstream fallback every time. We detect this here — before
+        returning — so the model gets another chance to give a real answer.
+    """
+    _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+    last_exc  = None
+    last_resp = None
     for attempt in range(1, retries + 2):
         try:
             if attempt > 1:
                 print(f"🔄 [LLM] Retry {attempt}…")
                 time.sleep(delay)
-            return llm.invoke(msgs)
+            resp      = llm.invoke(msgs)
+            last_resp = resp
+            # Check for effective emptiness after stripping think blocks
+            effective = _THINK_RE.sub("", str(resp.content or "")).strip()
+            has_tools = bool(getattr(resp, "tool_calls", None))
+            if not effective and not has_tools:
+                print(f"⚠️  [LLM] Effectively-empty response (attempt {attempt}/{retries + 1}) — retrying")
+                continue
+            return resp
         except Exception as e:
             err = str(e)
             if any(k in err for k in ["ReadError", "10054", "ConnectionError", "RemoteDisconnected", "forcibly closed"]):
@@ -1110,7 +1210,11 @@ def _invoke_with_retry(llm, msgs: list, retries: int = 2, delay: float = 3.0):
                 last_exc = e
             else:
                 raise
-    raise last_exc
+    # All attempts exhausted
+    if last_exc:
+        raise last_exc
+    # All attempts returned empty — return last response; downstream fallback will handle it
+    return last_resp
 
 
 def _validate_tool_calls(response) -> object | None:
@@ -1175,6 +1279,10 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
                 backfill_session_patient_id(ctx.get("session_id", ""), ctx["patient"]["id"])
             else:
                 print(f"   ⚠️  COULD NOT extract patient.id — regex found nothing in: {result_str[:200]}")
+                if "no patient profile found" in result_str.lower():
+                    ctx["patient_lookup_failed"] = True
+                    changed = True
+                    print("   → patient_lookup_failed = True (new patient — registration required)")
         if not ctx["patient"]["name"]:
             m = _PATIENT_NAME_RE.search(result_str)
             if m:
@@ -1219,6 +1327,14 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
             ctx["patient"]["name"] = m.group(1).strip()
             changed = True
             print(f"   → patient.name = '{ctx['patient']['name']}' (from registration)")
+            # Clear complaint hint if it's just the patient's name (not a real complaint).
+            # This happens when patient gives their name during registration and the
+            # auto-hint mistakenly stored it as the chief complaint.
+            hint = ctx.get("initial_complaint_hint", "")
+            if hint and hint.lower().strip() == ctx["patient"]["name"].lower().strip():
+                ctx["initial_complaint_hint"] = None
+                changed = True
+                print(f"   ⚠️  [AutoHint] Cleared hint '{hint}' — matched patient name, not a complaint")
         if not ctx["patient"]["phone"]:
             phone = tool_args.get("phone")
             if phone:
@@ -1311,7 +1427,37 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
 
         print(f"   After extract: doctor.id={ctx['selected_doctor']['id']}  doctor.name='{ctx['selected_doctor']['name']}'")
 
+        # ── Auto-fetch availability for the next working day once doctor is known ─
+        # Programmatic: don't wait for the LLM to call find_provider_availability.
+        # Tries tomorrow first; if the doctor has no slots, walks forward up to 7
+        # days so we always cache a date that has real times to show the patient.
+        doc_id_known = ctx["selected_doctor"]["id"]
+        if doc_id_known and not ctx.get("slots_fetched_for_date"):
+            try:
+                from agents.mcp_tools import find_provider_availability as _fpa
+                found_date = None
+                found_result = None
+                for days_ahead in range(1, 8):   # tomorrow … 7 days out
+                    candidate = (datetime.now(PKT) + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+                    avail_result = _fpa.invoke({"doctor_id": doc_id_known, "date": candidate})
+                    avail_str = str(avail_result)
+                    # Only accept a result that actually contains time slots
+                    if "No available slots" not in avail_str and avail_str.strip():
+                        found_date   = candidate
+                        found_result = avail_str
+                        break
+                if found_date:
+                    ctx["slots_fetched_for_date"] = found_date
+                    ctx["availability_result"]    = found_result
+                    changed = True
+                    print(f"   🗓️  [AutoAvail] Pre-fetched availability for {found_date}: {found_result[:150]}")
+                else:
+                    print(f"   ⚠️  [AutoAvail] Doctor {doc_id_known} has no available slots in the next 7 days")
+            except Exception as e:
+                print(f"   ⚠️  [AutoAvail] Could not pre-fetch availability: {e}")
+
     elif tool_name == "get_patient_history":
+        # ── Process the patient history result and compute required fields ────
         print(f"   result preview: {result_str[:300]}")
         ctx["patient_history_checked"] = True
         if "Patient history found" in result_str:
@@ -1448,10 +1594,20 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
         print(f"   result preview: {result_str[:300]}")
         # Grab the resolved date echoed back in the result
         date_m = _DATE_RE.search(result_str)
-        if date_m and not ctx["pending_slot"]["date"]:
-            ctx["pending_slot"]["date"] = date_m.group(1)
+        fetched_date = None
+        if date_m:
+            fetched_date = date_m.group(1)
+            if not ctx["pending_slot"]["date"]:
+                ctx["pending_slot"]["date"] = fetched_date
+                changed = True
+                print(f"   → pending_slot.date (from availability result) = '{fetched_date}'")
+        # Mark that we've fetched slots for this date — the slot extractor needs
+        # this to know it's safe to default time to 11:00 if patient doesn't pick
+        known_date = fetched_date or tool_args.get("date") or ctx["pending_slot"].get("date")
+        if known_date:
+            ctx["slots_fetched_for_date"] = known_date
             changed = True
-            print(f"   → pending_slot.date (from availability result) = '{date_m.group(1)}'")
+            print(f"   → slots_fetched_for_date = '{known_date}' (slot extractor can now apply 11:00 default)")
 
     elif tool_name == "create_booking":
         print(f"   result preview: {result_str[:300]}")
@@ -1470,8 +1626,25 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
             print(f"   ✅ BOOKING CONFIRMED — date={ctx['appointment']['date']} "
                   f"time={ctx['appointment']['time']} booking_id={ctx['appointment']['booking_id']}")
         else:
+            # Booking failed (slot taken or validation error).
+            # Clear the pending time so _advance_step drops back to collect_slot
+            # and the LLM re-asks the patient to pick from current free slots.
             print(f"   ⚠️  create_booking did NOT return 'Appointment confirmed'")
             print(f"       Full result: {result_str}")
+            ctx["pending_slot"]["time"] = None
+            # Re-fetch availability so the directive immediately shows fresh slots
+            try:
+                from agents.mcp_tools import find_provider_availability as _fpa
+                pending_date = ctx["pending_slot"].get("date")
+                doc_id       = ctx["selected_doctor"]["id"]
+                if pending_date and doc_id:
+                    refreshed = _fpa.invoke({"doctor_id": doc_id, "date": pending_date})
+                    ctx["availability_result"]  = str(refreshed)
+                    ctx["slots_fetched_for_date"] = pending_date
+                    print(f"   🔄 [BookingRetry] Refreshed availability: {str(refreshed)[:120]}")
+            except Exception as _e:
+                print(f"   ⚠️  [BookingRetry] Could not refresh availability: {_e}")
+            changed = True
 
     if changed:
         _advance_step(ctx)
@@ -1510,6 +1683,21 @@ def tool_executor_node(state: ConversationState) -> dict:
         return {"messages": [], "booking_context": ctx}
 
     tool_calls = last_msg.tool_calls
+    # ── Deduplicate tool calls ────────────────────────────────────────────────
+    # The LLM sometimes emits the same tool name+args twice. Each creates a
+    # separate ToolMessage. If two ToolMessages share the same name and the
+    # second has no distinct matching tool_call_id, Groq rejects the next
+    # request with "tool message must follow a message with tool_calls".
+    _seen_signatures: set[str] = set()
+    _deduped_calls: list = []
+    for _tc in tool_calls:
+        _sig = f"{_tc.get('name','')}::{sorted(_tc.get('args',{}).items())}"
+        if _sig not in _seen_signatures:
+            _seen_signatures.add(_sig)
+            _deduped_calls.append(_tc)
+        else:
+            print(f"   ⚠️  [ToolExec] Duplicate call '{_tc.get('name')}' removed — would create orphaned ToolMessage")
+    tool_calls = _deduped_calls
     print(f"   Calls to run: {[tc['name'] for tc in tool_calls]}")
 
     tool_messages: list[ToolMessage] = []
@@ -1600,15 +1788,18 @@ def tool_executor_node(state: ConversationState) -> dict:
             is_yes     = bool(_YES_RE.search(last_human))
             step       = ctx.get("step", "")
 
-            # ── AUTO-HYDRATE slot from tool args ──────────────────────────────
+            # ── SYNC pending_slot with what LLM put in tool args ─────────────
+            # IMPORTANT: always update (not just when empty).
+            # Without this, if patient picks 09:00 after a stale 11:00 default,
+            # the slot stays at 11:00 and the supervisor shows the wrong summary.
             args_date = str(tool_args.get("date", "")).strip()
             args_time = str(tool_args.get("time", "")).strip()
-            if args_date and not ctx["pending_slot"]["date"]:
+            if args_date and args_date != ctx["pending_slot"].get("date"):
                 ctx["pending_slot"]["date"] = args_date
-                print(f"   💉 [BookingGate] Auto-set slot.date={args_date} from tool args")
-            if args_time and not ctx["pending_slot"]["time"]:
+                print(f"   💉 [BookingGate] Synced slot.date={args_date} from tool args")
+            if args_time and args_time != ctx["pending_slot"].get("time"):
                 ctx["pending_slot"]["time"] = args_time
-                print(f"   💉 [BookingGate] Auto-set slot.time={args_time} from tool args")
+                print(f"   💉 [BookingGate] Synced slot.time={args_time} from tool args (was {ctx['pending_slot'].get('time')})")
             if ctx["pending_slot"]["date"] and ctx["pending_slot"]["time"]:
                 _advance_step(ctx)
                 save_booking_context(session_id, ctx)
@@ -1706,6 +1897,23 @@ def tool_executor_node(state: ConversationState) -> dict:
 # PENDING SLOT EXTRACTOR  (LLM-based — no regex)
 # ═══════════════════════════════════════════════════════════════════
 
+def _parse_first_available_slot(avail_str: str) -> str | None:
+    """
+    Extract the first available time from a find_provider_availability result string.
+    Handles formats like 'Slot: 09:00', 'Morning (06:00-11:59): 09:00, 09:30'
+    Returns HH:MM string or None.
+    """
+    if not avail_str:
+        return None
+    # Match any HH:MM pattern that comes after "Slot:", "Morning", "Afternoon" etc.
+    m = re.search(r"(?:Slot:|(?:Morning|Afternoon|Evening)\s*[^:]*:)\s*(\d{1,2}:\d{2})", avail_str)
+    if m:
+        return m.group(1)
+    # Fallback: grab first HH:MM anywhere in the string
+    m = re.search(r"\b(\d{1,2}:\d{2})\b", avail_str)
+    return m.group(1) if m else None
+
+
 def _try_extract_pending_slot_inline(messages: list, ctx: dict) -> None:
     """
     LLM-based slot extraction.
@@ -1724,6 +1932,28 @@ def _try_extract_pending_slot_inline(messages: list, ctx: dict) -> None:
     print(f"\n🔍 [SlotExtract] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print(f"🔍 [SlotExtract] last_human   = '{last_human[:120]}'")
     print(f"🔍 [SlotExtract] current slot = date={ctx['pending_slot']['date']}  time={ctx['pending_slot']['time']}")
+
+    # ── Fast path: vague / flexible responses → default to tomorrow 11:00 ───
+    # Patient says "any slot", "any time", "whenever", "first available" etc.
+    # Don't loop asking for a specific day — just book tomorrow morning.
+    _FLEXIBLE_PATTERNS = re.compile(
+        r"^(any\s*(slot|time|day|date|appointment|available)?|"
+        r"whenever|anytime|any\s*day|first\s*available|"
+        r"doesn'?t matter|don'?t care|up to you|your\s*choice|"
+        r"koi\s*bhi|kab\s*bhi|jo\s*bhi|chalega|chale\s*ga|theek\s*hai|"
+        r"ok|okay|sure|fine|yes|yeah|yep|yup|haan|han)\s*[\.\!]*$",
+        re.IGNORECASE,
+    )
+    if last_human and _FLEXIBLE_PATTERNS.match(last_human.strip()):
+        # Use pre-fetched availability date; parse first real slot from availability result
+        default_date = ctx.get("slots_fetched_for_date") or (datetime.now(PKT) + timedelta(days=1)).strftime("%Y-%m-%d")
+        avail_str    = ctx.get("availability_result", "")
+        first_slot   = _parse_first_available_slot(avail_str)
+        ctx["pending_slot"]["date"] = default_date
+        ctx["pending_slot"]["time"] = first_slot or "09:00"
+        print(f"🔍 [SlotExtract] ✅ Vague response — using first available: {default_date} at {ctx['pending_slot']['time']}")
+        print("🔍 [SlotExtract] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+        return
 
     # Build a short context window — last 8 messages is plenty
     recent        = messages[-8:]
@@ -1796,16 +2026,28 @@ Respond with ONLY valid JSON. No explanation, no markdown fences, no extra text.
     print(f"🔍 [SlotExtract] Extracted → date={ext_date}  time={ext_time}")
 
     # ── Default time fallback ─────────────────────────────────────
-    # If no time was found anywhere but we at least have a date,
-    # default to 11:00 AM (clinic standard morning slot).
+    # Only default to 11:00 AFTER find_provider_availability has been called
+    # for this date (ctx["slots_fetched_for_date"] is set).
+    # If we default early the step jumps to await_confirmation before the
+    # patient ever sees actual available slots from the doctor's schedule.
     if not ext_time:
         final_date = ctx["pending_slot"].get("date") or ext_date
-        if final_date:
+        slots_fetched = ctx.get("slots_fetched_for_date")
+        if final_date and slots_fetched and slots_fetched == final_date:
+            # Slots were fetched for this date — safe to default to 11:00
             ext_time = "11:00"
-            print(f"🔍 [SlotExtract] ⚠️  No time found — defaulting to 11:00")
+            print(f"🔍 [SlotExtract] ⚠️  No time found but slots fetched — defaulting to 11:00")
+        elif final_date:
+            # Date known but availability not yet checked — store date only,
+            # leave time null so step stays at collect_slot and the directive
+            # tells the LLM to call find_provider_availability.
+            ctx["pending_slot"]["date"] = final_date
+            print(f"🔍 [SlotExtract] ℹ️  Date={final_date} stored — awaiting find_provider_availability before setting time")
+            print("🔍 [SlotExtract] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+            return
         else:
             print(f"🔍 [SlotExtract] ❌ RESULT: no time and no date — slot NOT set")
-            print(f"🔍 [SlotExtract] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+            print("🔍 [SlotExtract] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
             return
 
     # Prefer the date already in ctx (it came from find_provider_availability),
@@ -1826,9 +2068,25 @@ Respond with ONLY valid JSON. No explanation, no markdown fences, no extra text.
 
 def _try_extract_pending_slot(state: dict, ctx: dict, session_id: str) -> None:
     """Supervisor-side wrapper — saves to disk if the slot was extracted."""
-    print(f"\n📅 [SlotExtract-Wrapper] step={ctx['step']}  slot.time={ctx['pending_slot']['time']}  slot.date={ctx['pending_slot']['date']}")
-    if ctx["step"] != "collect_slot":
-        print(f"📅 [SlotExtract-Wrapper] SKIPPED — step is '{ctx['step']}', not 'collect_slot'")
+    step = ctx["step"]
+    print(f"\n📅 [SlotExtract-Wrapper] step={step}  slot.time={ctx['pending_slot']['time']}  slot.date={ctx['pending_slot']['date']}")
+    if step not in ("collect_slot", "await_confirmation"):
+        print(f"📅 [SlotExtract-Wrapper] SKIPPED — step is '{step}'")
+        return
+    # At await_confirmation: only re-extract if patient is giving a new slot
+    # (i.e. not saying yes/no — those are handled by BookingGate).
+    if step == "await_confirmation":
+        last_human = _last_human_text(list(state.get("messages", [])))
+        if _YES_RE.search(last_human or "") or re.search(r"\bno\b|\bnope\b|\bcancel\b", last_human or "", re.I):
+            print(f"📅 [SlotExtract-Wrapper] SKIPPED — await_confirmation, patient said yes/no (not a slot)")
+            return
+        # Patient gave a new slot — extract and update
+        messages = list(state.get("messages", []))
+        old_time = ctx["pending_slot"]["time"]
+        _try_extract_pending_slot_inline(messages, ctx)
+        if ctx["pending_slot"]["time"] and ctx["pending_slot"]["time"] != old_time:
+            save_booking_context(session_id, ctx)
+            print(f"📅 [SlotExtract-Wrapper] ✅ Slot updated at await_confirmation: {old_time} → {ctx['pending_slot']['time']}")
         return
     if ctx["pending_slot"]["time"]:
         print(f"📅 [SlotExtract-Wrapper] SKIPPED — slot.time already set: '{ctx['pending_slot']['time']}'")
@@ -1950,6 +2208,30 @@ def _try_auto_save_history_field(ctx: dict, msg: str, session_id: str) -> None:
         return
 
     msg_lower = msg_clean.lower()
+
+    # ── SKIP if message looks like a complaint/symptom description ────────────
+    # Defensive: prevents "I have a severe headache" being saved as medications.
+    # We use symptom keywords + first-person phrases. Skip the check for
+    # chronic_conditions (where mentioning a condition like "asthma" or "diabetes"
+    # is the actual expected answer).
+    _SYMPTOM_INDICATORS = (
+        "headache", "head ache", "migraine", "fever", "nausea", "vomit",
+        "dizzy", "dizziness", "pain", "ache", "hurt", "hurting",
+        "i have", "i've had", "i'm having", "i am having", "i feel",
+        "rash", "itch", "swollen", "cough", "sore throat", "burning",
+        "chest pain", "shortness of breath", "trouble breathing", "stuck",
+        "discomfort",
+    )
+    if current_field != "chronic_conditions":
+        if any(ind in msg_lower for ind in _SYMPTOM_INDICATORS):
+            print(f"⚠️  [AutoSave-Hist] Skipping save — message looks like a complaint, not a {current_field} answer: '{msg_clean[:60]}'")
+            # Also remember it as the complaint so triage can pick it up later
+            if not ctx.get("initial_complaint_hint"):
+                ctx["initial_complaint_hint"] = msg_clean
+                save_booking_context(session_id, ctx)
+                print(f"💡 [AutoSave-Hist] Stored as initial_complaint_hint: '{msg_clean[:60]}'")
+            return
+
     # Detect negative answers ("no", "none", "no nothing", "nope", "nah", "nothing")
     NEGATIVE_RE = re.compile(
         r"^(no|none|nope|nah|nothing|n/a|na|null|nil|no nothing|not at all|not really)\b",
@@ -1985,6 +2267,63 @@ def _try_auto_save_history_field(ctx: dict, msg: str, session_id: str) -> None:
         print(f"⚠️  [AutoSave-Hist] Failed: {e}")
 
 
+def _build_fallback_response(ctx: dict) -> str:
+    """
+    Generate a sensible patient-facing response when the LLM returns empty.
+    Based entirely on ctx state — no LLM call. Patient should never see silence.
+    """
+    step = ctx.get("step", "collect_patient_history")
+    p    = ctx.get("patient", {})
+    name = p.get("name", "")
+    first_name = name.split()[0] if name else ""
+
+    if step == "collect_patient_history":
+        remaining = ctx.get("required_history_fields") or []
+        if remaining:
+            field    = remaining[0]
+            question = _QUESTION_FOR_FIELD.get(
+                field, f"Could you tell me about your {field.replace('_', ' ')}?"
+            )
+            prefix = f"Thanks{', ' + first_name if first_name else ''}! " if not ctx.get("history_field_turn_count", {}).get(field) else ""
+            return f"{prefix}{question}"
+        else:
+            hint = ctx.get("initial_complaint_hint")
+            if hint:
+                return f"Thank you for the information. You mentioned '{hint}' — let me start your assessment."
+            return "Thank you! What brings you in today?"
+
+    elif step == "collect_patient":
+        hint = ctx.get("initial_complaint_hint")
+        if hint:
+            return f"I see you came in for {hint}. Let me start your assessment."
+        return "What brings you in today?"
+
+    elif step == "collect_doctor":
+        spec = ctx.get("selected_doctor", {}).get("specialization", "")
+        if spec:
+            return f"Let me find available {spec} doctors for you."
+        return "Let me find a suitable doctor based on your assessment."
+
+    elif step == "collect_slot":
+        d_name = ctx.get("selected_doctor", {}).get("name", "the doctor")
+        avail  = ctx.get("availability_result", "")
+        if avail:
+            return f"Here are the available slots with Dr. {d_name}:\n{avail}\n\nWhich time works for you?"
+        return f"Which day would you like to see Dr. {d_name} — today or tomorrow?"
+
+    elif step == "await_confirmation":
+        s      = ctx.get("pending_slot", {})
+        d_name = ctx.get("selected_doctor", {}).get("name", "the doctor")
+        date   = s.get("date", "")
+        time   = s.get("time", "")
+        return f"To confirm: appointment with Dr. {d_name} on {date} at {time}. Shall I book this? (Yes / No)"
+
+    elif step == "completed":
+        return "Your appointment has been booked. Is there anything else I can help you with?"
+
+    return "I'm here to help. Could you please continue?"
+
+
 def supervisor_node(state: ConversationState) -> dict:
     now          = datetime.now(PKT)
     today_str    = now.strftime("%A, %Y-%m-%d")
@@ -1997,6 +2336,7 @@ def supervisor_node(state: ConversationState) -> dict:
 
     ctx             = state.get("booking_context") or load_booking_context(session_id)
     ctx             = _force_english_for_testing(ctx)
+    _advance_step(ctx)
     raw_messages    = _trim_messages(list(state.get("messages", [])))
     safe_messages   = _build_safe_messages(raw_messages)
     tools_this_turn = _count_tools_since_last_human(list(state.get("messages", [])))
@@ -2028,14 +2368,27 @@ def supervisor_node(state: ConversationState) -> dict:
     if relevant_history:
         print(f"🧠 [Memory] Retrieved relevant past context ({len(relevant_history)} chars)")
 
+    # ── Policy RAG lookup ─────────────────────────────────────────────────────
+    # When the patient asks about hospital policy (fees, cancellation, hours, etc.)
+    # find the relevant policy chunk and inject it. Skipped for tool-call-only turns.
+    policy_context = search_policy(last_user_msg) if last_user_msg else ""
+    if policy_context:
+        print(f"📋 [PolicyRAG] Injecting policy context ({len(policy_context)} chars)")
+
     # ── Programmatic complaint hint capture ───────────────────────────────────
-    # If this is the very first turn (no patient.id yet) and the message looks like
-    # a complaint (not a phone number), store it as initial_complaint_hint so the
-    # LLM never needs to ask "what brings you in today?" again.
+    # Only store if the first message is an actual complaint, not a greeting.
+    # "hi", "hello", "good morning", "hey", "assalam o alaikum" etc. should
+    # never be stored as the chief complaint.
+    _GREETING_RE = re.compile(
+        r"^(hi+|hey+|hello+|helo|salam|assalam|walaikum|good\s*(morning|evening|afternoon|day)|"
+        r"hola|namaste|howdy|greetings?|yo|sup|what'?s\s*up)\s*[\.,!?]*$",
+        re.IGNORECASE,
+    )
     if (not ctx["patient"].get("id")
             and not ctx.get("initial_complaint_hint")
             and last_user_msg
-            and not re.match(r"^[\+\d][\d\s\-]{8,14}$", last_user_msg.strip())):
+            and not re.match(r"^[\+\d][\d\s\-]{8,14}$", last_user_msg.strip())
+            and not _GREETING_RE.match(last_user_msg.strip())):
         ctx["initial_complaint_hint"] = last_user_msg.strip()
         save_booking_context(session_id, ctx)
         print(f"💡 [AutoHint] Stored initial complaint hint: '{last_user_msg[:80]}'")
@@ -2106,6 +2459,8 @@ PATIENT LANGUAGE: {ctx.get("patient_language", "en")}
 
 {f"── MEMORY: RELEVANT PAST CONTEXT (verified before this turn) ──{chr(10)}{relevant_history}" if relevant_history else ""}
 
+{policy_context}
+
 {booking_directive}
 
 ABSOLUTE PROHIBITIONS:
@@ -2171,6 +2526,11 @@ SPECIAL TAGS (output these exact strings when needed):
         start   = response_text.find("[SYMPTOM_LOGGED:") + 16
         end     = response_text.find("]", start)
         symptom = response_text[start:end].strip()
+        # Strip common filler prefixes so MedGemma gets a clean complaint
+        symptom = re.sub(
+            r"^(yes[,\s]+|no[,\s]+|i (am|have|am having|was having|got|feel|have got)\s+a?\s*)",
+            "", symptom, flags=re.IGNORECASE,
+        ).strip()
         extracted_symptom = symptom
         if not ctx.get("prime_complaint"):
             ctx["prime_complaint"] = symptom
@@ -2229,6 +2589,29 @@ SPECIAL TAGS (output these exact strings when needed):
         response = AIMessage(content="")
     elif "[START_TRIAGE]" in response_text and ctx.get("step") == "collect_patient_history":
         print("🚦 [Supervisor] ⛔ START_TRIAGE suppressed — still in collect_patient_history phase")
+        # Defensive: the LLM often adds "describe your symptoms" text that confuses
+        # the patient — they answer with the complaint, which then triggers the
+        # history auto-save to save the complaint as the current field. Replace
+        # the response with the proper field question so we stay on track.
+        remaining = ctx.get("required_history_fields") or []
+        if remaining:
+            current_field = remaining[0]
+            question = _QUESTION_FOR_FIELD.get(
+                current_field,
+                f"Could you tell me about your {current_field.replace('_', ' ')}?"
+            )
+            replacement = f"Thanks. Just a couple more questions to finish your history — {question}"
+            response = AIMessage(content=replacement)
+            print(f"🚦 [Supervisor] Replaced LLM response with proper field question: '{question[:60]}'")
+        else:
+            # No remaining fields but step hasn't advanced yet — accept START_TRIAGE.
+            # Clear the tag and let the entry_router handle the next turn.
+            cleaned = re.sub(r"\[START_TRIAGE\]", "", response_text).strip()
+            cleaned = re.sub(r"\[SYMPTOM_LOGGED:[^\]]*\]", "", cleaned).strip()
+            ctx["step"] = "collect_patient"
+            save_booking_context(session_id, ctx)
+            response = AIMessage(content=cleaned)
+            print(f"🚦 [Supervisor] All fields done — accepted START_TRIAGE, step advanced to collect_patient")
 
     if "[END_CALL]" in response_text:
         booking_done = (
@@ -2275,10 +2658,12 @@ SPECIAL TAGS (output these exact strings when needed):
         print(f"🔄 [Supervisor] Transfer message ({lang}): {transfer_msg}")
         response = AIMessage(content=transfer_msg)
 
-    if not str(response.content).strip() and not triage_active:
-        print("⚠️  [Supervisor] EMPTY response returned and triage not active — this is the silent-AI bug.")
-        print(f"   response_text was: {repr(response_text[:300])}")
-        print(f"   step={ctx.get('step')}  triage_active={triage_active}  interaction_completed={interaction_completed}")
+    if (not str(response.content).strip()
+            and not triage_active
+            and not getattr(response, "tool_calls", None)):
+        print("⚠️  [Supervisor] EMPTY response with no tool calls — generating contextual fallback")
+        print(f"   step={ctx.get('step')}")
+        response = AIMessage(content=_build_fallback_response(ctx))
 
     # ── Chat memory: persist assistant response ───────────────────────────────
     assistant_text = str(response.content).strip()
@@ -2301,17 +2686,22 @@ SPECIAL TAGS (output these exact strings when needed):
 def entry_router(state):
     ctx = state.get("booking_context", {})
 
-    # Run diagnostics ONCE — only AFTER booking is confirmed.
-    # Previously this fired on triage_completed which broke the booking flow:
-    # after triage the user still needs to pick a doctor + slot. Routing to
-    # diagnostic_node before that means the supervisor never gets a chance to
-    # handle "any slot" / date / time messages — they go to SOAP instead.
     appt_confirmed = (ctx.get("appointment") or {}).get("confirmed")
+
+    # 1. SOAP note — fires once after booking confirmed
     if appt_confirmed and not ctx.get("diagnostic_report"):
         print("🔀 [EntryRouter] booking confirmed + no report → diagnostic_node")
         return "diagnostic_node"
 
-    if ctx.get("triage_active") or ctx.get("step") == "collect_patient":
+    # 2. LLM Judge — fires after SOAP, only when USE_LLM_JUDGE=true
+    if (_USE_LLM_JUDGE
+            and appt_confirmed
+            and ctx.get("diagnostic_report")
+            and not ctx.get("judge_report")):
+        print("🔀 [EntryRouter] SOAP done → judge_node")
+        return "judge_node"
+
+    if ctx.get("triage_active"):
         return "triage_node"
 
     return "supervisor_node"
@@ -2368,6 +2758,16 @@ builder.add_node("supervisor_node", supervisor_node)
 builder.add_node("tool_executor",   tool_executor_node)
 builder.add_node("triage_node",     triage_node)
 builder.add_node("diagnostic_node", diagnostic_node)
+
+# Judge node — only active when USE_LLM_JUDGE=true, runs after diagnostic
+if _USE_LLM_JUDGE:
+    try:
+        from agents.judge_agent import judge_node
+        builder.add_node("judge_node", judge_node)
+        builder.add_edge("judge_node", END)
+        print("🔧 [Graph] judge_node added to graph")
+    except ImportError:
+        print("⚠️  [Graph] judge_agent not found — judge_node skipped")
 
 builder.add_conditional_edges(START,             entry_router)
 builder.add_conditional_edges("supervisor_node", supervisor_router)

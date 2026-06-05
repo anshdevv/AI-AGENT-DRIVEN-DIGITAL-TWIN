@@ -257,12 +257,43 @@ def lookup(patient_symptoms: list[str], top_n: int = 3) -> SymptomMatch:
     """
     _ensure_loaded()
 
-    # Normalise patient symptoms
+    # ── Stop-word filter ─────────────────────────────────────────────────────
+    # These words appear in normal speech but have no diagnostic value.
+    # Keeping them inflates patient_tokens, lowers scores for real symptoms,
+    # and causes random SYNAPSE rows to match via filler words.
+    _STOP = frozenset({
+        # Pronouns / auxiliary verbs / articles
+        "i", "am", "have", "having", "had", "has", "a", "an", "the", "be",
+        "been", "is", "are", "was", "were", "do", "did", "does",
+        # Personal pronouns
+        "my", "me", "im", "ive", "its",
+        # Conjunctions / prepositions
+        "some", "also", "and", "or", "but", "with", "for", "on", "at",
+        "in", "it", "this", "that", "of", "to", "by", "from", "about",
+        # Degree adverbs
+        "very", "really", "quite", "little", "bit", "just", "so",
+        # Action words that add no clinical meaning
+        "feel", "feeling", "getting", "got", "keep", "experiencing",
+        "suffering", "noticed", "experiencing",
+        # Common short answers from triage Q&A (these pollute _complete_triage token set)
+        "no", "yes", "not", "none", "nothing", "nope", "yeah",
+        "okay", "ok", "sure", "please", "thank", "thanks",
+    })
+
+    # Normalise patient symptoms, stripping stop words from individual tokens
     patient_tokens: set[str] = set()
     for s in patient_symptoms:
-        patient_tokens.add(_tok(s))
-        for word in _tok(s).split():
-            patient_tokens.add(word)
+        full_tok = _tok(s)
+        if full_tok and full_tok not in _STOP:
+            patient_tokens.add(full_tok)
+        for word in full_tok.split():
+            if word and word not in _STOP:
+                patient_tokens.add(word)
+
+    if not patient_tokens:
+        # All tokens were stop words — fall back to raw (shouldn't normally happen)
+        for s in patient_symptoms:
+            patient_tokens.add(_tok(s))
 
     # ── SAFETY: Check urgent overrides BEFORE dataset scoring ────────────────
     forced_specialist: str | None = None
@@ -272,7 +303,12 @@ def lookup(patient_symptoms: list[str], top_n: int = 3) -> SymptomMatch:
             print(f"🚨 [SymptomLookup] Urgent override → {specialist} (trigger={trigger_tokens})")
             break
 
-    # Score each disease
+    # ── Score each disease ────────────────────────────────────────────────────
+    # Score = matched / disease_symptom_count (how much of this disease's
+    # profile does the patient cover?). Previously we divided by patient_tokens
+    # which was polluted by stop words. Dividing by the disease's own symptom
+    # count is more stable and directly measures "does this complaint fit the
+    # disease profile?"
     scored: list[tuple[float, str, list[str]]] = []
     for disease, disease_symptoms in _disease_symptom_map.items():
         if not disease_symptoms:
@@ -280,7 +316,7 @@ def lookup(patient_symptoms: list[str], top_n: int = 3) -> SymptomMatch:
         matched = patient_tokens & disease_symptoms
         if not matched:
             continue
-        score = len(matched) / max(len(patient_tokens), 1)
+        score = len(matched) / len(disease_symptoms)
         scored.append((score, disease, sorted(matched)))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -298,16 +334,39 @@ def lookup(patient_symptoms: list[str], top_n: int = 3) -> SymptomMatch:
             specialist=specialist,
         ))
 
-    # Severity from SYNAPSE — find best-matching row
+    # ── Severity from SYNAPSE ─────────────────────────────────────────────────
+    # Use ROW COVERAGE RATIO: how much of a SYNAPSE row's expected symptom set
+    # does this patient cover?
+    #
+    # Old bug: raw overlap count → "fever" matched a Severe row containing
+    # {fever, chest_pain, breathlessness, confusion} with overlap=1 and won
+    # because nothing scored higher. Patient got Severe for a simple fever.
+    #
+    # Fix: a Severe row with 5 symptoms where patient only has 1 → coverage 0.2.
+    # A Moderate row with 2 symptoms where patient has 1 → coverage 0.5 → wins.
+    # Minimum threshold of 0.35: if no row is ≥35% covered, return "Unknown"
+    # so the question limit stays generous rather than prematurely capping.
     severity = "Unknown"
     recommendation = "Doctor Consultation"
-    best_synapse_overlap = 0
+    best_coverage = 0.0
+    _MIN_COVERAGE = 0.35   # patient must match at least 35% of a SYNAPSE row
+
     for row in _synapse_rows:
-        overlap = len(patient_tokens & row["symptoms"])
-        if overlap > best_synapse_overlap:
-            best_synapse_overlap = overlap
+        row_syms = row["symptoms"]
+        if not row_syms:
+            continue
+        overlap = len(patient_tokens & row_syms)
+        if not overlap:
+            continue
+        coverage = overlap / len(row_syms)
+        if coverage > best_coverage:
+            best_coverage = coverage
             severity = row["severity"]
             recommendation = row["recommendation"]
+
+    if best_coverage < _MIN_COVERAGE:
+        severity = "Unknown"   # not enough symptom coverage to assign a severity
+        recommendation = "Doctor Consultation"
 
     # Urgent override takes priority; otherwise use dataset top match
     suggested_specialist = (
@@ -318,7 +377,7 @@ def lookup(patient_symptoms: list[str], top_n: int = 3) -> SymptomMatch:
     print(
         f"🔍 [SymptomLookup] patient_tokens={sorted(patient_tokens)} "
         f"→ top={[(m.disease, m.score) for m in matches]} "
-        f"severity={severity}  specialist={suggested_specialist}"
+        f"severity={severity} (best_coverage={best_coverage:.2f})  specialist={suggested_specialist}"
     )
 
     return SymptomMatch(

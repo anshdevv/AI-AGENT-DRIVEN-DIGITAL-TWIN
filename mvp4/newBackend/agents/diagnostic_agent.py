@@ -222,6 +222,33 @@ CLINICAL SUMMARY FROM TRIAGE:
 
 # ── Fallback deterministic SOAP note ─────────────────────────────────────────
 
+def _clean_dataset_match(raw: str) -> str:
+    """
+    Strip the raw 'Top candidate conditions' block from the symptom lookup output.
+    Keep only the clinically useful summary lines (severity, recommendation, specialist).
+    The raw conditions list has too many false positives at low scores (50% on a single
+    symptom match) and makes the SOAP note look noisy and unprofessional.
+    """
+    if not raw:
+        return "Not recorded"
+    lines = raw.splitlines()
+    clean = []
+    skip  = False
+    for line in lines:
+        stripped = line.strip()
+        # Start skipping at the conditions block
+        if re.search(r"top candidate conditions|matched symptoms|precautions", stripped, re.I):
+            skip = True
+        if skip:
+            continue
+        # Drop the divider line and SYMPTOM LOOKUP header
+        if re.match(r"──+", stripped) or "SYMPTOM LOOKUP CONTEXT" in stripped:
+            continue
+        if stripped:
+            clean.append(stripped)
+    return "\n  ".join(clean) if clean else "Not recorded"
+
+
 def _build_fallback_report(
     date: str,
     doctor_name: str,
@@ -342,6 +369,7 @@ def diagnostic_node(state: dict) -> dict:
     precautions    = profile.get("precautions") or "Discuss with attending physician."
     date_str       = datetime.now(PKT).strftime("%Y-%m-%d %H:%M PKT")
     dataset_match  = ctx.get("final_symptom_match") or "Not recorded"
+    dataset_match  = _clean_dataset_match(dataset_match)   # strip noisy conditions block
 
     # Booking status line
     if appt.get("confirmed") and booking_id:
@@ -500,4 +528,291 @@ def diagnostic_node(state: dict) -> dict:
             print(f"❌ [Diagnostic] Could not update session JSON: {e}")
 
     print(f"\n📄 [SOAP Report]:\n{report}")
+
+    # ── Save as styled HTML ───────────────────────────────────────
+    # Parse the medgemma_qa_pairs for the HTML table
+    _qa_for_html = medgemma_qa_pairs[:6]   # cap at 6 for display
+    _conditions  = []
+    if dataset_match:
+        for _line in dataset_match.split("\n"):
+            _m = re.search(r"(\w[\w ]+)\s+\(score\s+(\d+%?)\)", _line)
+            if _m:
+                _pre = re.search(r"Precautions\s*:\s*(.+)", _line)
+                _conditions.append({
+                    "name":       _m.group(1).strip(),
+                    "score":      _m.group(2),
+                    "symptoms":   "headache" if "headache" in report.lower() else symptom,
+                    "precautions": _pre.group(1).strip() if _pre else "Discuss with physician.",
+                })
+    # Extract HPI from report text
+    _hpi = ""
+    _hpi_m = re.search(r"History of Present Illness.*?:\s*(.+?)(?:\n|$)", report, re.IGNORECASE)
+    if _hpi_m:
+        _hpi = _hpi_m.group(1).strip()
+    if not _hpi:
+        _hpi = f"Patient reports {symptom}. Duration and progression as noted in triage Q&A."
+    _clinical_m = re.search(r"Clinical Impression.*?:\s*(.+?)(?:\n|$)", report, re.IGNORECASE)
+    _clinical_impression = _clinical_m.group(1).strip() if _clinical_m else "Refer to SOAP note text above."
+
+    _soap_html_path = _save_soap_html(
+        session_id     = ctx.get("session_id", ""),
+        booking_id     = str(booking_id or ""),
+        patient_name   = patient_name,
+        date_str       = date_str,
+        doctor_name    = doctor_name,
+        specialization = specialization,
+        patient_phone  = patient_phone,
+        symptom        = symptom,
+        hpi            = _hpi,
+        qa_pairs       = _qa_for_html,
+        severity       = severity,
+        dataset_match  = dataset_match,
+        conditions     = _conditions,
+        clinical_impression = _clinical_impression,
+        routing_reason = routing_reason,
+        specialist     = specialist,
+        booking_date   = booking_status.replace("Booking ID:", "").strip() if booking_status else "",
+        precautions    = precautions,
+    )
+    if _soap_html_path and session_id:
+        try:
+            safe_id   = re.sub(r"[^a-zA-Z0-9_\-]", "_", session_id)
+            json_path = BOOKING_CTX_DIR / f"{safe_id}.json"
+            if json_path.exists():
+                _jdata = json.loads(json_path.read_text(encoding="utf-8"))
+                _jdata["soap_html_path"] = _soap_html_path
+                json_path.write_text(json.dumps(_jdata, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
     return {"final_diagnostic_report": report}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML SOAP NOTE GENERATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SOAP_HTML_DIR = Path("soap_notes")
+
+def _build_soap_html(
+    date_str: str, doctor_name: str, specialization: str,
+    patient_name: str, patient_phone: str, symptom: str,
+    hpi: str, qa_pairs: list[tuple[str,str]],
+    severity: str, dataset_match: str, conditions: list[dict],
+    clinical_impression: str, routing_reason: str,
+    specialist: str, booking_id: str, booking_date: str,
+    precautions: str,
+) -> str:
+    """Generate a fully styled HTML SOAP note from structured data."""
+
+    qa_rows = ""
+    for i, (q, a) in enumerate(qa_pairs, 1):
+        q_clean = q.replace("<", "&lt;").replace(">", "&gt;")
+        a_clean = a.replace("<", "&lt;").replace(">", "&gt;")
+        qa_rows += f"""
+        <div class="qa-row">
+          <div class="qa-cell"><span class="qnum">Q{i}:</span> {q_clean}</div>
+          <div class="qa-cell"><span class="anum">A{i}:</span> {a_clean}</div>
+        </div>"""
+
+    cond_rows = ""
+    for i, c in enumerate(conditions[:3], 1):
+        cond_rows += f"""
+        <div class="condition">
+          <div class="num">{i}</div>
+          <div>
+            <div class="condition-title">{c.get('name','')} <span class="muted">({c.get('score','')})</span></div>
+            <div>Matched symptoms: {c.get('symptoms','')}</div>
+            <div><strong class="label-strong">Precautions:</strong> {c.get('precautions','')}</div>
+          </div>
+        </div>"""
+
+    booking_badge = (
+        f'<span class="booking-badge">✅ CONFIRMED</span> Booking ID {booking_id}<br>'
+        f'<span class="muted">{booking_date}</span>'
+        if booking_id else "Not yet booked"
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Pre-Consultation SOAP Note — {patient_name}</title>
+  <style>
+    :root{{--navy:#0b2f5b;--navy-2:#123f75;--teal:#087d80;--teal-soft:#e8f7f6;--blue-soft:#eef6ff;--gray-50:#f7fafc;--gray-100:#eef2f6;--gray-200:#d9e2ec;--gray-500:#66788a;--text:#182433;--muted:#596b7c;--white:#ffffff;--shadow:0 18px 45px rgba(11,47,91,0.10);--radius:22px}}
+    *{{box-sizing:border-box}}
+    body{{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;background:linear-gradient(135deg,#f4f8fb 0%,#eef7f7 100%);color:var(--text);line-height:1.55}}
+    .page{{width:min(1180px,calc(100% - 32px));margin:32px auto;background:rgba(255,255,255,0.94);border:1px solid rgba(217,226,236,0.85);border-radius:30px;box-shadow:var(--shadow);overflow:hidden}}
+    .topbar{{background:linear-gradient(135deg,var(--navy) 0%,var(--teal) 100%);color:white;padding:28px 34px;display:flex;align-items:center;justify-content:space-between;gap:24px}}
+    .brand{{display:flex;gap:18px;align-items:center}}
+    .logo{{width:68px;height:68px;border-radius:20px;background:rgba(255,255,255,0.16);display:grid;place-items:center;font-size:34px;border:1px solid rgba(255,255,255,0.28)}}
+    .title-block h1{{margin:0;font-size:clamp(28px,4vw,44px);line-height:1.02;letter-spacing:-0.04em;font-weight:850}}
+    .title-block p{{margin:8px 0 0;color:rgba(255,255,255,0.82);font-size:15px}}
+    .status-pill{{display:inline-flex;align-items:center;gap:8px;background:rgba(255,255,255,0.14);border:1px solid rgba(255,255,255,0.24);border-radius:999px;padding:10px 16px;font-weight:750;white-space:nowrap}}
+    .content{{padding:30px 34px 36px}}
+    .meta-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:22px}}
+    .meta-card{{background:var(--white);border:1px solid var(--gray-200);border-radius:18px;padding:18px;min-height:110px;box-shadow:0 8px 18px rgba(11,47,91,0.04)}}
+    .meta-label{{display:flex;gap:8px;align-items:center;color:var(--teal);font-size:12px;font-weight:850;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:8px}}
+    .meta-value{{font-size:18px;font-weight:750;color:var(--navy)}}
+    .meta-subvalue{{margin-top:3px;color:var(--muted);font-size:14px}}
+    .section{{background:var(--white);border:1px solid var(--gray-200);border-radius:var(--radius);margin-top:18px;overflow:hidden;box-shadow:0 10px 26px rgba(11,47,91,0.05)}}
+    .section-header{{display:flex;align-items:center;gap:14px;padding:18px 22px;border-bottom:1px solid var(--gray-200);background:linear-gradient(90deg,#ffffff 0%,#f7fbfd 100%)}}
+    .letter{{width:48px;height:48px;border-radius:15px;display:grid;place-items:center;color:white;font-size:26px;font-weight:900;box-shadow:0 10px 20px rgba(8,125,128,0.18)}}
+    .letter.teal{{background:var(--teal)}}.letter.navy{{background:var(--navy)}}
+    .section-header h2{{margin:0;font-size:24px;color:var(--navy);letter-spacing:-0.02em}}
+    .section-body{{padding:22px}}
+    .two-col{{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start}}
+    .field-list{{display:grid;gap:16px}}
+    .field{{display:grid;grid-template-columns:28px 1fr;gap:10px;align-items:start}}
+    .dot{{width:9px;height:9px;background:var(--teal);border-radius:999px;margin-top:9px;justify-self:center}}
+    .field strong,.label-strong{{color:var(--teal);font-weight:850}}
+    .qa-table{{border:1px solid #c8dde2;border-radius:18px;overflow:hidden;background:#fbfefe}}
+    .qa-title{{background:var(--teal-soft);color:var(--teal);font-weight:850;padding:12px 16px;border-bottom:1px solid #c8dde2}}
+    .qa-row{{display:grid;grid-template-columns:1.2fr 0.8fr;border-bottom:1px solid #e2edf0}}
+    .qa-row:last-child{{border-bottom:0}}
+    .qa-cell{{padding:12px 16px;font-size:14px}}
+    .qa-cell+.qa-cell{{border-left:1px solid #e2edf0;background:#ffffff}}
+    .qnum,.anum{{color:var(--teal);font-weight:900;margin-right:6px}}
+    .objective-grid{{display:grid;grid-template-columns:0.78fr 1.22fr;gap:20px;align-items:start}}
+    .icon-list{{display:grid;gap:18px}}
+    .icon-field{{display:grid;grid-template-columns:46px 1fr;gap:12px;align-items:center}}
+    .mini-icon{{width:46px;height:46px;border-radius:16px;background:var(--blue-soft);display:grid;place-items:center;color:var(--navy);font-size:22px}}
+    .inset-card{{border:1px solid #b9d0ef;border-radius:18px;overflow:hidden;background:#fbfdff}}
+    .inset-head{{background:var(--navy-2);color:white;padding:13px 16px;font-weight:850;display:flex;align-items:center;gap:10px}}
+    .match-summary{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:16px;background:#f8fbff;border-bottom:1px solid #d6e5f7}}
+    .metric{{border-right:1px solid #d6e5f7;padding-right:10px}}
+    .metric:last-child{{border-right:0}}
+    .metric span{{display:block;color:var(--muted);font-size:12px;font-weight:700}}
+    .metric b{{color:var(--teal);font-size:16px}}
+    .conditions{{padding:16px}}
+    .conditions h3{{margin:0 0 12px;color:var(--navy);font-size:16px}}
+    .condition{{display:grid;grid-template-columns:30px 1fr;gap:10px;padding:11px 0;border-bottom:1px dashed #d8e5f2}}
+    .condition:last-child{{border-bottom:0}}
+    .num{{width:28px;height:28px;border-radius:999px;background:var(--navy);color:white;display:grid;place-items:center;font-weight:850;font-size:13px}}
+    .condition-title{{font-weight:850;color:var(--navy)}}
+    .muted{{color:var(--muted)}}
+    .assessment-plan-grid{{display:grid;grid-template-columns:1fr 0.9fr;gap:20px;align-items:start}}
+    .next-steps{{background:linear-gradient(135deg,#f3f8ff 0%,#edf7fb 100%);border:1px solid #cbdff3;border-radius:18px;padding:18px}}
+    .next-steps h3{{margin:0 0 12px;color:var(--navy);font-size:18px}}
+    .step{{display:grid;grid-template-columns:28px 1fr;gap:10px;margin:12px 0}}
+    .step-number{{width:28px;height:28px;border-radius:999px;background:var(--navy);color:white;display:grid;place-items:center;font-size:13px;font-weight:900}}
+    .booking-badge{{display:inline-flex;align-items:center;gap:8px;background:#ecfbf5;color:#08724f;border:1px solid #bcebd8;border-radius:999px;padding:6px 11px;font-weight:850;margin-left:4px}}
+    .footer-strip{{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:18px}}
+    .footer-card{{background:white;border:1px solid var(--gray-200);border-radius:18px;padding:18px;display:grid;grid-template-columns:46px 1fr;gap:12px;align-items:center}}
+    .actions{{display:flex;justify-content:flex-end;gap:12px;margin-top:24px}}
+    button{{border:0;border-radius:999px;padding:12px 18px;font-weight:850;cursor:pointer;color:white;background:linear-gradient(135deg,var(--navy) 0%,var(--teal) 100%);box-shadow:0 10px 22px rgba(8,125,128,0.18)}}
+    @media(max-width:900px){{.two-col,.objective-grid,.assessment-plan-grid,.footer-strip{{grid-template-columns:1fr}}.meta-grid{{grid-template-columns:repeat(2,1fr)}}}}
+    @media print{{body{{background:white}}.page{{width:100%;margin:0;border:0;box-shadow:none;border-radius:0}}.actions{{display:none}}.topbar{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}}}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">📋</div>
+        <div class="title-block">
+          <h1>Pre-Consultation SOAP Note</h1>
+          <p>Clinical pre-screening summary prepared before physician consultation</p>
+        </div>
+      </div>
+      <div class="status-pill">✅ Booking Confirmed</div>
+    </header>
+    <section class="content">
+      <div class="meta-grid">
+        <article class="meta-card"><div class="meta-label">📅 Date</div><div class="meta-value">{date_str[:10]}</div><div class="meta-subvalue">{date_str[11:16]} PKT</div></article>
+        <article class="meta-card"><div class="meta-label">🩺 Physician</div><div class="meta-value">{doctor_name}</div><div class="meta-subvalue">Attending physician</div></article>
+        <article class="meta-card"><div class="meta-label">🏥 Specialty</div><div class="meta-value">{specialization}</div><div class="meta-subvalue">Recommended route</div></article>
+        <article class="meta-card"><div class="meta-label">👤 Patient</div><div class="meta-value">{patient_name}</div><div class="meta-subvalue">Phone: {patient_phone}</div></article>
+      </div>
+      <section class="section">
+        <div class="section-header"><div class="letter teal">S</div><h2>S — Subjective</h2></div>
+        <div class="section-body two-col">
+          <div class="field-list">
+            <div class="field"><div class="dot"></div><div><strong>Chief Complaint:</strong> {symptom}</div></div>
+            <div class="field"><div class="dot"></div><div><strong>History of Present Illness (HPI):</strong> {hpi}</div></div>
+            <div class="field"><div class="dot"></div><div><strong>Past Medical / Surgical History:</strong> Not provided</div></div>
+          </div>
+          <aside class="qa-table">
+            <div class="qa-title">Triage Q&amp;A (clinical pre-screening)</div>
+            {qa_rows}
+          </aside>
+        </div>
+      </section>
+      <section class="section">
+        <div class="section-header"><div class="letter navy">O</div><h2>O — Objective</h2></div>
+        <div class="section-body objective-grid">
+          <div class="icon-list">
+            <div class="icon-field"><div class="mini-icon">♡</div><div><span class="label-strong">Vital Signs:</span> Not recorded (pre-consultation triage only)</div></div>
+            <div class="icon-field"><div class="mini-icon">📝</div><div><span class="label-strong">Physical Exam:</span> Deferred — to be completed by attending physician</div></div>
+            <div class="icon-field"><div class="mini-icon">📊</div><div><span class="label-strong">Symptom Severity:</span> {severity}</div></div>
+          </div>
+          <aside class="inset-card">
+            <div class="inset-head">🎯 Symptom Match</div>
+            <div class="match-summary">
+              <div class="metric"><span>Severity estimate</span><b>{severity}</b></div>
+              <div class="metric"><span>Recommendation</span><b>Physician review</b></div>
+              <div class="metric"><span>Suggested specialist</span><b>{specialist}</b></div>
+            </div>
+            <div class="conditions"><h3>Top candidate conditions</h3>{cond_rows}</div>
+          </aside>
+        </div>
+      </section>
+      <section class="section">
+        <div class="section-header"><div class="letter teal">A</div><h2>A — Assessment</h2></div>
+        <div class="section-body">
+          <div class="field-list">
+            <div class="field"><div class="dot"></div><div><strong>Clinical Impression:</strong> {clinical_impression}</div></div>
+            <div class="field"><div class="dot"></div><div><strong>Routing Rationale:</strong> {routing_reason}</div></div>
+          </div>
+        </div>
+      </section>
+      <section class="section">
+        <div class="section-header"><div class="letter navy">P</div><h2>P — Plan</h2></div>
+        <div class="section-body assessment-plan-grid">
+          <div class="field-list">
+            <div class="field"><div class="dot"></div><div><strong>Recommended Specialist:</strong> {specialist}</div></div>
+            <div class="field"><div class="dot"></div><div><strong>Booking Status:</strong> {booking_badge}</div></div>
+            <div class="field"><div class="dot"></div><div><strong>Precautions / Red Flags to Discuss:</strong> {precautions}</div></div>
+          </div>
+          <aside class="next-steps">
+            <h3>Next Steps</h3>
+            <div class="step"><div class="step-number">1</div><div>Attending physician to perform full history and physical examination.</div></div>
+            <div class="step"><div class="step-number">2</div><div>Order investigations as clinically indicated.</div></div>
+            <div class="step"><div class="step-number">3</div><div>Review and update this note after consultation.</div></div>
+          </aside>
+        </div>
+      </section>
+      <div class="footer-strip">
+        <div class="footer-card"><div class="mini-icon">⚠️</div><div><strong class="label-strong">PRECAUTIONS:</strong> {precautions}</div></div>
+        <div class="footer-card"><div class="mini-icon">📄</div><div><strong class="label-strong">CLINICAL SUMMARY FROM TRIAGE:</strong><br>See triage Q&amp;A above.</div></div>
+      </div>
+      <div class="actions"><button onclick="window.print()">Print / Save as PDF</button></div>
+    </section>
+  </main>
+</body>
+</html>"""
+
+
+def _save_soap_html(
+    session_id: str, booking_id: str, patient_name: str,
+    **kwargs
+) -> str | None:
+    """Save the HTML SOAP note to soap_notes/ and return the file path."""
+    try:
+        _SOAP_HTML_DIR.mkdir(exist_ok=True)
+        safe_name  = re.sub(r"[^a-zA-Z0-9]", "_", patient_name or "patient")
+        safe_bid   = re.sub(r"[^a-zA-Z0-9]", "_", str(booking_id or session_id[:8]))
+        filename   = f"SOAP_{safe_bid}_{safe_name}.html"
+        path       = _SOAP_HTML_DIR / filename
+        html       = _build_soap_html(
+            patient_name=patient_name,
+            booking_id=booking_id,
+            **kwargs,
+        )
+        path.write_text(html, encoding="utf-8")
+        print(f"🌐 [Diagnostic] HTML SOAP note saved → {path}")
+        return str(path)
+    except Exception as e:
+        print(f"❌ [Diagnostic] HTML save failed: {e}")
+        return None

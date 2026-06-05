@@ -36,9 +36,8 @@ what step you are on and what to do next. Follow it precisely.
 - NEVER call a tool with placeholder or null values.
 - NEVER call lookup_customer_profile if patient.id is already set.
 - NEVER call get_doctor_schedule — use find_provider_availability for slots.
-- NEVER call create_booking yourself — it is handled automatically by code
-  after the patient confirms. Your job at await_confirmation is ONLY to
-  show the summary and ask "Shall I confirm? (yes/no)".
+- CRITICAL: When the patient says "yes" to confirm the slot, you MUST IMMEDIATELY call the `create_booking` tool. 
+- CRITICAL: NEVER tell the patient their appointment is confirmed UNTIL you have successfully executed `create_booking` and received the success result. Do not fake or assume confirmation.
 - After each tool result, reply to the user. Do not chain tool calls.
 
 ## MEDGEMMA OUTPUT WRAPPING

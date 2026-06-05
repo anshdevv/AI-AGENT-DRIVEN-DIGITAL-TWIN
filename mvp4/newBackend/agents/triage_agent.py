@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -203,6 +204,7 @@ _SYSTEM_TAG_RE  = re.compile(
     r"|\[START_TRIAGE\]"
     r"|\[END_CALL\]"
     r"|\[TRIAGE_COMPLETE\]"
+    r"|\[EMERGENCY_REFERRAL\]"
     r"|CLINICAL_SUMMARY:.*?(?=\n\n|\Z)",
     re.DOTALL,
 )
@@ -470,30 +472,47 @@ def _fetch_patient_history(ctx: dict) -> str:
 def _detect_explicit_doctor_request(state: dict) -> str | None:
     """
     Check if the patient explicitly asked for a specific type of doctor
-    anywhere in the conversation before triage started.
+    anywhere in the conversation before triage started, OR in the extracted
+    complaint / symptom text itself.
     Returns the specialization string if found, None otherwise.
 
     Examples:
-      "I want to see a cardiologist"  → "Cardiologist"
-      "book me with a skin doctor"    → "Dermatologist"
-      "I need a general physician"    → "General Physician"
+      "I want to see a cardiologist"   → "Cardiologist"
+      "routine cardiac checkup"        → "Cardiologist"
+      "book me with a skin doctor"     → "Dermatologist"
+      "I need a general physician"     → "General Physician"
     """
     EXPLICIT_REQUEST_PATTERNS = [
-        (re.compile(r"\b(cardiolog\w+)\b", re.I),         "Cardiologist"),
-        (re.compile(r"\b(neurolog\w+)\b", re.I),          "Neurologist"),
-        (re.compile(r"\b(dermatolog\w+|skin\s+doctor)\b", re.I), "Dermatologist"),
-        (re.compile(r"\b(orthoped\w+|bone\s+doctor)\b",   re.I), "Orthopedic"),
-        (re.compile(r"\b(gastroenterolog\w+)\b",          re.I), "Gastroenterologist"),
-        (re.compile(r"\b(psychiatr\w+|psycholog\w+)\b",   re.I), "Psychiatrist"),
-        (re.compile(r"\b(gynecolog\w+|gynaecolog\w+)\b",  re.I), "Gynecologist"),
-        (re.compile(r"\b(pulmonolog\w+|lung\s+doctor)\b", re.I), "Pulmonologist"),
-        (re.compile(r"\b(urolog\w+)\b",                   re.I), "Urologist"),
-        (re.compile(r"\b(endocrinolog\w+)\b",              re.I), "Endocrinologist"),
-        (re.compile(r"\b(general\s+physician|gp|family\s+doctor)\b", re.I), "General Physician"),
-        (re.compile(r"\b(pediatr\w+|child\s+doctor)\b",  re.I), "Pediatrician"),
+        (re.compile(r"\b(cardiolog\w+|cardiac|heart\s+doctor|heart\s+specialist|heart\s+check)\b", re.I),
+            "Cardiologist"),
+        (re.compile(r"\b(neurolog\w+|neuro\s+doctor)\b", re.I),
+            "Neurologist"),
+        (re.compile(r"\b(dermatolog\w+|skin\s+doctor|skin\s+specialist)\b", re.I),
+            "Dermatologist"),
+        (re.compile(r"\b(orthoped\w+|bone\s+doctor|joint\s+doctor|ortho)\b", re.I),
+            "Orthopedic"),
+        (re.compile(r"\b(gastroenterolog\w+|stomach\s+doctor|gut\s+doctor)\b", re.I),
+            "Gastroenterologist"),
+        (re.compile(r"\b(psychiatr\w+|psycholog\w+|mental\s+health\s+doctor)\b", re.I),
+            "Psychiatrist"),
+        (re.compile(r"\b(gynecolog\w+|gynaecolog\w+|women\s+doctor|ladies\s+doctor)\b", re.I),
+            "Gynecologist"),
+        (re.compile(r"\b(pulmonolog\w+|lung\s+doctor|chest\s+specialist|respiratory)\b", re.I),
+            "Pulmonologist"),
+        (re.compile(r"\b(urolog\w+)\b", re.I),
+            "Urologist"),
+        (re.compile(r"\b(endocrinolog\w+|diabetes\s+doctor|thyroid\s+doctor|hormones\s+doctor)\b", re.I),
+            "Endocrinologist"),
+        (re.compile(r"\b(general\s+physician|gp|family\s+doctor|general\s+doctor)\b", re.I),
+            "General Physician"),
+        (re.compile(r"\b(pediatr\w+|child\s+doctor|kids\s+doctor|baby\s+doctor)\b", re.I),
+            "Pediatrician"),
+        (re.compile(r"\b(ophthalmolog\w+|eye\s+doctor|eye\s+specialist|eye\s+check)\b", re.I),
+            "Ophthalmologist"),
+        (re.compile(r"\b(ent|ear\s+nose|otolaryngolog\w+|ear\s+doctor|nose\s+doctor|throat\s+doctor)\b", re.I),
+            "ENT Specialist"),
     ]
     messages = list(state.get("messages", []))
-    # Only look at messages before triage started
     ctx = state.get("booking_context", {})
     triage_start_idx = ctx.get("triage_start_msg_index", len(messages))
 
@@ -501,8 +520,18 @@ def _detect_explicit_doctor_request(state: dict) -> str | None:
         str(m.content) for m in messages[:triage_start_idx] if m.type == "human"
     )
 
+    # Also scan the complaint / symptom text directly so patterns like
+    # "routine cardiac checkup" are caught even if they weren't in a human message
+    complaint_text = " ".join(filter(None, [
+        state.get("extracted_symptom") or "",
+        ctx.get("prime_complaint") or "",
+        ctx.get("initial_complaint_hint") or "",
+    ]))
+
+    search_text = pre_triage_text + " " + complaint_text
+
     for pattern, specialization in EXPLICIT_REQUEST_PATTERNS:
-        if pattern.search(pre_triage_text):
+        if pattern.search(search_text):
             print(f"🎯 [Triage] Explicit doctor request detected: '{specialization}'")
             return specialization
 
@@ -565,18 +594,67 @@ def triage_node(state: dict) -> dict:
     }
     is_routine = any(kw in (symptom or "").lower() for kw in _ROUTINE_KW)
     if is_routine and questions_asked >= 1:
-        print("🏥 [Triage] Routine visit — completing after red-flag screen")
-        from agents.triage_agent import _detect_explicit_doctor_request
-        explicit = _detect_explicit_doctor_request(state)
-        specialist = explicit or "General Physician"
-        summary = (
-            f"CLINICAL_SUMMARY:\n"
-            f"- Chief complaint      : {symptom}\n"
-            f"- Visit type           : Routine / preventive\n"
-            f"- Red flags screened   : negative\n"
-            f"- Suggested specialist : {specialist}"
+        # ── Patient has answered the "any symptoms?" question ─────
+        # Inspect their reply. Two paths:
+        #   A) They mentioned actual symptoms  → flip to full OLDCARTS triage
+        #   B) No symptoms / routine only       → complete, use requested specialist
+        messages_so_far = list(state.get("messages", []))
+        last_human = next(
+            (str(m.content) for m in reversed(messages_so_far) if m.type == "human"), ""
         )
-        return _complete_triage(state, summary, triage_qa, profile, ctx)
+
+        _SYMPTOM_KW_RE = re.compile(
+            r"\b(pain|ache|hurt|fever|cough|bleed|dizz|nausea|vomit|swollen|rash|itch"
+            r"|shortness|breath|tir\w+|fatigue|weak|loss|pressure|tightness"
+            r"|headache|migraine|chest|stomach|abdomen|burning|tingling|numb"
+            r"|discharge|swell|palpitat|irregular|frequent|urgent)\b",
+            re.IGNORECASE,
+        )
+        # A negative opener means "no symptoms" even if the rest mentions them
+        _NEGATIVE_OPENER_RE = re.compile(
+            r"^(no\b|none\b|nope\b|nah\b|nothing\b|not\s+really|not\s+at\s+all"
+            r"|all\s+good|just|purely|only|regular)",
+            re.IGNORECASE,
+        )
+
+        patient_revealed_symptoms = bool(_SYMPTOM_KW_RE.search(last_human))
+        patient_denied_symptoms   = bool(_NEGATIVE_OPENER_RE.match(last_human.strip()))
+
+        if patient_revealed_symptoms and not patient_denied_symptoms:
+            # ── Path A: switch to symptomatic OLDCARTS ────────────
+            print(f"🏥 [Triage] Routine → patient revealed symptoms: "
+                  f"'{last_human[:80]}' — switching to full triage")
+            new_symptom = last_human.strip()
+            ctx["prime_complaint"]        = new_symptom
+            ctx["initial_complaint_hint"] = new_symptom
+            ctx["triage_dimensions"]      = None   # force recompute with OLDCARTS
+            ctx["triage_questions_asked"] = 0      # start the question count fresh
+            ctx["triage_severity"]        = "Unknown"
+            ctx["symptom_context_block"]  = ""     # force re-lookup for new symptom
+            _persist_booking_context(ctx)
+            # Update locals — fall through to symptomatic triage below
+            symptom         = new_symptom
+            questions_asked = 0
+            is_routine      = False
+            # Do NOT return — fall through to rest of triage_node
+
+        else:
+            # ── Path B: purely routine, no symptoms ──────────────
+            print("🏥 [Triage] Routine visit — no symptoms reported, completing triage")
+            explicit   = _detect_explicit_doctor_request(state)
+            specialist = explicit or "General Physician"
+            summary = (
+                f"CLINICAL_SUMMARY:\n"
+                f"- Chief complaint      : {symptom}\n"
+                f"- Visit type           : Routine / preventive\n"
+                f"- Symptoms reported    : none\n"
+                f"- Suggested specialist : {specialist}"
+            )
+            return _complete_triage(state, summary, triage_qa, profile, ctx)
+
+    elif is_routine and questions_asked == 0:
+        # First turn of a routine visit — fall through to ask the one dimension question
+        pass
 
     # ── Accumulate patient responses each turn ────────────────────
     messages = list(state.get("messages", []))
@@ -591,13 +669,16 @@ def triage_node(state: dict) -> dict:
 
     # ── Symptom lookup — TURN 1 ONLY ─────────────────────────────
     symptom_context_block = ctx.get("symptom_context_block", "")
-    if symptom and not symptom_context_block:
+    _use_lookup = os.getenv("USE_SYMPTOM_LOOKUP", "true").lower() != "false"
+    if not _use_lookup:
+        ctx.setdefault("triage_severity", "Unknown")
+        print("🔧 [Triage] symptom_lookup disabled (USE_SYMPTOM_LOOKUP=false)")
+    elif symptom and not symptom_context_block:
         tokens = [s.strip() for s in symptom.replace(",", " ").split() if s.strip()]
         try:
             match = lookup(tokens)
             symptom_context_block = format_for_prompt(match)
             ctx["symptom_context_block"] = symptom_context_block
-            # ── Store severity for dynamic question limit ─────────
             ctx["triage_severity"] = match.severity
             print(f"🔍 [Triage] Turn-1 lookup → "
                   f"candidates: {[m.disease for m in match.top_matches]}  "
@@ -628,6 +709,7 @@ def triage_node(state: dict) -> dict:
     # number of distinct questions we have to ask is len(dimensions).
     from agents.orchestrator import _compute_triage_dimensions as _ctd
     if questions_asked == 0 or not ctx.get("triage_dimensions"):
+        # Recompute: either first turn, or reset after routine→symptomatic switch
         dimensions = _ctd(symptom or "", ctx)
         ctx["triage_dimensions"] = dimensions
         _persist_booking_context(ctx)
@@ -647,7 +729,10 @@ def triage_node(state: dict) -> dict:
         return _complete_triage(state, summary, triage_qa, profile, ctx)
 
     # ── Record the most recent Q&A pair ───────────────────────────
-    triage_qa = _record_qa_pair(state, triage_qa)
+    # Skip turn 0 — no triage question asked yet; most recent human
+    # message is from history collection and would contaminate triage Q&A.
+    if questions_asked > 0:
+        triage_qa = _record_qa_pair(state, triage_qa)
 
     # ── Build MedGemma system prompt ──────────────────────────────
     base_prompt     = _load_triage_prompt()
@@ -662,8 +747,9 @@ def triage_node(state: dict) -> dict:
     label = current_dim_key.replace("_", " ").title()
 
     # ── Conversation so far (last 4 Q&A pairs) ────────────────────
-    qa_pairs = ctx.get("triage_qa", [])
-    qa_block = "\n".join(f"  {pair}" for pair in qa_pairs[-4:]) if qa_pairs else "  (none yet)"
+    # Use the local triage_qa (already updated by _record_qa_pair above),
+    # NOT ctx.get("triage_qa") which is only written at _complete_triage.
+    qa_block = "\n".join(f"  {pair}" for pair in triage_qa[-4:]) if triage_qa else "  (none yet)"
 
     sys_prompt_text = (
         f"{base_prompt}\n\n"
@@ -675,6 +761,8 @@ def triage_node(state: dict) -> dict:
         f"YOUR TASK THIS TURN ({dim_idx + 1} of {len(dimensions)}):\n"
         f"  Dimension : {label}\n"
         f"  Ask       : \"{current_dim_question}\"\n\n"
+        f"⛔ ALREADY ASKED — DO NOT repeat these: "
+        f"{', '.join(dimensions[i][0].replace('_',' ').title() for i in range(dim_idx)) or 'none yet'}\n"
         f"Ask this ONE question naturally in the patient's language. "
         f"{questions_left} question(s) remaining.\n"
         f"If red flag confirmed → [EMERGENCY_REFERRAL]\n"
@@ -692,6 +780,22 @@ def triage_node(state: dict) -> dict:
         response = med_llm.invoke(msgs)
         raw_text = str(response.content).strip()
         print(f"🧠 [MedGemma raw output] → {raw_text[:300]}")
+
+        # ── Guard: MedGemma echoed patient answer or gave nonsense ────────────
+        # When MedGemma outputs something very short (< 15 chars) or a single
+        # word that looks like a patient response ("no", "yes", "okay" etc.),
+        # it failed to ask the dimension question. Use the scripted question.
+        _ECHO_RE = re.compile(
+            r"^(no|yes|okay|ok|none|nope|sure|fine|i see|understood|noted|"
+            r"alright|got it|thank you|thanks|sorry|hmm|ah)\s*[\.\!]*$",
+            re.IGNORECASE,
+        )
+        if len(raw_text) < 15 or _ECHO_RE.match(raw_text):
+            print(
+                f"⚠️  [Triage] MedGemma output looks like an echo/nonsense: '{raw_text}' "
+                f"— falling back to scripted dimension question"
+            )
+            raw_text = current_dim_question
 
         # ── Append MedGemma's raw output to its ISOLATED history ──────────────
         # MUST happen here — before Qwen rephrases — so we store the clinical
@@ -720,9 +824,55 @@ def triage_node(state: dict) -> dict:
             ctx,
         )
 
+    # ── Check for emergency referral ───────────────────────────────
+    if "[EMERGENCY_REFERRAL]" in raw_text:
+        # medgemma:4b sometimes misfires this tag even when the patient just
+        # said "no" to the red-flag question. Detect that false positive before
+        # escalating, then patch the history and continue triage normally.
+        _NEG_RE = re.compile(
+            r"^(no\b|none\b|nope\b|nah\b|nothing\b|not\s+really|not\s+at\s+all)",
+            re.I,
+        )
+        last_human_msg = next(
+            (str(m.content) for m in reversed(list(state.get("messages", []))) if m.type == "human"),
+            "",
+        )
+        is_false_positive = (
+            current_dim_key == "red_flag"
+            and bool(_NEG_RE.match(last_human_msg.strip()))
+        )
+
+        if is_false_positive:
+            print(
+                f"⚠️  [Triage] [EMERGENCY_REFERRAL] false positive — "
+                f"patient said '{last_human_msg[:40]}' (negative) on red_flag dim. "
+                f"Patching history and continuing."
+            )
+            # Replace the bad history entry with the scripted question so
+            # MedGemma sees a clean conversation next turn
+            history = ctx.get("medgemma_raw_history", [])
+            if history and history[-1]["role"] == "assistant":
+                history[-1]["content"] = current_dim_question
+            _persist_booking_context(ctx)
+            raw_text = current_dim_question   # proceed with the scripted question
+        else:
+            print(f"🚨 [Triage] Emergency referral confirmed by patient — routing to ER")
+            summary = _extract_clinical_summary(raw_text) or (
+                f"- Chief complaint      : {symptom}\n"
+                f"- Red flags screened   : POSITIVE\n"
+                f"- Suggested specialist : Emergency Department"
+            )
+            return _complete_triage(state, summary, triage_qa, profile, ctx)
+
     # ── STEP 2: Qwen — patient-facing rephrasing ───────────────────
     patient_language = ctx.get("patient_language", "en")
     polished = _rephrase_with_qwen(raw_text, patient_language)
+    if not polished:
+        # Qwen returned empty — fall back to MedGemma's own stripped text
+        polished = _strip_all_system_tags(raw_text)
+    if not polished:
+        # Both empty — use the scripted dimension question as last resort
+        polished = current_dim_question
     print(f"💬 [Qwen→Patient] → {polished[:200]}")
 
     ctx["triage_questions_asked"] = questions_asked + 1
@@ -850,6 +1000,21 @@ def _complete_triage(
 
     patient_language = ctx.get("patient_language", "en")
     handoff = _rephrase_with_qwen(handoff_prompt, patient_language)
+    if not handoff:
+        # Qwen returned empty — build a safe plain-text fallback
+        if final_doctor_type == "General Physician":
+            handoff = (
+                "Thank you for sharing that information. Based on what you've described, "
+                "we recommend starting with a General Physician who can assess you and "
+                "refer to a specialist if needed. Would you like to book an appointment?"
+            )
+        else:
+            handoff = (
+                f"Thank you for sharing that information. Based on your symptoms, "
+                f"we recommend seeing a {final_doctor_type}. "
+                f"Would you like to book an appointment?"
+            )
+        print(f"⚠️  [Triage] Qwen handoff was empty — using plain-text fallback")
 
     return {
         "triage_active":   False,

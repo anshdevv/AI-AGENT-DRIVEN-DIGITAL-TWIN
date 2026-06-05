@@ -1,0 +1,55 @@
+{
+  "hospital": "City Medical Center",
+  "chunks": [
+    {
+      "id": "visiting_hours",
+      "topic": "Visiting Hours",
+      "text": "Visiting hours are 9:00 AM to 8:00 PM daily. ICU visiting hours are 10:00 AM to 12:00 PM and 4:00 PM to 6:00 PM. Maximum 2 visitors per patient at a time. Children under 12 are not permitted in ICU."
+    },
+    {
+      "id": "appointment_cancellation",
+      "topic": "Appointment Cancellation Policy",
+      "text": "Appointments must be cancelled at least 4 hours before the scheduled time to avoid a cancellation fee. Same-day cancellations incur a Rs. 500 fee. No-shows are charged the full consultation fee. To cancel, call reception or use the patient portal."
+    },
+    {
+      "id": "payment_methods",
+      "topic": "Payment Methods",
+      "text": "We accept cash, credit/debit cards (Visa, Mastercard), JazzCash, Easypaisa, and bank transfers. Insurance claims can be submitted at the billing desk. A deposit may be required for certain procedures."
+    },
+    {
+      "id": "insurance",
+      "topic": "Insurance and Coverage",
+      "text": "We work with Jubilee, EFU, State Life, Adamjee, and most major corporate insurance panels. Please bring your insurance card and CNIC. Pre-authorization is required for procedures above Rs. 10,000. Emergency services are covered without prior authorization."
+    },
+    {
+      "id": "emergency",
+      "topic": "Emergency Services",
+      "text": "Emergency services are available 24/7. Walk-in emergencies are triaged immediately. Call 1122 or our emergency line for ambulance. Emergency consultation fee is Rs. 2000. Stabilization is provided regardless of payment status."
+    },
+    {
+      "id": "reports",
+      "topic": "Test Reports and Records",
+      "text": "Lab and radiology reports are available within 4-24 hours depending on the test. Reports can be collected from the lab counter or sent via WhatsApp upon request. Medical records can be requested with 3 working days notice and CNIC."
+    },
+    {
+      "id": "pharmacy",
+      "topic": "In-House Pharmacy",
+      "text": "Our pharmacy is open 8:00 AM to 10:00 PM daily. We stock all prescribed medications. Discounts of 10% are available on prescriptions issued by our doctors. Generic alternatives are available on request."
+    },
+    {
+      "id": "parking",
+      "topic": "Parking",
+      "text": "Free parking is available for up to 2 hours for patients and visitors. Extended parking is Rs. 50 per hour after the first 2 hours. Disabled parking bays are available at the main entrance."
+    },
+    {
+      "id": "waiting_time",
+      "topic": "Waiting Times",
+      "text": "Average GP consultation wait is 15-30 minutes. Specialist appointments may have longer waits depending on doctor availability. If wait exceeds 45 minutes you will be notified and may reschedule. Priority is given to emergency and severe cases."
+    },
+    {
+      "id": "covid",
+      "topic": "Infection Control",
+      "text": "Masks are recommended in all clinical areas. Hand sanitizer stations are available throughout the facility. Patients with fever or respiratory symptoms should notify reception upon arrival. Separate waiting areas are available for symptomatic patients."
+    }
+  ]
+}
