@@ -308,15 +308,14 @@ def _build_triage_messages(state: dict, sys_prompt_text: str) -> list:
             (str(m.content) for m in reversed(all_msgs) if m.type == "human"), ""
         ).strip()
         if last_human:
-            # Guard: don't duplicate if already appended
-            last_user_content = next(
-                (e["content"] for e in reversed(raw_history) if e["role"] == "user"), ""
-            )
-            if last_user_content.strip() != last_human:
-                raw_history.append({"role": "user", "content": last_human})
-                print(f"   [MedGemmaHistory] Turn-N answer appended: '{last_human[:60]}...'")
-            else:
-                print(f"   [MedGemmaHistory] Answer already in history — skip duplicate")
+            # ALWAYS append when last entry is assistant — the patient just answered
+            # the latest question. The previous content-based dedup was harmful:
+            # if the patient said "no" to two questions in a row, the second "no"
+            # was dropped as a "duplicate", but MedGemma's next assistant entry
+            # was still appended → consecutive 'assistant' entries → MedGemma
+            # repeats / asks two questions without an intervening answer.
+            raw_history.append({"role": "user", "content": last_human})
+            print(f"   [MedGemmaHistory] Turn-N answer appended: '{last_human[:60]}...'")
         else:
             print(f"   [MedGemmaHistory] No human message found to append")
     else:
@@ -623,9 +622,24 @@ def triage_node(state: dict) -> dict:
     # ── Dynamic question limit ────────────────────────────────────
     max_questions = _get_max_questions(state)
 
-    # ── Hard exit at question limit ───────────────────────────────
-    if questions_asked >= max_questions:
-        print(f"🔔 [Triage] Reached {max_questions}-question limit — completing")
+    # ── Compute dimensions early so we can cap the limit at len(dimensions) ──
+    # Without this, a routine_intent visit (1 dimension) would keep asking the
+    # same question until the severity-based limit (5-10) is hit. The actual
+    # number of distinct questions we have to ask is len(dimensions).
+    from agents.orchestrator import _compute_triage_dimensions as _ctd
+    if questions_asked == 0 or not ctx.get("triage_dimensions"):
+        dimensions = _ctd(symptom or "", ctx)
+        ctx["triage_dimensions"] = dimensions
+        _persist_booking_context(ctx)
+    else:
+        dimensions = ctx.get("triage_dimensions") or _ctd(symptom or "", ctx)
+
+    effective_max = min(max_questions, len(dimensions))
+    print(f"   [TriageLimit] severity_max={max_questions}  dim_count={len(dimensions)}  effective={effective_max}")
+
+    # ── Hard exit at question limit (severity-based OR dimension-count) ──────
+    if questions_asked >= effective_max:
+        print(f"🔔 [Triage] Reached {effective_max}-question limit — completing")
         summary = (
             f"Complaint: {symptom}\n"
             f"Suggested specialist: {profile.get('doctor_specialization', 'General Physician')}"
@@ -637,21 +651,12 @@ def triage_node(state: dict) -> dict:
 
     # ── Build MedGemma system prompt ──────────────────────────────
     base_prompt     = _load_triage_prompt()
-    questions_left  = max_questions - questions_asked
+    questions_left  = effective_max - questions_asked
     severity_so_far = ctx.get("triage_severity", "Unknown")
     patient_context = _build_patient_context_block(ctx)
 
     # ── Orchestrator-controlled OLDCARTS dimensions ───────────────
-    # Computed once on turn 0 and cached in ctx. Each turn injects
-    # the specific dimension so MedGemma only has ONE job per turn.
-    from agents.orchestrator import _compute_triage_dimensions as _ctd
-    if questions_asked == 0 or not ctx.get("triage_dimensions"):
-        dimensions = _ctd(symptom or "", ctx)
-        ctx["triage_dimensions"] = dimensions
-        _persist_booking_context(ctx)
-    else:
-        dimensions = ctx.get("triage_dimensions") or _ctd(symptom or "", ctx)
-
+    # (dimensions already computed above before the limit check)
     dim_idx = min(questions_asked, len(dimensions) - 1)
     current_dim_key, current_dim_question = dimensions[dim_idx]
     label = current_dim_key.replace("_", " ").title()

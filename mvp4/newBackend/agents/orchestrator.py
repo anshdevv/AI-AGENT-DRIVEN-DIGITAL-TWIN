@@ -349,6 +349,11 @@ def _compute_triage_dimensions(complaint: str, ctx: dict) -> list[tuple[str, str
 
     Priority: red_flag → duration → character → severity → associated → complaint_specific
     At most 6 dimensions. Condition-specific branch replaces generic modifying-factors.
+
+    SPECIAL CASE: routine / checkup / screening / follow-up visits are NOT symptomatic.
+    OLDCARTS makes no sense for them — patient gets confused by "how long have you had
+    this?" / "is it sharp or dull?" when there is no symptom. For these, ask one
+    intent-clarifying question and complete triage.
     """
     c     = complaint.lower()
     p     = ctx.get("patient", {})
@@ -358,6 +363,21 @@ def _compute_triage_dimensions(complaint: str, ctx: dict) -> list[tuple[str, str
     m     = (p.get("marital_status") or "").lower()
     female  = g in ("female", "f", "woman", "girl")
     married = m == "married"
+
+    # ── SPECIAL CASE: Routine / preventive / non-symptomatic visit ───────────
+    # Detect these BEFORE building OLDCARTS dimensions. One brief question only.
+    _ROUTINE_KW = (
+        "routine", "checkup", "check-up", "check up", "screening",
+        "follow-up", "follow up", "followup", "annual", "yearly",
+        "preventive", "preventative", "physical exam", "wellness",
+        "well visit", "general checkup", "general check",
+    )
+    if any(kw in c for kw in _ROUTINE_KW):
+        return [(
+            "routine_intent",
+            "Just to confirm — is there any specific concern you'd like the doctor "
+            "to look at during this visit, or is this purely a routine check?",
+        )]
 
     def _has(kw: str) -> bool:
         return kw in hist
@@ -1887,6 +1907,84 @@ def _try_auto_save_demographic(ctx: dict, msg: str, session_id: str) -> None:
         print(f"⚠️  [AutoSave] Failed: {e}")
 
 
+def _try_auto_save_history_field(ctx: dict, msg: str, session_id: str) -> None:
+    """
+    For non-demographic history fields (chronic_conditions, medications,
+    drug_allergies, general_allergies, family_history, smoking_status,
+    vaccination_status, menstrual_history, lmp_date, pregnancy_status,
+    obstetric_history, fall_history), extract the patient's answer directly
+    and call save_patient_history.
+
+    This prevents the LLM from asking a question, getting an answer, then
+    moving to the next question without saving — which causes data loss
+    when the HistoryGate force-advances after 3 turns.
+
+    Logic:
+      - "no" / "none" / "no nothing" → save "none"
+      - anything else → save the full answer text (capped at 200 chars)
+    """
+    required = ctx.get("required_history_fields")
+    if not required:
+        return
+    current_field = required[0]
+    # Skip demographic fields — those are handled by _try_auto_save_demographic
+    _DEMO = {"age", "gender", "marital_status"}
+    if current_field in _DEMO:
+        return
+    # Only auto-save fields we recognize as history fields
+    _HISTORY_FIELDS = {
+        "chronic_conditions", "medications", "drug_allergies", "general_allergies",
+        "family_history", "smoking_status", "vaccination_status",
+        "menstrual_history", "lmp_date", "pregnancy_status", "obstetric_history",
+        "fall_history",
+    }
+    if current_field not in _HISTORY_FIELDS:
+        return
+
+    patient_id = ctx["patient"].get("id")
+    if not patient_id:
+        return
+
+    msg_clean = msg.strip()
+    if not msg_clean:
+        return
+
+    msg_lower = msg_clean.lower()
+    # Detect negative answers ("no", "none", "no nothing", "nope", "nah", "nothing")
+    NEGATIVE_RE = re.compile(
+        r"^(no|none|nope|nah|nothing|n/a|na|null|nil|no nothing|not at all|not really)\b",
+        re.IGNORECASE,
+    )
+    if NEGATIVE_RE.match(msg_lower):
+        value = "none"
+    else:
+        # Take the patient's answer verbatim, capped at 200 chars
+        value = msg_clean[:200]
+
+    payload = {current_field: value}
+
+    try:
+        from agents.mcp_tools import save_patient_history as _save
+        result = _save.invoke({"patient_id": patient_id, **payload})
+        if "saved successfully" in result.lower():
+            # Update local ctx so the next directive reflects the save
+            phist = ctx.setdefault("patient_history_data", "")
+            # We don't recompute patient_history_data string here — just mark field done
+            reqs = ctx.get("required_history_fields") or []
+            if current_field in reqs:
+                reqs.remove(current_field)
+            ctx["required_history_fields"] = reqs
+            coll = ctx.setdefault("collected_this_session", [])
+            if current_field not in coll:
+                coll.append(current_field)
+            counts = ctx.setdefault("history_field_turn_count", {})
+            counts[current_field] = 0
+            save_booking_context(session_id, ctx)
+            print(f"🤖 [AutoSave-Hist] {current_field}='{value[:50]}' auto-saved for patient_id={patient_id}")
+    except Exception as e:
+        print(f"⚠️  [AutoSave-Hist] Failed: {e}")
+
+
 def supervisor_node(state: ConversationState) -> dict:
     now          = datetime.now(PKT)
     today_str    = now.strftime("%A, %Y-%m-%d")
@@ -1961,6 +2059,10 @@ def supervisor_node(state: ConversationState) -> dict:
             and ctx["patient"].get("id")
             and last_user_msg):
         _try_auto_save_demographic(ctx, last_user_msg, session_id)
+        # Then auto-save the current history field too (chronic_conditions,
+        # medications, allergies, etc) — same idea, same problem: LLM skips
+        # save_patient_history and moves on, causing data loss on force-advance.
+        _try_auto_save_history_field(ctx, last_user_msg, session_id)
 
     # ── Programmatic complaint shortcut ───────────────────────────────────────
     # If step=collect_patient and we already have the complaint from the history
@@ -2199,8 +2301,14 @@ SPECIAL TAGS (output these exact strings when needed):
 def entry_router(state):
     ctx = state.get("booking_context", {})
 
-    # Run diagnostics ONCE, right after triage completes.
-    if ctx.get("triage_completed") and not ctx.get("diagnostic_report"):
+    # Run diagnostics ONCE — only AFTER booking is confirmed.
+    # Previously this fired on triage_completed which broke the booking flow:
+    # after triage the user still needs to pick a doctor + slot. Routing to
+    # diagnostic_node before that means the supervisor never gets a chance to
+    # handle "any slot" / date / time messages — they go to SOAP instead.
+    appt_confirmed = (ctx.get("appointment") or {}).get("confirmed")
+    if appt_confirmed and not ctx.get("diagnostic_report"):
+        print("🔀 [EntryRouter] booking confirmed + no report → diagnostic_node")
         return "diagnostic_node"
 
     if ctx.get("triage_active") or ctx.get("step") == "collect_patient":
