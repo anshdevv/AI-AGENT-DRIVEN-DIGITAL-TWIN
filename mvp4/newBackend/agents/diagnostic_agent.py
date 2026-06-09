@@ -181,6 +181,7 @@ P — PLAN
 ─────────────────────────────────────────
 Recommended Specialist : {specialist}
 Booking Status         : {booking_status}
+Status                 : {consultation_status}
 
 Precautions / Red Flags to Discuss:
   {precautions}
@@ -265,6 +266,7 @@ def _build_fallback_report(
     severity: str,
     dataset_match: str,
     precautions: str,
+    consultation_status: str = "pending",
 ) -> str:
     return (
         "=========================================\n"
@@ -305,7 +307,8 @@ def _build_fallback_report(
         "P — PLAN\n"
         "─────────────────────────────────────────\n"
         f"Recommended Specialist : {specialist}\n"
-        f"Booking Status         : {booking_status}\n\n"
+        f"Booking Status         : {booking_status}\n"
+        f"Status                 : {consultation_status}\n\n"
         "Precautions / Red Flags to Discuss:\n"
         f"  {precautions}\n\n"
         "Next Steps:\n"
@@ -412,6 +415,11 @@ def diagnostic_node(state: dict) -> dict:
                 clinical_summary = content[start:end].strip()
             break
 
+    # Consultation status — pulled from ctx; defaults to 'pending' if not yet set.
+    # This is what the returning-patient check reads back from prior SOAPs to
+    # decide whether a complaint counts as a new episode.
+    consultation_status = ctx.get("consultation_status", "pending").lower()
+
     # ── Build System + Human prompts ──────────────────────────────
     system_text = _SOAP_SYSTEM.format(
         date           = date_str,
@@ -426,6 +434,7 @@ def diagnostic_node(state: dict) -> dict:
         routing_reason = routing_reason,
         specialist     = specialist,
         booking_status = booking_status,
+        consultation_status = consultation_status,
         precautions    = precautions,
     )
 
@@ -490,6 +499,7 @@ def diagnostic_node(state: dict) -> dict:
             severity       = severity,
             dataset_match  = dataset_match,
             precautions    = precautions,
+            consultation_status = consultation_status,
         )
 
     # ── Save to Supabase ──────────────────────────────────────────

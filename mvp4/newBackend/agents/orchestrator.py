@@ -42,8 +42,8 @@ from agents.triage_agent import triage_node
 from agents.diagnostic_agent import diagnostic_node
 from agents.chat_memory import store_message, search_relevant, backfill_session_patient_id
 from agents.policy_rag  import search_policy
-import os 
 
+import os
 # ── Feature flags (set in .env to disable expensive features) ─────────────
 _USE_SYMPTOM_LOOKUP = os.getenv("USE_SYMPTOM_LOOKUP", "true").lower() != "false"
 _USE_LLM_JUDGE      = os.getenv("USE_LLM_JUDGE",      "false").lower() == "true"
@@ -465,59 +465,79 @@ def _compute_triage_dimensions(complaint: str, ctx: dict) -> list[tuple[str, str
 
 def _determine_routing(ctx: dict) -> str:
     """
-    Routing rules (per clinical advice):
-      - Emergency                           → EMERGENCY (human escalation)
-      - Severe/Critical, first visit        → recommended specialist + human flag
-      - Mild/Moderate, first visit          → General Physician
-      - Returning, same complaint           → recommended specialist
-      - Returning, different complaint      → General Physician
+    Routing rules:
+      - Emergency                                → EMERGENCY
+      - Severe                                   → specialist + human flag
+      - No prior notes                           → GP (first visit)
+      - Prior visit > 6 months                   → new episode → GP
+      - Prior visit, different complaint         → GP
+      - Prior visit, same complaint, < 6 months  → prior specialist (or recommended)
     """
+    from datetime import datetime, timezone
+
     if ctx.get("routing_decision"):
         return ctx["routing_decision"]
 
     recommended = (ctx.get("recommended_specialist") or "General Physician").strip()
     notes       = (ctx.get("recent_case_notes") or "").lower()
-    severity    = (ctx.get("triage_severity") or "Unknown").lower()
+    severity    = (ctx.get("triage_severity")    or "Unknown").lower()
+    complaint   = (ctx.get("prime_complaint")    or ctx.get("extracted_symptom") or "").lower()
 
-    # Emergency always overrides everything
     if "emergency" in recommended.lower() or severity in ("emergency", "critical"):
         return "EMERGENCY"
 
-    # Severe first visit → go direct to specialist, also set human flag
     if severity == "severe":
         if not ctx.get("human_handoff_pending"):
             ctx["human_handoff_pending"] = True
-            print(f"   [Routing] Severe case — flagging for human/doctor attention")
+            print("   [Routing] Severe — flagging for human attention")
         spec = recommended if recommended.lower() not in ("general physician", "gp", "") else "Specialist"
-        print(f"   [Routing] Severe → {spec} (+ human flag set)")
+        print(f"   [Routing] Severe → {spec} (+ human flag)")
         return spec
 
-    # No prior notes → first visit → GP
-    if not notes or "no case notes" in notes or "no recent" in notes:
+    if not notes or "no case notes" in notes or "no prior" in notes or "no recent" in notes:
+        print("   [Routing] No prior notes → first visit → General Physician")
         return "General Physician"
 
-    # Prior notes exist — returning patient with same specialist complaint?
-    if recommended and recommended.lower() not in ("general physician", "gp", ""):
-        specialist_keyword = recommended.split("/")[0].strip().lower()
-        if specialist_keyword and specialist_keyword in notes:
-            return recommended
+    if complaint:
+        complaint_words = set(re.sub(r"[^a-z\s]", "", complaint).split())
+        complaint_words -= {"i", "a", "an", "the", "have", "had", "am", "is", "my", "with"}
+        matches = sum(1 for w in complaint_words if len(w) > 3 and w in notes)
 
+        if matches >= 1:
+            date_matches = re.findall(r"(\d{4}-\d{2}-\d{2})", notes)
+            days_ago = None
+            if date_matches:
+                try:
+                    last_dt = datetime.strptime(max(date_matches), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    days_ago = (datetime.now(timezone.utc) - last_dt).days
+                except Exception:
+                    pass
+
+            if days_ago is not None and days_ago > 180:
+                print(f"   [Routing] Prior visit {days_ago}d ago (>180) → new episode → GP")
+                return "General Physician"
+
+            prior_spec_m = re.search(
+                r"(?:recommended specialist|specialty)[\s]*[:=][\s]*([a-z][a-z\s/]+?)(?:[\n]|\.|booking|$)",
+                notes, re.IGNORECASE,
+            )
+            prior_spec = prior_spec_m.group(1).strip().title() if prior_spec_m else ""
+            if prior_spec.lower() in ("general physician", "gp", ""):
+                prior_spec = ""
+
+            ctx["is_returning_same_complaint"] = True
+            chosen = prior_spec or recommended
+
+            if chosen.lower() in ("general physician", "gp", ""):
+                print(f"   [Routing] Returning ({days_ago}d ago) — prior was GP → General Physician")
+                return "General Physician"
+
+            print(f"   [Routing] Returning ({days_ago}d ago, {matches} kw) → {chosen}")
+            return chosen
+
+    print("   [Routing] Prior notes but different/new complaint → General Physician")
     return "General Physician"
 
-    # No prior notes → definitely first visit → GP
-    if not notes or "no case notes" in notes or "no recent" in notes:
-        return "General Physician"
-
-    # Prior notes exist — check if same specialist was seen before
-    # e.g. recommended = "Neurologist" and prior notes mention Neurologist → returning
-    if recommended and recommended.lower() not in ("general physician", "gp", ""):
-        # strip to the first word for a fuzzy match (e.g. "Neurologist" in notes)
-        specialist_keyword = recommended.split("/")[0].strip().lower()
-        if specialist_keyword and specialist_keyword in notes:
-            return recommended   # returning patient for same complaint → specialist
-
-    # Prior notes but different complaint → GP again
-    return "General Physician"
 
 
 def load_booking_context(session_id: str) -> dict:
@@ -606,6 +626,15 @@ def _advance_step(ctx: dict) -> None:
         print(f"🔀 [AdvanceStep] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
         return
 
+    # ── Phase 0.6: history collected but not yet confirmed by patient ────────
+    # Stay in confirm_patient_history until patient explicitly approves the
+    # parsed history record. The supervisor handles parsing + save on YES.
+    if ctx.get("history_pending_confirmation"):
+        ctx["step"] = "confirm_patient_history"
+        print(f"🔀 [AdvanceStep] → step = 'confirm_patient_history' (awaiting patient YES)")
+        print(f"🔀 [AdvanceStep] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+        return
+
     # ── History confirmed — proceed to triage ────────────────────────────────
     if not ctx.get("triage_completed"):
         ctx["step"] = "collect_patient"
@@ -684,7 +713,8 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
         lines.append("YOUR NEXT ACTION: Collect patient profile and medical history.")
         lines.append("  ⛔ ONLY these tools are allowed right now:")
         lines.append("     lookup_customer_profile · register_customer_profile")
-        lines.append("     update_patient_demographics · get_patient_history · save_patient_history")
+        lines.append("     update_patient_demographics · get_patient_history")
+        lines.append("  ⛔ DO NOT call save_patient_history (history is batched + saved later).")
         lines.append("  ⛔ DO NOT call any booking or specialist tools.")
         lines.append("  ⛔ DO NOT output [SYMPTOM_LOGGED:] or [START_TRIAGE] yet.")
         lines.append("")
@@ -700,7 +730,6 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
 
         elif phone and not pid:
             lines.append(f"  ✓ Phone collected: {phone}")
-            # Detect if lookup already ran and returned 'not found' (flag set in tool extract)
             if ctx.get("patient_lookup_failed"):
                 lines.append("  ✓ Lookup ran — patient is NEW (not in system).")
                 lines.append("  ▶ Ask for their name (first name is fine).")
@@ -718,7 +747,6 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
             remaining = ctx.get("required_history_fields", [])
             collected = ctx.get("collected_this_session", [])
 
-            # Show known demographics so the LLM doesn't re-ask them
             known_demo = []
             if p.get("age"):            known_demo.append(f"age={p['age']}")
             if p.get("gender"):         known_demo.append(f"gender={p['gender']}")
@@ -729,11 +757,15 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
                 question  = _QUESTION_FOR_FIELD.get(current_field, f"Please tell me about: {current_field}")
                 criteria  = _FIELD_COMPLETE_CRITERIA.get(current_field, "a clear answer")
 
+                _DEMOGRAPHIC_FIELDS = {"age", "gender", "marital_status"}
+                is_demographic     = current_field in _DEMOGRAPHIC_FIELDS
+
                 lines.append(f"  ✓ Patient: {p.get('name')} (ID={pid})")
                 if known_demo:
                     lines.append(f"  ✓ Already known — DO NOT re-ask: {', '.join(known_demo)}")
                 lines.append(f"  ✓ Collected this session: {collected or 'none yet'}")
-                lines.append(f"  ▶ Currently collecting: [{current_field}]")
+                lines.append(f"  ▶ Currently collecting: [{current_field}] "
+                             f"({'demographic' if is_demographic else 'history'})")
 
                 field_turns = ctx.get("history_field_turn_count", {}).get(current_field, 0)
                 lines.append(f"    Field turn {field_turns}/{_MAX_TURNS_PER_HISTORY_FIELD} (auto-advances if unanswered)")
@@ -741,77 +773,138 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
                 lines.append(f"    ⛔ Ask this EXACTLY as written.")
                 lines.append(f"    Complete when you have: {criteria}")
                 lines.append("")
-                lines.append("  RULES:")
-                lines.append("  1. Ask the question if not yet asked.")
-                lines.append("  2. If answer is partial, ask ONE follow-up to complete it.")
-                lines.append("  3. ⛔ Call save_patient_history IMMEDIATELY after patient answers.")
-                lines.append("     Do NOT batch multiple fields — save each one right away.")
-                lines.append("  4. Do NOT move to the next field until this one is saved.")
-                lines.append(f"  5. If off-topic, redirect: 'I'll note that — {question}'")
-                lines.append("")
 
-                _DEMOGRAPHIC_FIELDS = {"age", "gender", "marital_status"}
-                if current_field in _DEMOGRAPHIC_FIELDS:
-                    lines.append(f"  When complete → call update_patient_demographics(patient_id={pid}, {current_field}=<answer>)")
+                if is_demographic:
+                    # Demographics still save per-field via update_patient_demographics
+                    lines.append("  RULES (demographic field):")
+                    lines.append("  1. Ask the question if not yet asked.")
+                    lines.append("  2. If answer is partial, ask ONE follow-up to complete it.")
+                    lines.append(f"  3. When complete → call update_patient_demographics(patient_id={pid}, {current_field}=<answer>)")
+                    lines.append("  4. Then briefly acknowledge and move to the next field.")
                 else:
-                    lines.append(f"  When complete → call save_patient_history(patient_id={pid}, {current_field}=<full answer summary>)")
+                    # ── HISTORY FIELD: LLM-driven completion via [FIELD_COMPLETE] ─
+                    next_field    = remaining[1] if len(remaining) > 1 else None
+                    next_question = _QUESTION_FOR_FIELD.get(next_field, "") if next_field else ""
+                    lines.append("  RULES (history field — DO NOT CALL ANY TOOL):")
+                    lines.append("  1. Ask the question if not yet asked.")
+                    lines.append("  2. If the answer is unclear or 'yes/yeah/sure' → ask ONE follow-up.")
+                    lines.append("  3. ⛔ DO NOT call save_patient_history — it is NOT bound.")
+                    lines.append("  4. When you have a CLEAR answer: briefly acknowledge,")
+                    lines.append("     ask the NEXT field question in the SAME message,")
+                    lines.append("     then end with [FIELD_COMPLETE]. One round-trip per two fields.")
+                    if next_question:
+                        lines.append(f"  5. NEXT question to ask: \"{next_question}\"")
+                        lines.append("     Examples:")
+                        lines.append(f"       Patient: 'No'          → 'Got it! {next_question} [FIELD_COMPLETE]'")
+                        lines.append(f"       Patient: 'Penicillin'  → 'Noted. {next_question} [FIELD_COMPLETE]'")
+                        lines.append(f"       Patient: 'Dust allergy' → 'Understood. {next_question} [FIELD_COMPLETE]'")
+                    else:
+                        lines.append("  5. This is the LAST field — just acknowledge clearly:")
+                        lines.append("       Patient: 'No'    → 'Got it. [FIELD_COMPLETE]'")
+                        lines.append("       Patient: 'Never' → 'Noted. [FIELD_COMPLETE]'")
+                        lines.append("  ⛔ DO NOT ask 'What brings you in today?' or any complaint question.")
+                        lines.append("  ⛔ DO NOT ask about symptoms. The system handles the next step automatically.")
+                        lines.append("  ⛔ Your response must be 1-2 words + [FIELD_COMPLETE]. Nothing more.")
+                    lines.append("  6. Unclear answers (follow-up first, NO marker yet):")
+                    lines.append("       Patient: 'Yes'          → 'Could you tell me which one?'")
+                    lines.append("       Patient: 'I take pills' → 'What kind of pills?'")
+                    lines.append(f"  7. Off-topic: 'I\'ll note that — {question}'")
+                    lines.append("  8. ⛔ Never reply with ONLY '[FIELD_COMPLETE]' — always")
+                    lines.append("     include either the next question or an acknowledgement.")
 
                 lines.append(f"  Fields remaining after this: {remaining[1:] or 'none — all done'}")
 
             else:
+                # Shouldn't normally reach here — _advance_step moves past empty
+                # required list — but keep a sane fallback.
                 lines.append(f"  ✓ ALL FIELDS COLLECTED for {p.get('name')}.")
                 lines.append("  ▶ Ask: 'What brings you in today?'")
                 lines.append("  When the patient mentions a complaint, output ONLY these two lines:")
                 lines.append("  [SYMPTOM_LOGGED: <their complaint>]")
                 lines.append("  [START_TRIAGE]")
-                lines.append("  ⛔ Output NOTHING else. No triage questions. No explanations.")
-                lines.append("  ⛔ The triage system takes over completely after START_TRIAGE.")
+
+    # ── New step: show patient the parsed history, await YES/NO ──────────────
+    elif step == "confirm_patient_history":
+        parsed = ctx.get("parsed_history") or {}
+        lines.append("YOUR NEXT ACTION: Show the patient their parsed medical-history record.")
+        lines.append("  ⛔ ABSOLUTE RULES — read carefully:")
+        lines.append("  ⛔ DO NOT call any tools or functions of any kind at this step.")
+        lines.append("  ⛔ DO NOT output `<tool_call>`, `<invoke>`, `<parameter>`, `<|DSML|>`,")
+        lines.append("     `tool_calls`, `save_medical_history`, `save_patient_history`,")
+        lines.append("     JSON blocks, code fences, or ANY function-call-like syntax.")
+        lines.append("  ⛔ The system has already saved everything. The database write happens")
+        lines.append("     PROGRAMMATICALLY in Python when the patient replies YES — you do NOT")
+        lines.append("     and CANNOT trigger it from here. Trying to call save_patient_history")
+        lines.append("     would CORRUPT the record. Just speak to the patient as plain text.")
+        lines.append("")
+        lines.append("  Reply with ONLY this plain-text format (no other content, no markdown")
+        lines.append("  fences, no tool calls, no JSON):")
+        lines.append("")
+        lines.append("    📋 Here's the medical history I've gathered:")
+
+        _DEMO = {"age", "gender", "marital_status"}
+        rendered_any = False
+        # Render non-demographic fields first (the medical content)
+        for fld, val in parsed.items():
+            if fld in _DEMO:
+                continue
+            if val and str(val).strip() and str(val).strip().lower() != "none":
+                lines.append(f"      • {fld.replace('_', ' ').title()}: {val}")
+                rendered_any = True
+            elif val and str(val).strip().lower() == "none":
+                # Still show "none" explicitly — patient should know nothing
+                # was missed, just confirmed-absent.
+                lines.append(f"      • {fld.replace('_', ' ').title()}: None")
+                rendered_any = True
+        # Then demographics for context
+        for fld in ("age", "gender", "marital_status"):
+            val = parsed.get(fld)
+            if val and str(val).strip():
+                lines.append(f"      • {fld.replace('_', ' ').title()}: {val}")
+                rendered_any = True
+
+        if not rendered_any:
+            # Defensive — should never happen after the safety-net parser runs,
+            # but if it does, tell the LLM to just move forward without showing
+            # an empty record (the patient would be confused).
+            lines.append("      • (no specific history recorded)")
+            lines.append("")
+            lines.append("  ⚠️  No structured fields available — just say:")
+            lines.append("    'Thanks! I have your details on file. Shall we continue?'")
+            lines.append("    and wait for YES/NO.")
+        else:
+            lines.append("")
+            lines.append("  Then ask: 'Is this correct? (yes / no — and tell me what to change)'")
+
+        lines.append("")
+        lines.append("  Behaviour on patient reply:")
+        lines.append("  • YES → orchestrator saves to DB programmatically. Do NOT save yourself.")
+        lines.append("  • NO + correction → orchestrator re-parses. Just acknowledge their correction.")
+        lines.append("  • Anything else → repeat the record briefly and ask yes/no again.")
 
     # ── GUARD: only trigger triage when step is collect_patient AND flag is unset.
     elif not ctx.get("triage_completed") and step == "collect_patient":
         hint = ctx.get("initial_complaint_hint")
-        lines.append("YOUR NEXT ACTION: Start medical triage.")
+        lines.append("YOUR NEXT ACTION: Ask the patient what brings them in today.")
         # Tell the LLM what history was collected so it doesn't say "no history on file"
         _hist = ctx.get("patient_history_data") or ""
         if _hist and "history found" in _hist.lower():
             lines.append(f"  ✓ Medical history on file (already collected — do NOT say 'no history on file').")
         elif ctx.get("history_checked"):
             lines.append(f"  ✓ History check complete.")
+        lines.append("  ▶ ALWAYS ask: 'What brings you in today?' or 'What's the reason for your visit?'")
+        lines.append("  ⛔ Do NOT skip this question — triage accuracy depends on the patient's own words.")
         if hint:
-            lines.append(f"  ✓ Patient already mentioned their complaint: '{hint}'")
-            lines.append(f"  DO NOT ask 'what brings you in today?' — use the hint.")
-            lines.append(f"  Say: 'I see you came in for {hint}. Let me start your assessment.'")
-            lines.append(f"  Then immediately output:")
-            lines.append(f"  [SYMPTOM_LOGGED: {hint}]")
-            lines.append(f"  [START_TRIAGE]")
-        else:
-            lines.append("  Ask: 'What brings you in today?'")
-            lines.append("  When the patient mentions a symptom, output BOTH:")
-            lines.append("  [SYMPTOM_LOGGED: <symptom>]")
-            lines.append("  [START_TRIAGE]")
-        lines.append("  ⛔ Triage MUST happen before any booking.")
+            lines.append(f"  ℹ️  Patient may have mentioned '{hint}' earlier — you may reference it naturally,")
+            lines.append(f"      e.g. 'I see you mentioned {hint} — is that what you're coming in for today?'")
+            lines.append(f"      But still WAIT for their confirmation before starting triage.")
+        lines.append("  ▶ When patient states their reason: output ONLY:")
+        lines.append("  [SYMPTOM_LOGGED: <their complaint>]")
+        lines.append("  [START_TRIAGE]")
 
     elif step == "collect_patient":
-        if not ctx.get("triage_completed"):
-            hint = ctx.get("initial_complaint_hint")
-            lines.append("YOUR NEXT ACTION: Start medical triage.")
-            lines.append(f"  Patient {p.get('name') or 'identified'} — history collection complete.")
-            lines.append("  ⚠️  The previous conversation messages were HISTORY COLLECTION.")
-            lines.append("  ⚠️  The patient's last message was their answer to a history question.")
-            lines.append("  ⚠️  Do NOT treat the last message as their chief complaint.")
-            if hint:
-                lines.append(f"  ✓ Patient already mentioned their complaint earlier: '{hint}'")
-                lines.append(f"  DO NOT ask 'what brings you in today?' — use the hint above.")
-                lines.append(f"  Output EXACTLY:")
-                lines.append(f"  [SYMPTOM_LOGGED: {hint}]")
-                lines.append(f"  [START_TRIAGE]")
-            else:
-                lines.append("  Ask ONE question: 'What brings you in today?'")
-                lines.append("  When the patient answers, output BOTH:")
-                lines.append("  [SYMPTOM_LOGGED: <their complaint>]")
-                lines.append("  [START_TRIAGE]")
-            lines.append("  ⛔ Triage MUST happen before any booking. DO NOT skip to doctor selection.")
-
+        if False:
+            pass
         else:
             routing = _determine_routing(ctx)
             ctx["routing_decision"] = routing
@@ -927,7 +1020,12 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
         lines.append("  1. If the patient has NOT yet said yes/no → show the summary above and ask:")
         lines.append("     'Shall I confirm this appointment? (yes/no)'")
         lines.append("  2. If the patient says YES → call create_booking immediately:")
-        lines.append(f"     create_booking(patient_id={p['id']}, doctor_id={d['id']}, date='{s['date']}', time='{s['time']}')")
+        complaint_for_book = (ctx.get("prime_complaint") or "").strip().replace("'", "")[:200]
+        lines.append(
+            f"     create_booking(patient_id={p['id']}, doctor_id={d['id']}, "
+            f"date='{s['date']}', time='{s['time']}', "
+            f"chief_complaint='{complaint_for_book}')"
+        )
         lines.append("  3. If create_booking succeeds → warmly confirm and wait for next message.")
         lines.append("  4. If create_booking fails (slot taken) → tell the patient that slot is gone,")
         lines.append("     show the updated free slots from the tool result, and ask them to pick again.")
@@ -974,14 +1072,18 @@ _llm_with_tools: Any = None
 # Each step gets exactly the tools it needs. The LLM is bound with only those
 # tools so it cannot generate calls for tools outside its current phase.
 _PHASE_TOOL_NAMES: dict[str, list[str]] = {
-    # Phase 0.5 — identity + history only
+    # Phase 0.5 — identity + history collection (questions only, no save)
+    # save_patient_history is INTENTIONALLY excluded — history is batched and
+    # confirmed via the confirm_patient_history step below, then saved once.
     "collect_patient_history": [
         "lookup_customer_profile",
         "register_customer_profile",
         "update_patient_demographics",
         "get_patient_history",
-        "save_patient_history",
     ],
+    # Phase 0.6 — show batched history to patient, await YES/NO confirmation.
+    # No tools bound — the orchestrator handles save programmatically on YES.
+    "confirm_patient_history": [],
     # Phase 1-4 — chief complaint → triage → specialist recommendation
     "collect_patient": [
         "recommend_specialist_tool",
@@ -1091,7 +1193,7 @@ _YES_RE = re.compile(
 )
 _INVALID_VALUES = {"unknown", "none", "null", "n/a", "", "undefined", "?"}
 _TOOL_REQUIRED_ARGS = {
-    "create_booking":          {"patient_id": "patient ID", "doctor_id": "doctor ID", "date": "date", "time": "time"},
+    "create_booking":          {"patient_id": "patient ID", "doctor_id": "doctor ID", "date": "date", "time": "time", "chief_complaint": "the patient's chief complaint from triage"},
     "lookup_customer_profile": {"phone": "patient phone number"},
 }
 
@@ -1782,10 +1884,9 @@ def tool_executor_node(state: ConversationState) -> dict:
                 continue
             tool_args = args
 
-        # ── GUARD 3: create_booking requires confirmed YES ────────
+        # ── GUARD 3: create_booking only at await_confirmation step ────────
         if tool_name == "create_booking":
             last_human = _last_human_text(messages)
-            is_yes     = bool(_YES_RE.search(last_human))
             step       = ctx.get("step", "")
 
             # ── SYNC pending_slot with what LLM put in tool args ─────────────
@@ -1809,7 +1910,6 @@ def tool_executor_node(state: ConversationState) -> dict:
             print(f"\n   🔐 [BookingGate] ═══════════════════════════════════════════")
             print(f"   🔐 step            = '{step}'  (must be 'await_confirmation')")
             print(f"   🔐 last_human      = '{last_human[:120]}'")
-            print(f"   🔐 is_yes          = {is_yes}  (regex: {_YES_RE.pattern[:60]})")
             print(f"   🔐 patient.id      = {ctx['patient']['id']}")
             print(f"   🔐 patient.name    = {ctx['patient']['name']}")
             print(f"   🔐 doctor.id       = {ctx['selected_doctor']['id']}")
@@ -1844,13 +1944,8 @@ def tool_executor_node(state: ConversationState) -> dict:
                 tool_messages.append(ToolMessage(content=block_msg, tool_call_id=tool_call_id, name=tool_name))
                 continue
 
-            if not is_yes:
-                block_msg = (
-                    f"Booking blocked — patient has not confirmed yet. "
-                    f"Last message: '{last_human[:80]}'. "
-                    f"Ask: 'Shall I confirm this appointment? (yes/no)'"
-                )
-                print(f"   🚫 [BookingGate] BLOCKED — no YES in last message")
+            # Trust the LLM to only call create_booking after explicit patient confirmation.
+            # The step == "await_confirmation" guard above is sufficient.
                 tool_messages.append(ToolMessage(content=block_msg, tool_call_id=tool_call_id, name=tool_name))
                 continue
 
@@ -2159,37 +2254,188 @@ def _try_auto_save_demographic(ctx: dict, msg: str, session_id: str) -> None:
             counts = ctx.setdefault("history_field_turn_count", {})
             for f in payload:
                 counts[f] = 0
+            # If demographics happened to be the last missing pieces, flag for
+            # confirmation. The supervisor will then run the LLM parser (which
+            # picks up demographics from ctx["patient"] directly).
+            if not ctx.get("required_history_fields"):
+                ctx["history_pending_confirmation"] = True
+                print(f"📋 [AutoSave] All history collected (demographics last) — "
+                      f"flagging for patient confirmation")
             save_booking_context(session_id, ctx)
             print(f"🤖 [AutoSave] {payload} auto-saved for patient_id={patient_id}")
     except Exception as e:
         print(f"⚠️  [AutoSave] Failed: {e}")
 
 
+def _history_fields_to_extract(ctx: dict) -> list[str]:
+    """
+    Determine which non-demographic history fields the parser should try to
+    extract from the conversation.
+
+    Robust to two LLM-quirk failure modes:
+      1. LLM forgot to emit [FIELD_COMPLETE] markers → collected_this_session
+         is empty / partial.
+      2. LLM force-advanced past fields without saving → required_history_fields
+         is empty.
+
+    Resolution strategy (union, then minus demographics):
+      • collected_this_session  (fields the LLM explicitly marked complete)
+      • required_history_fields (fields still on the queue right now)
+      • _compute_required_history_fields(...) re-derived for the patient
+        (deterministic, based on age/gender/marital_status — gives the full
+        set of fields that SHOULD have been collected this session)
+
+    This way even if the LLM walked through every question without ever
+    emitting [FIELD_COMPLETE], we still know which fields the conversation
+    covered and can hand them to the batch parser.
+    """
+    _DEMO = {"age", "gender", "marital_status"}
+    fields: set[str] = set()
+    fields.update(ctx.get("collected_this_session", []) or [])
+    fields.update(ctx.get("required_history_fields", []) or [])
+    try:
+        derived = _compute_required_history_fields(
+            ctx.get("patient", {}) or {},
+            ctx.get("patient_history_data"),
+        )
+        fields.update(derived or [])
+    except Exception as e:
+        print(f"⚠️  [HistoryFields] _compute_required_history_fields failed: {e}")
+    fields.difference_update(_DEMO)
+    # Preserve a sensible order (alphabetical is fine — parser doesn't care)
+    return sorted(fields)
+
+
+def _parse_history_with_llm(messages: list, fields_to_extract: list[str]) -> dict:
+    """
+    Batch-extract structured medical history from a conversation.
+
+    Takes the full message list and the list of history field names to
+    populate. Calls the supervisor LLM (DeepSeek in production) ONCE with
+    a strict JSON-only prompt, then validates and sanitises the output.
+
+    Returns a dict mapping field names to extracted values. Fields that
+    were never discussed in the conversation are omitted. Negative answers
+    ("no allergies") become the string "none".
+
+    This replaces the per-turn save approach which couldn't handle:
+      - "Yes" followed by follow-up "Levothyroxine 75mcg" → maps to medications
+      - "I have asthma and BP and thyroid" → splits into chronic_conditions
+      - "Penicillin... actually also sulfa" → combines into drug_allergies
+      - Patient correcting themselves later in the conversation
+    """
+    if not messages or not fields_to_extract:
+        return {}
+
+    # Build a clean transcript — only NURSE questions and PATIENT answers.
+    # Skip tool messages, empty messages, and AI messages that look like
+    # internal markers.
+    transcript_lines = []
+    for m in messages:
+        content = str(getattr(m, "content", "") or "").strip()
+        if not content:
+            continue
+        if m.type == "ai":
+            # Skip directive markers and pure tool-call responses
+            if content.startswith("[") and content.endswith("]"):
+                continue
+            transcript_lines.append(f"NURSE: {content[:400]}")
+        elif m.type == "human":
+            transcript_lines.append(f"PATIENT: {content[:400]}")
+        # tool messages skipped
+
+    if not transcript_lines:
+        return {}
+
+    transcript = "\n".join(transcript_lines)
+    fields_list = "\n".join(f"  - {f}" for f in fields_to_extract)
+
+    system_prompt = (
+        "You extract structured medical history from a nurse-patient conversation. "
+        "Return ONLY a single JSON object — no preamble, no explanation, no markdown fences."
+    )
+
+    user_prompt = f"""Extract values for these fields from the conversation below:
+{fields_list}
+
+Rules:
+1. If the patient clearly denied or said "no/none/nope" → use "none"
+2. Combine multi-turn answers — if nurse asked "any medications?" → patient said "Yes" → nurse asked "which?" → patient said "Levothyroxine 75mcg" → the value is "Levothyroxine 75mcg daily"
+3. Combine list-style answers — "dust and pollen" → "dust, pollen"
+4. If a field was never discussed at all → use null (omit it)
+5. Do NOT invent details that aren't in the conversation
+6. Keep each value concise (under 200 characters)
+
+Conversation:
+{transcript}
+
+Return JSON now:"""
+
+    try:
+        from agents.llm_config import get_llm
+        from langchain_core.messages import SystemMessage, HumanMessage
+        llm = get_llm(temperature=0)
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ])
+        raw = str(response.content).strip()
+        # Strip markdown code fences if the model added them anyway
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```\s*$", "", raw)
+        # Find the first JSON object substring
+        m = re.search(r"\{[\s\S]*\}", raw)
+        if not m:
+            print(f"⚠️  [HistoryParser] No JSON found in response: {raw[:200]}")
+            return {}
+        parsed = json.loads(m.group(0))
+
+        # Sanitise: only include known fields, coerce to string, cap length
+        out: dict[str, str] = {}
+        for fld in fields_to_extract:
+            v = parsed.get(fld)
+            if v is None or v == "":
+                continue
+            if isinstance(v, list):
+                v = ", ".join(str(x) for x in v if x)
+            v = str(v).strip()
+            if v and v.lower() not in {"null", "none mentioned", "not mentioned", "n/a"}:
+                out[fld] = v[:300]
+        print(f"📋 [HistoryParser] Extracted {len(out)}/{len(fields_to_extract)} fields: "
+              f"{list(out.keys())}")
+        return out
+    except json.JSONDecodeError as e:
+        print(f"⚠️  [HistoryParser] JSON parse failed: {e}")
+        return {}
+    except Exception as e:
+        print(f"⚠️  [HistoryParser] LLM call failed: {e}")
+        return {}
+
+
 def _try_auto_save_history_field(ctx: dict, msg: str, session_id: str) -> None:
     """
-    For non-demographic history fields (chronic_conditions, medications,
-    drug_allergies, general_allergies, family_history, smoking_status,
-    vaccination_status, menstrual_history, lmp_date, pregnancy_status,
-    obstetric_history, fall_history), extract the patient's answer directly
-    and call save_patient_history.
+    Symptom-bleed safety check during the patient-history collection phase.
 
-    This prevents the LLM from asking a question, getting an answer, then
-    moving to the next question without saving — which causes data loss
-    when the HistoryGate force-advances after 3 turns.
+    Field advancement is now LLM-driven via the [FIELD_COMPLETE] marker
+    (handled in supervisor_node's post-LLM processing). This function only
+    handles the safety case where a patient describes a SYMPTOM during the
+    history phase — that message should never be treated as a history-field
+    answer (e.g. "I have a severe headache" must NOT be saved as medications).
 
-    Logic:
-      - "no" / "none" / "no nothing" → save "none"
-      - anything else → save the full answer text (capped at 200 chars)
+    When detected, we:
+      • Store the message as initial_complaint_hint for triage to pick up later
+      • Skip any field-advancement decision — the LLM decides via FIELD_COMPLETE
+
+    Per-turn turn counts (used by _enforce_history_field_limits as a stuck-
+    state safety net) are still incremented by that function — not here.
     """
     required = ctx.get("required_history_fields")
     if not required:
         return
     current_field = required[0]
-    # Skip demographic fields — those are handled by _try_auto_save_demographic
     _DEMO = {"age", "gender", "marital_status"}
     if current_field in _DEMO:
-        return
-    # Only auto-save fields we recognize as history fields
+        return    # demographics handled by _try_auto_save_demographic
     _HISTORY_FIELDS = {
         "chronic_conditions", "medications", "drug_allergies", "general_allergies",
         "family_history", "smoking_status", "vaccination_status",
@@ -2206,14 +2452,14 @@ def _try_auto_save_history_field(ctx: dict, msg: str, session_id: str) -> None:
     msg_clean = msg.strip()
     if not msg_clean:
         return
-
     msg_lower = msg_clean.lower()
 
-    # ── SKIP if message looks like a complaint/symptom description ────────────
-    # Defensive: prevents "I have a severe headache" being saved as medications.
-    # We use symptom keywords + first-person phrases. Skip the check for
-    # chronic_conditions (where mentioning a condition like "asthma" or "diabetes"
-    # is the actual expected answer).
+    # ── Symptom-bleed safety check ─────────────────────────────────────────────
+    # If the patient describes a symptom (e.g. "I have a headache") during
+    # history collection, that's a complaint — not an answer to whichever
+    # history field is current. Capture it as initial_complaint_hint and skip
+    # any field advancement. The LLM should not emit [FIELD_COMPLETE] for this
+    # message either, since the answer to the actual question wasn't given.
     _SYMPTOM_INDICATORS = (
         "headache", "head ache", "migraine", "fever", "nausea", "vomit",
         "dizzy", "dizziness", "pain", "ache", "hurt", "hurting",
@@ -2224,47 +2470,16 @@ def _try_auto_save_history_field(ctx: dict, msg: str, session_id: str) -> None:
     )
     if current_field != "chronic_conditions":
         if any(ind in msg_lower for ind in _SYMPTOM_INDICATORS):
-            print(f"⚠️  [AutoSave-Hist] Skipping save — message looks like a complaint, not a {current_field} answer: '{msg_clean[:60]}'")
-            # Also remember it as the complaint so triage can pick it up later
+            print(f"⚠️  [HistorySafety] Message looks like a complaint, not a "
+                  f"{current_field} answer: '{msg_clean[:60]}'")
             if not ctx.get("initial_complaint_hint"):
                 ctx["initial_complaint_hint"] = msg_clean
                 save_booking_context(session_id, ctx)
-                print(f"💡 [AutoSave-Hist] Stored as initial_complaint_hint: '{msg_clean[:60]}'")
+                print(f"💡 [HistorySafety] Stored as initial_complaint_hint")
             return
-
-    # Detect negative answers ("no", "none", "no nothing", "nope", "nah", "nothing")
-    NEGATIVE_RE = re.compile(
-        r"^(no|none|nope|nah|nothing|n/a|na|null|nil|no nothing|not at all|not really)\b",
-        re.IGNORECASE,
-    )
-    if NEGATIVE_RE.match(msg_lower):
-        value = "none"
-    else:
-        # Take the patient's answer verbatim, capped at 200 chars
-        value = msg_clean[:200]
-
-    payload = {current_field: value}
-
-    try:
-        from agents.mcp_tools import save_patient_history as _save
-        result = _save.invoke({"patient_id": patient_id, **payload})
-        if "saved successfully" in result.lower():
-            # Update local ctx so the next directive reflects the save
-            phist = ctx.setdefault("patient_history_data", "")
-            # We don't recompute patient_history_data string here — just mark field done
-            reqs = ctx.get("required_history_fields") or []
-            if current_field in reqs:
-                reqs.remove(current_field)
-            ctx["required_history_fields"] = reqs
-            coll = ctx.setdefault("collected_this_session", [])
-            if current_field not in coll:
-                coll.append(current_field)
-            counts = ctx.setdefault("history_field_turn_count", {})
-            counts[current_field] = 0
-            save_booking_context(session_id, ctx)
-            print(f"🤖 [AutoSave-Hist] {current_field}='{value[:50]}' auto-saved for patient_id={patient_id}")
-    except Exception as e:
-        print(f"⚠️  [AutoSave-Hist] Failed: {e}")
+    # That's it — no more regex-based field advancement. The supervisor's
+    # post-LLM [FIELD_COMPLETE] handler advances the field head when the LLM
+    # decides the answer is satisfactory.
 
 
 def _build_fallback_response(ctx: dict) -> str:
@@ -2381,14 +2596,28 @@ def supervisor_node(state: ConversationState) -> dict:
     # never be stored as the chief complaint.
     _GREETING_RE = re.compile(
         r"^(hi+|hey+|hello+|helo|salam|assalam|walaikum|good\s*(morning|evening|afternoon|day)|"
-        r"hola|namaste|howdy|greetings?|yo|sup|what'?s\s*up)\s*[\.,!?]*$",
+        r"hola|namaste|howdy|greetings?|yo|sup|what'?s\s*up|"
+        # Administrative / booking phrases — not medical complaints
+        r"i\s*(want|need|would like|'d like)\s*(to\s*)?(book|make|schedule|get)\s*(an?\s*)?(appointment|booking|slot|visit)|"
+        r"(book|make|schedule)\s*(an?\s*)?(appointment|booking)|"
+        r"i\s*want\s*(to\s*)?(see\s*)?(a\s*)?(doctor|physician|specialist)|"
+        r"appointment\s*(please|chahiye|chahiye ga)?"
+        r")\s*[\.,!?]*$",
         re.IGNORECASE,
+    )
+    _has_medical_word = re.search(
+        r"\b(pain|ache|fever|cough|cold|nausea|dizzy|vomit|bleed|rash|itch|swollen|"
+        r"throat|head|chest|back|stomach|ear|eye|nose|breathing|tired|weak|numb|burn|"
+        r"injury|wound|cut|fracture|broke|break|hurt|symptom|ill|sick|unwell|problem|"
+        r"complaint)\b",
+        last_user_msg or "", re.IGNORECASE,
     )
     if (not ctx["patient"].get("id")
             and not ctx.get("initial_complaint_hint")
             and last_user_msg
             and not re.match(r"^[\+\d][\d\s\-]{8,14}$", last_user_msg.strip())
-            and not _GREETING_RE.match(last_user_msg.strip())):
+            and not _GREETING_RE.match(last_user_msg.strip())
+            and _has_medical_word):   # only store if message has a medical word
         ctx["initial_complaint_hint"] = last_user_msg.strip()
         save_booking_context(session_id, ctx)
         print(f"💡 [AutoHint] Stored initial complaint hint: '{last_user_msg[:80]}'")
@@ -2417,25 +2646,258 @@ def supervisor_node(state: ConversationState) -> dict:
         # save_patient_history and moves on, causing data loss on force-advance.
         _try_auto_save_history_field(ctx, last_user_msg, session_id)
 
-    # ── Programmatic complaint shortcut ───────────────────────────────────────
-    # If step=collect_patient and we already have the complaint from the history
-    # phase hint, skip the LLM round-trip and fire triage immediately.
-    if (ctx.get("step") == "collect_patient"
-            and not ctx.get("triage_completed")
-            and not ctx.get("prime_complaint")
-            and ctx.get("initial_complaint_hint")):
-        hint = ctx["initial_complaint_hint"]
-        ctx["prime_complaint"]  = hint
-        ctx["triage_active"]    = True
+    # ── If history collection just finished, run the batch parser ─────────────
+    # _try_auto_save_history_field sets history_pending_confirmation when the
+    # last field's head is advanced. We then make ONE LLM call to extract
+    # structured values from the whole history conversation, store them in
+    # ctx["parsed_history"], and let _advance_step move us to the
+    # confirm_patient_history step.
+    #
+    # Failure handling: parser may return {} on JSON error / LLM hiccup.
+    # Retry once on the next turn. On second failure, skip the confirmation
+    # step entirely with what we have (demographics + initial complaint) so
+    # the patient never gets stuck staring at a blank record.
+    if (ctx.get("history_pending_confirmation")
+            and ctx.get("step") == "collect_patient_history"
+            and not ctx.get("parsed_history_built")):
+
+        _DEMO = {"age", "gender", "marital_status"}
+        # Use the deterministic field list — robust to LLM skipping FIELD_COMPLETE.
+        # See _history_fields_to_extract docstring for the union strategy.
+        history_fields = _history_fields_to_extract(ctx)
+
+        parse_attempts = ctx.get("history_parse_attempts", 0) + 1
+        ctx["history_parse_attempts"] = parse_attempts
+
+        parsed_fields: dict = {}
+        if history_fields:
+            print(f"📋 [HistoryParse] Running batch parser on {len(history_fields)} fields "
+                  f"(attempt {parse_attempts}): {history_fields}")
+            parsed_fields = _parse_history_with_llm(
+                list(state.get("messages", [])),
+                history_fields,
+            )
+
+        if parsed_fields or not history_fields:
+            # Success (or nothing to parse — pure demographics case)
+            parsed = ctx.setdefault("parsed_history", {})
+            for k, v in parsed_fields.items():
+                parsed[k] = v
+            for demo_key in ("age", "gender", "marital_status"):
+                v = ctx.get("patient", {}).get(demo_key)
+                if v is not None and v != "":
+                    parsed[demo_key] = v
+            ctx["parsed_history_built"] = True
+            # CRITICAL: clear required_history_fields so _advance_step can
+            # move past collect_patient_history. Without this, _advance_step
+            # sees remaining fields and returns early, never reaching the
+            # history_pending_confirmation check → stuck forever.
+            ctx["required_history_fields"] = []
+            print(f"📋 [HistoryParse] Cleared required_history_fields → advancing to confirm step")
+            _advance_step(ctx)
+            save_booking_context(session_id, ctx)
+        elif parse_attempts >= 2:
+            # Two parse attempts failed — bail out gracefully. Skip the
+            # confirmation step entirely with whatever we have so the
+            # patient isn't stuck. Demographics survive, history fields
+            # are left as whatever the auto-save captured (none, in the
+            # new architecture). Triage will still run.
+            print(f"⚠️  [HistoryParse] Parser failed {parse_attempts}x — "
+                  f"skipping confirmation, proceeding to triage with degraded record")
+            parsed = ctx.setdefault("parsed_history", {})
+            for demo_key in ("age", "gender", "marital_status"):
+                v = ctx.get("patient", {}).get(demo_key)
+                if v is not None and v != "":
+                    parsed[demo_key] = v
+            ctx["parsed_history_built"] = True
+            ctx["history_confirmed"] = True            # skip confirm step
+            ctx["history_pending_confirmation"] = False
+            ctx["history_parse_degraded"] = True        # diagnostic flag
+            _advance_step(ctx)
+            save_booking_context(session_id, ctx)
+        else:
+            # First failure — keep the pending flag set so we retry next turn.
+            # Don't mark parsed_history_built. Don't advance step.
+            print(f"⚠️  [HistoryParse] Parser returned empty (attempt {parse_attempts}/2) — "
+                  f"will retry next turn")
+            save_booking_context(session_id, ctx)
+
+    # ── Confirm-step CORRECTION handler: re-parse when patient pushes back ────
+    # If the patient sees the confirmation summary and says "no" or otherwise
+    # signals a correction ("actually my meds are X"), we re-run the parser.
+    # The parser sees the new correction message in the conversation history
+    # and produces an updated record. The directive then re-renders it for
+    # another confirmation pass. Capped at 3 attempts to avoid infinite loops.
+    if (ctx.get("step") == "confirm_patient_history"
+            and last_user_msg
+            and not _YES_RE.search(last_user_msg)):
+
+        _CORRECTION_RE = re.compile(
+            r"(\bno\b|\bnope\b|\bnah\b|\bwrong\b|\bincorrect\b|\bactually\b"
+            r"|\bchange\b|\bupdate\b|\bfix\b|\bedit\b|\bcorrect\b"
+            r"|that\'?s\s+not|that\s+is\s+not|let\s+me|i\s+meant)",
+            re.IGNORECASE,
+        )
+        if _CORRECTION_RE.search(last_user_msg):
+            attempts = ctx.get("history_reparse_attempts", 0)
+            _DEMO = {"age", "gender", "marital_status"}
+            # Same robustness: don't rely solely on collected_this_session.
+            history_fields = _history_fields_to_extract(ctx)
+            if history_fields and attempts < 3:
+                print(f"📋 [HistoryReparse] Patient signalled correction "
+                      f"(attempt {attempts + 1}/3) — re-running parser with full conversation")
+                parsed_fields = _parse_history_with_llm(
+                    list(state.get("messages", [])),
+                    history_fields,
+                )
+                if parsed_fields:
+                    # OVERWRITE — the latest correction should supersede prior values
+                    parsed = ctx.setdefault("parsed_history", {})
+                    for k, v in parsed_fields.items():
+                        parsed[k] = v
+                    # Re-mirror demographics (in case patient corrected age/gender too)
+                    for demo_key in ("age", "gender", "marital_status"):
+                        v = ctx.get("patient", {}).get(demo_key)
+                        if v is not None and v != "":
+                            parsed[demo_key] = v
+                    ctx["history_reparse_attempts"] = attempts + 1
+                    save_booking_context(session_id, ctx)
+                    print(f"📋 [HistoryReparse] Updated record — directive will re-show "
+                          f"with new values: {list(parsed.keys())}")
+                else:
+                    print(f"⚠️  [HistoryReparse] Re-parse returned empty — keeping previous record")
+            elif attempts >= 3:
+                print(f"⚠️  [HistoryReparse] Hit 3-attempt cap — letting LLM handle "
+                      f"this turn conversationally without re-parse")
+
+    # ── Safety net: if we arrived at confirm_patient_history with an empty
+    # parsed_history record, run the parser NOW. This is the last line of
+    # defense — happens when either:
+    #   (a) the FieldFallback path advanced the step but the parser failed
+    #   (b) some other path set history_pending_confirmation+parsed_history_built
+    #       without populating parsed_history
+    # Without this, the directive renders an empty bullet list and the LLM
+    # hallucinates a save tool call to compensate.
+    if (ctx.get("step") == "confirm_patient_history"
+            and not ctx.get("history_confirmed")
+            and not ctx.get("history_safety_parse_done")):
+
+        parsed_existing = ctx.get("parsed_history") or {}
+        _DEMO = {"age", "gender", "marital_status"}
+        has_non_demo = any(
+            k not in _DEMO and v is not None and str(v).strip()
+            for k, v in parsed_existing.items()
+        )
+        if not has_non_demo:
+            print("🛟 [HistorySafetyNet] confirm_patient_history reached with empty "
+                  "parsed_history — running parser as last resort")
+            history_fields = _history_fields_to_extract(ctx)
+            parsed_fields: dict = {}
+            if history_fields:
+                try:
+                    parsed_fields = _parse_history_with_llm(
+                        list(state.get("messages", [])),
+                        history_fields,
+                    )
+                except Exception as e:
+                    print(f"⚠️  [HistorySafetyNet] parser raised: {e}")
+                    parsed_fields = {}
+
+            parsed = ctx.setdefault("parsed_history", {})
+            for k, v in parsed_fields.items():
+                parsed[k] = v
+            # Mirror demographics
+            for demo_key in ("age", "gender", "marital_status"):
+                v = ctx.get("patient", {}).get(demo_key)
+                if v is not None and v != "":
+                    parsed[demo_key] = v
+            ctx["history_safety_parse_done"] = True
+            print(f"🛟 [HistorySafetyNet] parsed_history populated with "
+                  f"{len(parsed)} keys: {list(parsed.keys())}")
+            save_booking_context(session_id, ctx)
+
+    # ── Confirm-step handler: programmatic YES advances the flow ──────────────
+    # During confirm_patient_history we show the patient the parsed record and
+    # ask them to confirm. On YES we (a) do the single batch save of all
+    # parsed history fields to the database, (b) clear the flag, (c) re-compute
+    # the step (which will move forward into triage), and (d) queue a brief
+    # AI confirmation message so the patient isn't left hanging. We do this
+    # BEFORE the LLM call so the model doesn't accidentally re-ask the
+    # confirmation question or hallucinate the save.
+    if (ctx.get("step") == "confirm_patient_history"
+            and last_user_msg
+            and _YES_RE.search(last_user_msg)):
+        print("✅ [HistoryConfirm] Patient confirmed history record — running batch save")
+
+        parsed     = ctx.get("parsed_history") or {}
+        patient_id = ctx.get("patient", {}).get("id")
+        _DEMO      = {"age", "gender", "marital_status"}
+
+        # Save the history fields in ONE call (demographics are already
+        # in the patients table from per-turn update_patient_demographics)
+        history_payload = {
+            k: v for k, v in parsed.items()
+            if k not in _DEMO and v is not None and str(v).strip()
+        }
+
+        # ── LAST-CHANCE PARSE on YES with empty payload ───────────────────────
+        # If the patient said YES but we somehow have nothing to save, run the
+        # parser one more time. Better than silently saving an empty record.
+        if patient_id and not history_payload and not ctx.get("history_yes_reparse_done"):
+            print("🛟 [HistoryConfirm] Empty payload at YES — last-chance parser run")
+            ctx["history_yes_reparse_done"] = True
+            history_fields = _history_fields_to_extract(ctx)
+            if history_fields:
+                try:
+                    parsed_fields = _parse_history_with_llm(
+                        list(state.get("messages", [])),
+                        history_fields,
+                    )
+                    if parsed_fields:
+                        for k, v in parsed_fields.items():
+                            parsed[k] = v
+                        history_payload = {
+                            k: v for k, v in parsed.items()
+                            if k not in _DEMO and v is not None and str(v).strip()
+                        }
+                        print(f"🛟 [HistoryConfirm] Last-chance parse recovered "
+                              f"{len(history_payload)} field(s)")
+                except Exception as e:
+                    print(f"⚠️  [HistoryConfirm] Last-chance parse failed: {e}")
+
+        if patient_id and history_payload:
+            try:
+                from agents.mcp_tools import save_patient_history as _sph
+                result = _sph.invoke({"patient_id": patient_id, **history_payload})
+                if "saved successfully" in str(result).lower():
+                    print(f"✅ [HistoryConfirm] Batch saved {len(history_payload)} fields: "
+                          f"{list(history_payload.keys())}")
+                else:
+                    print(f"⚠️  [HistoryConfirm] Batch save returned unexpected result: {result}")
+            except Exception as e:
+                print(f"❌ [HistoryConfirm] Batch save failed: {e}")
+        else:
+            print(f"⚠️  [HistoryConfirm] Nothing to save (patient_id={patient_id}, "
+                  f"fields={len(history_payload)})")
+
+        ctx["history_pending_confirmation"] = False
+        ctx["history_confirmed"] = True
         _advance_step(ctx)
         save_booking_context(session_id, ctx)
-        print(f"🚦 [Supervisor] Complaint hint '{hint}' auto-applied — routing to triage")
+        # Short programmatic confirmation message — keeps UI flowing.
+        first_name = (ctx.get("patient", {}).get("name") or "").split()[0]
+        hint       = ctx.get("initial_complaint_hint") or ""
+        prefix     = f"Thanks{', ' + first_name if first_name else ''}! " if first_name else "Thanks! "
+        if hint:
+            ack_msg = f"{prefix}Your medical history is confirmed. Now let me ask about your reason for visiting today — you mentioned '{hint}'. Could you tell me a bit more?"
+        else:
+            ack_msg = f"{prefix}Your medical history is confirmed. What brings you in today?"
         return {
-            "messages":              [AIMessage(content="")],
+            "messages":              [AIMessage(content=ack_msg)],
             "booking_context":       ctx,
-            "triage_active":         True,
+            "triage_active":         False,
             "interaction_completed": False,
-            "extracted_symptom":     hint,
+            "extracted_symptom":     state.get("extracted_symptom"),
             "session_id":            session_id,
         }
 
@@ -2517,12 +2979,166 @@ SPECIAL TAGS (output these exact strings when needed):
         print("🧹 [Supervisor] Stripped <think> block from response")
         response = AIMessage(content=cleaned_content, tool_calls=getattr(response, "tool_calls", None) or [])
 
+    # ── Strip hallucinated DSML / inline tool-call markup ─────────────────────
+    # Qwen 32B on Groq occasionally outputs DeepSeek-style tool calls AS PLAIN
+    # TEXT (the `<｜DSML｜>` markup, sometimes mixed with `<tool_call>` tags
+    # or fenced JSON). This leaks garbled syntax to the WhatsApp user and
+    # the tool never actually runs because LangChain doesn't see it as a
+    # real tool_call.
+    #
+    # Strategy: HARD STOP at the first sign of tool-call markup. Once the
+    # model starts hallucinating tool syntax, everything that follows is
+    # garbage — preamble like "Alright, let me save your..." is kept, the
+    # markup and everything after it is deleted. If the cleaned result is
+    # too short to be useful, substitute a clean step-appropriate message.
+    raw_content_2 = str(response.content)
+    _DSML_HARD_STOP = re.compile(
+        r"[<\[]?[｜\|]+\s*DSML[\s\S]*$"
+        r"|<\s*\|\s*[A-Za-z]{2,8}\s*\|[\s\S]*$"
+        r"|<\s*/?\s*tool_calls?\b[\s\S]*$"
+        r"|<\s*/?\s*invoke\b[\s\S]*$"
+        r"|<\s*/?\s*parameter\b[\s\S]*$"
+        r"|```\s*(?:tool_code|tool_calls?|function_call)\b[\s\S]*$",
+        re.IGNORECASE,
+    )
+    stripped_dsml = _DSML_HARD_STOP.sub("", raw_content_2)
+    was_stripped  = stripped_dsml != raw_content_2
+
+    if was_stripped:
+        # Only collapse whitespace when we actually cut something — otherwise
+        # we'd squash the newline-formatted bullet lists in normal responses.
+        cleaned_dsml = re.sub(r"[ \t]+", " ", stripped_dsml).strip()
+        cleaned_dsml = re.sub(r"\n{3,}", "\n\n", cleaned_dsml)
+
+        print("🧹 [Supervisor] Stripped hallucinated DSML/tool-call markup from response")
+        # If stripping left only the "Alright, let me save..." preamble (or
+        # nothing), substitute a clean step-appropriate message so the
+        # patient never sees fragments or a "let me save" promise that won't
+        # actually happen as the model expects.
+        is_save_preamble = bool(
+            re.match(
+                r"^\s*(alright|ok(ay)?|sure|now|first|let me|i'?ll)\s*[,!.\-]*\s*"
+                r"(let me\s+)?(save|store|record|put|update|persist)\b",
+                cleaned_dsml, re.IGNORECASE,
+            )
+        )
+        if len(cleaned_dsml) < 10 or is_save_preamble:
+            cur_step = ctx.get("step", "")
+            if cur_step == "confirm_patient_history":
+                cleaned_dsml = (
+                    "Let me show you what I've recorded — please confirm if everything looks right."
+                )
+            else:
+                cleaned_dsml = "One moment please."
+            print(f"🧹 [Supervisor] Substituted clean message for step={cur_step!r}")
+        response = AIMessage(
+            content   = cleaned_dsml,
+            tool_calls= getattr(response, "tool_calls", None) or [],
+        )
+
     response_text         = str(response.content)
     extracted_symptom     = state.get("extracted_symptom")
     triage_active         = state.get("triage_active") or False
     interaction_completed = state.get("interaction_completed") or False
 
-    if "[SYMPTOM_LOGGED:" in response_text and ctx.get("step") != "collect_patient_history":
+    # ── FALLBACK: LLM skipped [FIELD_COMPLETE] and went straight to complaint ──
+    # The LLM sometimes collects all history fields in one conversational pass
+    # without emitting [FIELD_COMPLETE] tags. When it then asks "What brings
+    # you in today?" the fields are answered in context but not recorded.
+    # Detect this and force-trigger the batch parser so we don't skip confirmation.
+    _COMPLAINT_Q_RE = re.compile(
+        r"(what brings you in|what('?s| is) (the reason|your reason|your concern)|"
+        r"what symptoms|what('?s| is) (wrong|bothering|the problem)|"
+        r"how can (i|we) help you today|reason for (your )?visit)",
+        re.IGNORECASE,
+    )
+    if (ctx.get("step") == "collect_patient_history"
+            and ctx.get("required_history_fields")
+            and not ctx.get("history_pending_confirmation")
+            and _COMPLAINT_Q_RE.search(response_text)):
+        print("⚠️  [FieldFallback] LLM asked complaint question while fields remain — "
+              "running batch parse now (LLM skipped [FIELD_COMPLETE])")
+
+        # ── CRITICAL: Run the parser inline BEFORE advancing the step ─────────
+        # Without this, parsed_history stays empty and the next turn's
+        # confirm_patient_history directive shows the patient an empty record.
+        # The parser block at line ~2579 only fires when step is still
+        # collect_patient_history — but we're about to advance past that.
+        history_fields = _history_fields_to_extract(ctx)
+        parsed_fields: dict = {}
+        if history_fields:
+            print(f"📋 [FieldFallback→HistoryParse] Extracting {len(history_fields)} fields "
+                  f"from conversation: {history_fields}")
+            try:
+                parsed_fields = _parse_history_with_llm(
+                    list(state.get("messages", [])),
+                    history_fields,
+                )
+            except Exception as e:
+                print(f"⚠️  [FieldFallback→HistoryParse] parser raised: {e}")
+                parsed_fields = {}
+
+        parsed = ctx.setdefault("parsed_history", {})
+        for k, v in parsed_fields.items():
+            parsed[k] = v
+        # Mirror demographics into parsed_history for the confirmation render
+        for demo_key in ("age", "gender", "marital_status"):
+            v = ctx.get("patient", {}).get(demo_key)
+            if v is not None and v != "":
+                parsed[demo_key] = v
+        ctx["parsed_history_built"] = True
+        ctx["history_pending_confirmation"] = True
+        ctx["required_history_fields"] = []   # clear so _advance_step proceeds
+        ctx["history_parse_attempts"] = ctx.get("history_parse_attempts", 0) + 1
+        print(f"📋 [FieldFallback→HistoryParse] parsed_history now has "
+              f"{len(parsed)} keys: {list(parsed.keys())}")
+
+        _advance_step(ctx)
+        save_booking_context(session_id, ctx)
+        # Replace the complaint question with a hold message — confirmation first
+        response = AIMessage(
+            content   = "Thank you! Let me just confirm what I've noted before we proceed.",
+            tool_calls= [],
+        )
+
+    # ── [FIELD_COMPLETE] handler — LLM-driven field advancement ────────────────
+    # During collect_patient_history (history-fields phase), the directive
+    # instructs the LLM to emit [FIELD_COMPLETE] whenever it has a clear
+    # answer for the current field. This replaces brittle regex on the
+    # patient's message — the LLM has full context and can correctly handle
+    # multi-turn answers, "no X but yes Y", corrections, etc.
+    if "[FIELD_COMPLETE]" in response_text and ctx.get("step") == "collect_patient_history":
+        required = ctx.get("required_history_fields") or []
+        if required:
+            current_field = required[0]
+            _DEMO = {"age", "gender", "marital_status"}
+            if current_field not in _DEMO:
+                reqs = list(required)
+                reqs.remove(current_field)
+                ctx["required_history_fields"] = reqs
+                coll = ctx.setdefault("collected_this_session", [])
+                if current_field not in coll:
+                    coll.append(current_field)
+                counts = ctx.setdefault("history_field_turn_count", {})
+                counts[current_field] = 0
+                print(f"📝 [FieldComplete] LLM signalled '{current_field}' is complete — advanced")
+                if not reqs:
+                    ctx["history_pending_confirmation"] = True
+                    print(f"📋 [FieldComplete] All history fields done — flagging for batch parse")
+                save_booking_context(session_id, ctx)
+            else:
+                print(f"⚠️  [FieldComplete] LLM emitted marker for demographic field "
+                      f"'{current_field}' — ignored (demographics use update_patient_demographics)")
+        # Strip the marker from the response — patient should never see it
+        cleaned = re.sub(r"\[FIELD_COMPLETE\]", "", response_text).strip()
+        response = AIMessage(
+            content   = cleaned,
+            tool_calls= getattr(response, "tool_calls", None) or [],
+        )
+        response_text = cleaned
+
+    _HISTORY_STEPS = {"collect_patient_history", "confirm_patient_history"}
+    if "[SYMPTOM_LOGGED:" in response_text and ctx.get("step") not in _HISTORY_STEPS:
         start   = response_text.find("[SYMPTOM_LOGGED:") + 16
         end     = response_text.find("]", start)
         symptom = response_text[start:end].strip()
@@ -2544,27 +3160,38 @@ SPECIAL TAGS (output these exact strings when needed):
             response = AIMessage(content="")   # triage_node will speak
             save_booking_context(session_id, ctx)
             print("🚦 [Supervisor] Triage auto-triggered programmatically after SYMPTOM_LOGGED")
-    elif "[SYMPTOM_LOGGED:" in response_text and ctx.get("step") == "collect_patient_history":
+    elif "[SYMPTOM_LOGGED:" in response_text and ctx.get("step") in _HISTORY_STEPS:
         start   = response_text.find("[SYMPTOM_LOGGED:") + 16
         end     = response_text.find("]", start)
         symptom = response_text[start:end].strip()
-        # Store for later so patient doesn't have to repeat the complaint
+        # Store the complaint hint so patient doesn't have to repeat it later
         if not ctx.get("initial_complaint_hint"):
             ctx["initial_complaint_hint"] = symptom
-            print(f"📝 [Supervisor] 💾 Complaint hint stored: '{symptom}' (will be used post-history)")
+            print(f"📝 [Supervisor] 💾 Complaint hint stored: '{symptom}' (used post-history)")
         print(f"📝 [Supervisor] ⛔ SYMPTOM_LOGGED suppressed during history phase: '{symptom}'")
-        # Strip both tags but keep the full response — legitimate questions must not be cut
-        cleaned = re.sub(r"\[SYMPTOM_LOGGED:[^\]]*\]", "", response_text)
-        cleaned = re.sub(r"\[START_TRIAGE\]", "", cleaned).strip()
-        # CRITICAL: preserve tool_calls so the router still goes to tool_executor
-        response = AIMessage(content=cleaned, tool_calls=getattr(response, "tool_calls", None) or [])
         save_booking_context(session_id, ctx)
-        # If all history fields are done, advance step NOW so next turn fires triage properly
+
+        # If all history fields are done, advance step so triage fires next turn
         required = ctx.get("required_history_fields")
         if required is not None and len(required) == 0:
             _advance_step(ctx)
             save_booking_context(session_id, ctx)
             print(f"📝 [Supervisor] ✅ Step advanced to '{ctx['step']}' — triage fires next turn")
+            # Let the existing response through (stripped) — no redirect needed
+            cleaned = re.sub(r"\[SYMPTOM_LOGGED:[^\]]*\]", "", response_text)
+            cleaned = re.sub(r"\[START_TRIAGE\]", "", cleaned).strip()
+            response = AIMessage(content=cleaned, tool_calls=[])
+        else:
+            # History still in progress — cancel all tool calls, redirect to current field
+            current_field = (required or [""])[0] if required else ""
+            redirect_q    = _QUESTION_FOR_FIELD.get(current_field, "")
+            redirect_msg  = (
+                f"I noted that — we'll get to your {symptom} shortly. "
+                f"First, let me finish collecting your medical history. "
+                f"{redirect_q}"
+            ).strip()
+            print(f"📝 [Supervisor] ↩️  Redirecting to history field '{current_field}'")
+            response = AIMessage(content=redirect_msg, tool_calls=[])  # ← cancel tool calls
 
     # ── Human handoff detection ───────────────────────────────────────────────
     if "[HUMAN_REQUESTED]" in response_text:
@@ -2686,16 +3313,15 @@ SPECIAL TAGS (output these exact strings when needed):
 def entry_router(state):
     ctx = state.get("booking_context", {})
 
-    appt_confirmed = (ctx.get("appointment") or {}).get("confirmed")
-
-    # 1. SOAP note — fires once after booking confirmed
-    if appt_confirmed and not ctx.get("diagnostic_report"):
-        print("🔀 [EntryRouter] booking confirmed + no report → diagnostic_node")
+    # 1. SOAP note — fires once AFTER patient says goodbye (interaction_completed)
+    # NOT immediately on booking confirmation — patient may still have questions.
+    if state.get("interaction_completed") and not ctx.get("diagnostic_report"):
+        print("🔀 [EntryRouter] interaction complete + no report → diagnostic_node")
         return "diagnostic_node"
 
     # 2. LLM Judge — fires after SOAP, only when USE_LLM_JUDGE=true
     if (_USE_LLM_JUDGE
-            and appt_confirmed
+            and state.get("interaction_completed")
             and ctx.get("diagnostic_report")
             and not ctx.get("judge_report")):
         print("🔀 [EntryRouter] SOAP done → judge_node")

@@ -24,7 +24,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -222,9 +221,19 @@ def _get_questions_asked(state: dict) -> int:
     return state.get("booking_context", {}).get("triage_questions_asked", 0)
 
 
-def _get_max_questions(state: dict) -> int:
-    """Dynamic limit based on severity from the first symptom lookup."""
+def _get_max_questions(state: dict, symptom: str = "") -> int:
+    """
+    Dynamic limit:
+      - Returning patient (same complaint, not resolved, within 180d) → 3 or 5 q's
+        depending on the complaint (cardiac/abdominal/neuro keep full OLDCARTS)
+      - Otherwise → severity-based limit from the first symptom lookup
+    """
     ctx = state.get("booking_context", {})
+    if ctx.get("is_returning_same_complaint"):
+        cap = _returning_question_cap(symptom)
+        print(f"   [DynamicLimit] returning_patient=True → max_questions={cap} "
+              f"(complaint='{symptom[:40]}')")
+        return cap
     severity = ctx.get("triage_severity", "Unknown")
     limit = MAX_QUESTIONS_BY_SEVERITY.get(severity, MAX_TRIAGE_QUESTIONS)
     print(f"   [DynamicLimit] severity='{severity}' → max_questions={limit}")
@@ -432,6 +441,15 @@ def _rephrase_with_qwen(raw_text: str, patient_language: str = "en") -> str:
 
 
 def _save_triage_to_supabase(ctx: dict, clinical_summary: str, qa_pairs: list[str]) -> None:
+    """
+    Persist the raw triage Q&A + clinical summary to the appointments.notes column.
+
+    NOTE: this gets OVERWRITTEN by diagnostic_agent's SOAP note when the patient
+    completes booking and the diagnostic node runs. So this is essentially a
+    safety net for sessions where the diagnostic flow doesn't run. Don't bother
+    adding rich structured fields here — they'd be lost. The conditions /
+    severity / specialist all already live in the SOAP note written later.
+    """
     booking_id = ctx.get("appointment", {}).get("booking_id")
     if not booking_id:
         return
@@ -442,7 +460,8 @@ def _save_triage_to_supabase(ctx: dict, clinical_summary: str, qa_pairs: list[st
     )
     try:
         save_case_notes.invoke({"appointment_id": booking_id, "notes": notes})
-        print(f"💾 [Triage] Notes saved for booking_id={booking_id}")
+        print(f"💾 [Triage] Notes saved for booking_id={booking_id} "
+              f"(will be overwritten by SOAP after diagnostic runs)")
     except Exception as e:
         print(f"❌ [Triage] Failed to save notes: {e}")
 
@@ -540,9 +559,18 @@ def _detect_explicit_doctor_request(state: dict) -> str | None:
 
 def _check_returning_patient_for_complaint(ctx: dict, symptom: str) -> bool:
     """
-    Returns True if patient has prior appointment notes mentioning the
-    same complaint area — indicating they've already seen a GP for this.
-    Uses simple keyword overlap between complaint and prior notes.
+    Returns True if patient has prior recent appointment notes mentioning the
+    same complaint area AND that prior episode was not flagged as resolved AND
+    the prior visit was within the last 180 days.
+
+    Side effects (stored in ctx for downstream routing):
+      - recent_case_notes        : full raw notes string (used by routing)
+      - prior_specialist         : specialist seen for the same complaint, if any
+      - prior_visit_days_ago     : days since the most recent matching visit
+      - prior_complaint_resolved : True if notes contain a "resolved" marker
+
+    Uses simple keyword overlap between current complaint and prior notes,
+    with a 6-month decay window and a resolution-status heuristic.
     """
     patient_id = ctx.get("patient", {}).get("id")
     if not patient_id:
@@ -553,23 +581,101 @@ def _check_returning_patient_for_complaint(ctx: dict, symptom: str) -> bool:
         if "No case notes" in result or not result.strip():
             return False
 
-        # Simple overlap check — if symptom keywords appear in past notes
+        # Cache full notes so _determine_routing / _complete_triage can re-use them
+        ctx["recent_case_notes"] = result
+
+        # ── Keyword overlap between current complaint and prior notes ────────
         symptom_tokens = set(re.findall(r"[a-z]+", symptom.lower()))
         notes_tokens   = set(re.findall(r"[a-z]+", result.lower()))
-        # Remove noise words
         stop = {"the", "a", "an", "of", "and", "or", "is", "was", "for", "to",
                 "in", "at", "with", "no", "not", "this", "that", "has", "have"}
         symptom_tokens -= stop
-        overlap = symptom_tokens & notes_tokens
-        overlap_ratio = len(overlap) / max(len(symptom_tokens), 1)
+        overlap        = symptom_tokens & notes_tokens
+        overlap_ratio  = len(overlap) / max(len(symptom_tokens), 1)
+        keyword_match  = overlap_ratio >= 0.3   # 30%+ keyword overlap
 
-        returning = overlap_ratio >= 0.3   # 30%+ keyword overlap = likely same complaint
+        if not keyword_match:
+            print(f"   [ReturningCheck] symptom_tokens={symptom_tokens}  "
+                  f"overlap={overlap}  ratio={overlap_ratio:.2f}  returning=False (no keyword match)")
+            return False
+
+        # ── Time-decay: anything older than 180 days = new episode ──────────
+        # Notes format includes ISO-like dates: [2026-04-25T00:01:42.028646+00:00]
+        from datetime import datetime, timezone
+        date_matches = re.findall(r"\[(\d{4}-\d{2}-\d{2})", result)
+        days_ago = None
+        if date_matches:
+            try:
+                most_recent = max(datetime.fromisoformat(d) for d in date_matches)
+                days_ago    = (datetime.now() - most_recent).days
+                ctx["prior_visit_days_ago"] = days_ago
+            except Exception:
+                pass
+
+        if days_ago is not None and days_ago > 180:
+            print(f"   [ReturningCheck] keyword match BUT prior visit was {days_ago} days ago "
+                  f"(>180) → treat as new episode → returning=False")
+            return False
+
+        # ── Resolution heuristic (currently a safety net — will trigger if a future
+        # ── SOAP template or clinician adds an explicit resolution marker).
+        # ── For now, the SOAP note doesn't have a structured "resolved" field,
+        # ── so this almost never fires. Leaving the check in place so the day
+        # ── the diagnostic agent learns to mark "Status: Resolved" we get the
+        # ── behaviour for free without touching this code again.
+        resolution_markers = re.compile(
+            r"\b(status\s*:\s*resolved|condition\s+resolved|"
+            r"treatment\s+successful|fully\s+recovered)\b",
+            re.IGNORECASE,
+        )
+        is_resolved = bool(resolution_markers.search(result))
+        ctx["prior_complaint_resolved"] = is_resolved
+        if is_resolved:
+            print(f"   [ReturningCheck] keyword match BUT prior complaint flagged resolved → "
+                  f"treat as new episode → returning=False")
+            return False
+
+        # ── Try to extract the specialist seen for the prior visit ─────────────
+        # SOAP notes from diagnostic_agent contain "Recommended Specialist : X".
+        # Older triage-only notes may use "Suggested specialist : X".
+        spec_match = (
+            re.search(r"Recommended\s+Specialist\s*:\s*([A-Za-z][A-Za-z\s]+?)(?:\n|$)", result, re.IGNORECASE)
+            or re.search(r"Suggested\s+specialist\s*:\s*([A-Za-z][A-Za-z\s]+?)(?:\n|$)", result, re.IGNORECASE)
+            or re.search(r"SPECIALTY\s*:\s*([A-Za-z][A-Za-z\s]+?)(?:\n|$)", result, re.IGNORECASE)
+        )
+        if spec_match:
+            prior_spec = spec_match.group(1).strip()
+            if prior_spec and prior_spec.lower() not in {"general physician", "gp"}:
+                ctx["prior_specialist"] = prior_spec
+                print(f"   [ReturningCheck] Extracted prior specialist: '{prior_spec}'")
+
         print(f"   [ReturningCheck] symptom_tokens={symptom_tokens}  "
-              f"overlap={overlap}  ratio={overlap_ratio:.2f}  returning={returning}")
-        return returning
+              f"overlap={overlap}  ratio={overlap_ratio:.2f}  "
+              f"days_ago={days_ago}  resolved={is_resolved}  returning=True")
+        return True
     except Exception as e:
         print(f"⚠️  [Triage] Returning patient check failed: {e}")
         return False
+
+
+# ── Complaint-specific question caps for returning patients ──────────────────
+# Some complaints genuinely need full OLDCARTS even on a return visit because
+# the clinical picture can change significantly between episodes.
+_RETURNING_FULL_QUESTIONS_COMPLAINTS = re.compile(
+    r"\b(chest|cardiac|heart|breath|shortness|abdominal|abdomen|stroke|"
+    r"seizure|bleed|severe|sudden|paralys)\b",
+    re.IGNORECASE,
+)
+
+def _returning_question_cap(symptom: str) -> int:
+    """
+    How many questions to ask a RETURNING patient for the SAME complaint.
+    Default 3 (fast-track), but bumped to 5 for complaints where the
+    differential really can shift between visits (cardiac, abdominal, neuro).
+    """
+    if symptom and _RETURNING_FULL_QUESTIONS_COMPLAINTS.search(symptom):
+        return 5
+    return 3
 
 
 # ── Main node ─────────────────────────────────────────────────────────────────
@@ -631,6 +737,11 @@ def triage_node(state: dict) -> dict:
             ctx["triage_questions_asked"] = 0      # start the question count fresh
             ctx["triage_severity"]        = "Unknown"
             ctx["symptom_context_block"]  = ""     # force re-lookup for new symptom
+            # Reset returning-patient flag — it was computed against "routine
+            # checkup" not the actual revealed symptom; let next iteration
+            # recompute it correctly
+            ctx.pop("is_returning_same_complaint", None)
+            ctx.pop("prior_specialist", None)
             _persist_booking_context(ctx)
             # Update locals — fall through to symptomatic triage below
             symptom         = new_symptom
@@ -667,28 +778,29 @@ def triage_node(state: dict) -> dict:
         ctx["accumulated_symptoms"] = accumulated
         print(f"   accumulated_symptoms count={len(accumulated)}")
 
-    # ── Symptom lookup — TURN 1 ONLY ─────────────────────────────
-    symptom_context_block = ctx.get("symptom_context_block", "")
-    _use_lookup = os.getenv("USE_SYMPTOM_LOOKUP", "true").lower() != "false"
-    if not _use_lookup:
+    # ── Returning patient check — TURN 1 ONLY ────────────────────
+    # Must run BEFORE _get_max_questions so the question cap can shrink
+    # when the same complaint was already seen recently. Sets:
+    #   ctx["is_returning_same_complaint"]  (bool)
+    #   ctx["recent_case_notes"]            (raw notes, for routing)
+    #   ctx["prior_specialist"]             (if extracted from notes)
+    #   ctx["prior_visit_days_ago"]         (decay metric)
+    #   ctx["prior_complaint_resolved"]     (resolution heuristic)
+    if questions_asked == 0 and symptom and "is_returning_same_complaint" not in ctx:
+        ctx["is_returning_same_complaint"] = _check_returning_patient_for_complaint(ctx, symptom)
+        _persist_booking_context(ctx)
+
+    # ── Symptom lookup is DEFERRED ────────────────────────────────
+    # Previously this ran on turn 1 with only the chief complaint, which gave
+    # imprecise severity/specialist estimates. We now run lookup ONCE in
+    # _complete_triage() with the FULL accumulated symptom set (chief complaint
+    # + all triage answers), which is much more accurate.
+    #
+    # Severity starts as Unknown so _get_max_questions returns a generous limit
+    # (10 q's) for first-time visits — triage gets the full OLDCARTS picture.
+    if questions_asked == 0:
         ctx.setdefault("triage_severity", "Unknown")
-        print("🔧 [Triage] symptom_lookup disabled (USE_SYMPTOM_LOOKUP=false)")
-    elif symptom and not symptom_context_block:
-        tokens = [s.strip() for s in symptom.replace(",", " ").split() if s.strip()]
-        try:
-            match = lookup(tokens)
-            symptom_context_block = format_for_prompt(match)
-            ctx["symptom_context_block"] = symptom_context_block
-            ctx["triage_severity"] = match.severity
-            print(f"🔍 [Triage] Turn-1 lookup → "
-                  f"candidates: {[m.disease for m in match.top_matches]}  "
-                  f"severity={match.severity}")
-        except Exception as e:
-            print(f"⚠️  [Triage] symptom_lookup failed: {e}")
-            ctx["triage_severity"] = "Unknown"
-    else:
-        if not symptom:
-            print("⚠️  [Triage] No symptom in state")
+        ctx.setdefault("symptom_context_block", "")
 
     # ── Patient history — TURN 1 ONLY ────────────────────────────
     patient_history_block = ctx.get("patient_history_block", "")
@@ -700,8 +812,11 @@ def triage_node(state: dict) -> dict:
         else:
             ctx["patient_history_block"] = ""   # mark as attempted so we don't retry
 
-    # ── Dynamic question limit ────────────────────────────────────
-    max_questions = _get_max_questions(state)
+    # ── Dynamic question limit (now sees the returning flag) ─────
+    max_questions = _get_max_questions(state, symptom)
+
+    # symptom_context_block stays empty until _complete_triage runs the final lookup
+    symptom_context_block = ctx.get("symptom_context_block", "")
 
     # ── Compute dimensions early so we can cap the limit at len(dimensions) ──
     # Without this, a routine_intent visit (1 dimension) would keep asking the
@@ -729,8 +844,8 @@ def triage_node(state: dict) -> dict:
         return _complete_triage(state, summary, triage_qa, profile, ctx)
 
     # ── Record the most recent Q&A pair ───────────────────────────
-    # Skip turn 0 — no triage question asked yet; most recent human
-    # message is from history collection and would contaminate triage Q&A.
+    # Skip turn 0 — no triage question has been asked yet; the most recent
+    # human message belongs to history collection, not triage.
     if questions_asked > 0:
         triage_qa = _record_qa_pair(state, triage_qa)
 
@@ -761,6 +876,7 @@ def triage_node(state: dict) -> dict:
         f"YOUR TASK THIS TURN ({dim_idx + 1} of {len(dimensions)}):\n"
         f"  Dimension : {label}\n"
         f"  Ask       : \"{current_dim_question}\"\n\n"
+        f"{'⚠️  RETURNING PATIENT — same complaint as prior visit. Ask only what has CHANGED (severity, new symptoms). Already have full OLDCARTS from last visit.' if ctx.get('is_returning_same_complaint') else ''}\n"
         f"⛔ ALREADY ASKED — DO NOT repeat these: "
         f"{', '.join(dimensions[i][0].replace('_',' ').title() for i in range(dim_idx)) or 'none yet'}\n"
         f"Ask this ONE question naturally in the patient's language. "
@@ -781,20 +897,14 @@ def triage_node(state: dict) -> dict:
         raw_text = str(response.content).strip()
         print(f"🧠 [MedGemma raw output] → {raw_text[:300]}")
 
-        # ── Guard: MedGemma echoed patient answer or gave nonsense ────────────
-        # When MedGemma outputs something very short (< 15 chars) or a single
-        # word that looks like a patient response ("no", "yes", "okay" etc.),
-        # it failed to ask the dimension question. Use the scripted question.
+        # ── Echo guard: MedGemma sometimes echoes patient answer instead of asking
         _ECHO_RE = re.compile(
             r"^(no|yes|okay|ok|none|nope|sure|fine|i see|understood|noted|"
-            r"alright|got it|thank you|thanks|sorry|hmm|ah)\s*[\.\!]*$",
+            r"alright|got it|thank you|thanks|sorry|hmm|ah)\s*[\.!]*$",
             re.IGNORECASE,
         )
         if len(raw_text) < 15 or _ECHO_RE.match(raw_text):
-            print(
-                f"⚠️  [Triage] MedGemma output looks like an echo/nonsense: '{raw_text}' "
-                f"— falling back to scripted dimension question"
-            )
+            print(f"⚠️  [Triage] Echo/nonsense detected: '{raw_text}' → scripted question")
             raw_text = current_dim_question
 
         # ── Append MedGemma's raw output to its ISOLATED history ──────────────
@@ -925,22 +1035,32 @@ def _complete_triage(
     # ── GP-FIRST ROUTING LOGIC ─────────────────────────────────────
     #
     # Priority order:
-    #   1. Severe → skip GP, go straight to specialist
-    #   2. Patient explicitly requested a doctor type → honor it
-    #   3. Returning patient for same complaint → specialist (they've seen GP already)
-    #   4. First visit → General Physician
+    #   1. Severe                              → skip GP, go straight to specialist
+    #   2. Patient explicitly requested a doc  → honour it
+    #   3. Returning patient (same complaint)  → prior specialist if known,
+    #                                            else dataset specialist
+    #   4. First visit                         → General Physician
     #
     symptom = state.get("extracted_symptom", initial)
 
     explicit_request  = _detect_explicit_doctor_request(state)
-    is_returning      = _check_returning_patient_for_complaint(ctx, symptom)
+    # Re-use the flag computed earlier in triage_node (turn 1). Fall back to
+    # re-checking here if for some reason the flag wasn't set (e.g. triage
+    # entered via a path that skipped turn-1 setup).
+    is_returning      = ctx.get("is_returning_same_complaint")
+    if is_returning is None:
+        is_returning = _check_returning_patient_for_complaint(ctx, symptom)
+    prior_specialist  = ctx.get("prior_specialist")
     is_severe         = final_severity == "Severe"
 
     print(f"\n   ── ROUTING DECISION ──")
-    print(f"   severity       = {final_severity}  is_severe={is_severe}")
-    print(f"   explicit_req   = {explicit_request}")
-    print(f"   is_returning   = {is_returning}")
-    print(f"   dataset_spec   = {dataset_specialist}")
+    print(f"   severity         = {final_severity}  is_severe={is_severe}")
+    print(f"   explicit_req     = {explicit_request}")
+    print(f"   is_returning     = {is_returning}")
+    print(f"   prior_specialist = {prior_specialist}")
+    print(f"   prior_days_ago   = {ctx.get('prior_visit_days_ago')}")
+    print(f"   resolved         = {ctx.get('prior_complaint_resolved')}")
+    print(f"   dataset_spec     = {dataset_specialist}")
 
     if is_severe:
         final_doctor_type = dataset_specialist
@@ -948,7 +1068,16 @@ def _complete_triage(
     elif explicit_request:
         final_doctor_type = explicit_request
         routing_reason = f"Patient explicitly requested → {explicit_request}"
+    elif is_returning and prior_specialist:
+        # Patient already saw a specialist for this same complaint — send them
+        # back to that same specialist directly (don't go through GP again)
+        final_doctor_type = prior_specialist
+        routing_reason = (
+            f"Returning patient — last seen by {prior_specialist} "
+            f"for same complaint → direct route"
+        )
     elif is_returning:
+        # Returning but no specialist on record → use dataset suggestion
         final_doctor_type = dataset_specialist
         routing_reason = f"Returning patient (same complaint) → specialist ({dataset_specialist})"
     else:

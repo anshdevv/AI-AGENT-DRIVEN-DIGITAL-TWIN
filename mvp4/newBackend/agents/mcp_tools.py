@@ -1040,22 +1040,76 @@ def get_doctor_schedule(doctor_id: int | None = None, doctor_name: str | None = 
 
 
 @tool
-def create_booking(patient_id: int, doctor_id: int, date: str, time: str) -> str:
+def create_booking(
+    patient_id: int,
+    doctor_id: int,
+    date: str,
+    time: str,
+    chief_complaint: str,
+) -> str:
     """
     Create a confirmed appointment for an existing patient with an existing doctor.
-    Requires: patient_id (int), doctor_id (int), date (e.g. '2026-04-20' or 'tomorrow'), time (e.g. '14:30').
-    Validates the slot is actually free before booking. Creates both slot and appointment records.
-    Also logs an appointment_events entry for audit trail.
+    All five arguments are REQUIRED:
+      - patient_id    : int
+      - doctor_id     : int
+      - date          : e.g. '2026-04-20' or 'tomorrow'
+      - time          : e.g. '14:30'
+      - chief_complaint : the symptom/reason for the visit (used for duplicate detection
+                          and returning-patient routing on future visits)
+    Validates the slot is free, creates slot + appointment + audit-trail rows.
+    Refuses the booking if the patient already has a pending appointment for the
+    same complaint.
     """
-    print(f"🛠️ [Tool] create_booking: patient_id={patient_id}, doctor_id={doctor_id}, date={date}, time={time}")
+    print(f"🛠️ [Tool] create_booking: patient_id={patient_id}, doctor_id={doctor_id}, "
+          f"date={date}, time={time}, complaint='{chief_complaint[:50]}'")
     if not supabase:
         return "Database not connected."
+    if not chief_complaint or not chief_complaint.strip():
+        return "chief_complaint is required — cannot book without knowing why the patient is visiting."
 
     try:
         target_date = _parse_date(date)
         target_time = _parse_time(time)
     except ValueError as exc:
         return f"Invalid date/time: {exc}"
+
+    # ── Duplicate-booking guard ───────────────────────────────────────────────
+    # If this patient already has a 'pending' (not yet completed/cancelled)
+    # appointment for the same complaint, refuse the second booking.
+    # Best-effort: silently skip the check if the new columns don't exist yet.
+    if chief_complaint:
+        try:
+            existing = (
+                supabase.table("appointments")
+                .select("id, doctor_id, appointment_date, appointment_time, chief_complaint, consultation_status")
+                .eq("patient_id", patient_id)
+                .execute()
+            )
+            for appt in (existing.data or []):
+                if str(appt.get("consultation_status", "pending")).lower() in {"completed", "resolved", "cancelled", "canceled", "no_show"}:
+                    continue
+                prior = (appt.get("chief_complaint") or "").lower()
+                cur   = chief_complaint.lower()
+                if not prior:
+                    continue
+                # Token overlap to catch "sore throat" vs "throat pain"
+                prior_tokens = set(re.findall(r"[a-z]+", prior))
+                cur_tokens   = set(re.findall(r"[a-z]+", cur))
+                stop = {"the","a","an","of","and","or","is","was","for","to","in","at","with","no","not","this","that","has","have","i","am","my"}
+                prior_tokens -= stop
+                cur_tokens   -= stop
+                if prior_tokens and cur_tokens:
+                    overlap = prior_tokens & cur_tokens
+                    if len(overlap) / max(len(cur_tokens), 1) >= 0.4:
+                        appt_when = f"{appt.get('appointment_date','?')} at {appt.get('appointment_time','?')}"
+                        return (
+                            f"You already have a pending appointment for this complaint "
+                            f"('{appt.get('chief_complaint')}') on {appt_when} with doctor "
+                            f"ID {appt.get('doctor_id')}. Please attend that appointment or "
+                            f"cancel it before booking again. (Appointment ID: {appt['id']})"
+                        )
+        except Exception as e:
+            print(f"   ⚠️  [DupCheck] Could not check for duplicates (likely missing columns): {e}")
 
     weekday = _day_of_week_from_date(target_date)
     schedule_rows = _get_schedule_rows(doctor_id, weekday)
@@ -1091,24 +1145,28 @@ def create_booking(patient_id: int, doctor_id: int, date: str, time: str) -> str
     if not slot_record:
         return "Slot could not be reserved."
 
-    # Create appointment record
+    # ── Create appointment record ─────────────────────────────────────────────
+    # Required Supabase columns on `appointments` for full feature support:
+    #   appointment_date     TEXT    (e.g. '2026-06-08')
+    #   appointment_time     TEXT    (e.g. '11:00')
+    #   chief_complaint      TEXT    — for duplicate detection & returning-patient routing
+    #   consultation_status  TEXT    — 'pending' | 'completed' | 'resolved' | 'cancelled'
+    # If any are missing, we retry without them so existing data still works.
     try:
         appointment_payload = {
-            "slot_id":          slot_record["id"],
-            "doctor_id":        doctor_id,
-            "patient_id":       patient_id,
-            "status":           "booked",
-            # Store date + time directly so appointments can be read without joining slots.
-            # Requires two TEXT/DATE/TIME columns in your Supabase appointments table:
-            #   appointment_date  TEXT  (e.g. '2026-06-08')
-            #   appointment_time  TEXT  (e.g. '11:00')
-            "appointment_date": target_date.strftime("%Y-%m-%d"),
-            "appointment_time": target_time.strftime("%H:%M"),
+            "slot_id":             slot_record["id"],
+            "doctor_id":           doctor_id,
+            "patient_id":          patient_id,
+            "status":              "booked",
+            "appointment_date":    target_date.strftime("%Y-%m-%d"),
+            "appointment_time":    target_time.strftime("%H:%M"),
+            "chief_complaint":     chief_complaint or None,
+            "consultation_status": "pending",
         }
-        response = supabase.table("appointments").insert(appointment_payload).execute()
+        response    = supabase.table("appointments").insert(appointment_payload).execute()
         appointment = response.data[0] if response.data else None
     except Exception as e:
-        # If the new columns don't exist yet, retry without them so booking still works
+        # Retry without the optional columns so booking still works on older schemas
         try:
             fallback_payload = {
                 "slot_id":    slot_record["id"],
@@ -1119,11 +1177,15 @@ def create_booking(patient_id: int, doctor_id: int, date: str, time: str) -> str
             response    = supabase.table("appointments").insert(fallback_payload).execute()
             appointment = response.data[0] if response.data else None
             if appointment:
-                print(f"   ⚠️  appointment_date/time columns missing — added without them. "
-                      f"Run: ALTER TABLE appointments ADD COLUMN appointment_date TEXT; "
-                      f"ALTER TABLE appointments ADD COLUMN appointment_time TEXT;")
+                print(
+                    "   ⚠️  Optional columns missing — appointment created without them. To enable\n"
+                    "       full features (duplicate detection, returning-patient routing, completion tracking) run:\n"
+                    "         ALTER TABLE appointments ADD COLUMN appointment_date TEXT;\n"
+                    "         ALTER TABLE appointments ADD COLUMN appointment_time TEXT;\n"
+                    "         ALTER TABLE appointments ADD COLUMN chief_complaint TEXT;\n"
+                    "         ALTER TABLE appointments ADD COLUMN consultation_status TEXT DEFAULT 'pending';"
+                )
         except Exception as e2:
-            # Roll back slot
             supabase.table("slots").update({"status": "available"}).eq("id", slot_record["id"]).execute()
             return f"Failed to create appointment: {e2}"
 
@@ -1197,6 +1259,48 @@ def save_case_notes(appointment_id: int, notes: str) -> str:
         return f"No appointment found with ID {appointment_id}."
     except Exception as e:
         return f"Error saving notes: {e}"
+
+
+@tool
+def update_consultation_status(appointment_id: int, status: str) -> str:
+    """
+    Mark an appointment's consultation status — the field used to decide whether
+    a future complaint counts as a NEW episode or a continuation.
+
+    Allowed status values:
+      - 'pending'   : default; consultation hasn't happened yet
+      - 'completed' : doctor saw the patient; complaint still active
+      - 'resolved'  : doctor saw the patient; complaint fully resolved → next
+                      visit for the same symptom counts as a fresh episode
+      - 'cancelled' : appointment was cancelled before consultation
+      - 'no_show'   : patient didn't attend
+    """
+    print(f"🛠️ [Tool] update_consultation_status: appointment_id={appointment_id}, status='{status}'")
+    if not supabase:
+        return "Database not connected."
+
+    allowed = {"pending", "completed", "resolved", "cancelled", "canceled", "no_show"}
+    s = status.strip().lower()
+    if s not in allowed:
+        return f"Invalid status '{status}'. Must be one of: {', '.join(sorted(allowed))}."
+
+    try:
+        response = (
+            supabase.table("appointments")
+            .update({"consultation_status": s})
+            .eq("id", appointment_id)
+            .execute()
+        )
+        if response.data:
+            return f"Appointment {appointment_id} marked as '{s}'."
+        return f"No appointment found with ID {appointment_id}."
+    except Exception as e:
+        # Likely the column doesn't exist yet
+        return (
+            f"Error updating consultation_status: {e}\n"
+            f"Run: ALTER TABLE appointments ADD COLUMN consultation_status TEXT DEFAULT 'pending';"
+        )
+
 
 @tool
 def get_doctors_by_specialization(specialization: str) -> str:
@@ -1486,6 +1590,7 @@ ALL_TOOLS = [
     create_booking,
     get_recent_case_notes,
     save_case_notes,
+    update_consultation_status,
     get_patient_history,
     save_patient_history,
     add_to_waitlist,
