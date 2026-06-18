@@ -297,19 +297,287 @@ def _compute_required_history_fields(patient: dict, history_data: str | None) ->
 
 
 # ── Per-field turn limit: after this many turns on one field, force-advance ──
-_MAX_TURNS_PER_HISTORY_FIELD = 3
+_MAX_TURNS_PER_HISTORY_FIELD = 2
+
+# ── Negative / "none" answer patterns — these ALWAYS count as a complete answer ──
+_NEGATIVE_ANSWER_RE = re.compile(
+    r"^\s*(no+|none|nope|nah|never|nothing|n/a|na)\b",
+    re.IGNORECASE,
+)
+
+# ── Off-topic detector — patient is talking about something else entirely ──
+# (their actual complaint, scheduling, etc.) rather than answering the
+# current history question. Used to decide whether to advance or redirect.
+_OFFTOPIC_HINT_RE = re.compile(
+    r"(book|appointment|slot|schedule|doctor|specialist|"
+    r"pain|ache|hurt|symptom|sick|unwell|fever|headache|throat|cough)",
+    re.IGNORECASE,
+)
 
 
-def _enforce_history_field_limits(ctx: dict) -> None:
+def _refresh_patient_history_blob(ctx: dict) -> None:
+    """
+    Rebuild ctx["patient_history_data"] from what's been collected/saved this
+    session so MedGemma and the conditional-followup logic see freshly-collected
+    fields instead of the stale "No medical history on file" snapshot that
+    was taken when get_patient_history first ran.
+
+    Why this exists: get_patient_history runs ONCE at the start of the
+    conversation and stores its raw result in ctx["patient_history_data"].
+    For new patients that string is "No medical history on file." None of
+    the in-session save paths (classifier save, tool_executor save_patient_history
+    handler, confirm-step batch save) updated this blob, so downstream
+    consumers (MedGemma's prompt builder, _compute_required_history_fields's
+    conditional gates) kept reading the original stale snapshot. For new
+    patients (most of our test cases) this meant triage reasoned with zero
+    history despite the patient having just told us about their allergies,
+    medications, family history, etc.
+
+    Call this from every save path so the blob stays in lockstep with
+    what's actually in the database.
+    """
+    # Pull everything we know was saved this session
+    parsed       = ctx.get("parsed_history") or {}
+    last_saved   = ctx.get("last_saved_history") or {}
+    collected    = ctx.get("collected_this_session") or []
+    patient      = ctx.get("patient") or {}
+
+    _HISTORY_FIELD_ORDER = [
+        "chronic_conditions", "medications", "drug_allergies", "general_allergies",
+        "family_history", "smoking_status", "menstrual_history", "lmp_date",
+        "pregnancy_status", "obstetric_history", "fall_history", "vaccination_status",
+    ]
+    _DEMO_FIELD_ORDER = ["age", "gender", "marital_status"]
+
+    lines: list[str] = []
+
+    # Demographics from patient record (always source of truth)
+    for f in _DEMO_FIELD_ORDER:
+        v = patient.get(f)
+        if v is not None and str(v).strip():
+            lines.append(f"{f.replace('_',' ').title()}: {v}")
+
+    # History fields — prefer the most recent save, then parsed_history,
+    # then the bare fact "answered this session" (without a value)
+    for f in _HISTORY_FIELD_ORDER:
+        v = last_saved.get(f) or parsed.get(f)
+        if v and str(v).strip():
+            lines.append(f"{f.replace('_',' ').title()}: {v}")
+        elif f in collected:
+            lines.append(f"{f.replace('_',' ').title()}: (answered, value pending parse)")
+
+    if lines:
+        ctx["patient_history_data"]      = "\n".join(lines)
+        ctx["patient_history_available"] = True
+        print(f"🔄 [HistoryBlob] Refreshed patient_history_data ({len(lines)} field(s))")
+
+
+def _classify_history_answer(field: str, patient_msg: str) -> str:
+    """
+    Code-side (not LLM-side) decision: does this patient message answer
+    the given history field well enough to move on?
+
+    Returns one of: "answered", "unclear", "offtopic"
+
+    This is the SINGLE source of truth for field completion — replacing the
+    old dual-system where both the LLM (via [FIELD_COMPLETE]/[HISTORY_COMPLETE])
+    and the code were independently trying to track progress, which is what
+    caused the LLM and the field-pointer to drift out of sync.
+    """
+    msg = (patient_msg or "").strip()
+    if not msg:
+        return "unclear"
+
+    # ── Confirmation-flavored phrases must NOT be saved as field values ─────
+    # When a patient (real or simulated) says "yes that's all correct" or
+    # "looks good" during history collection, they're confirming the visit
+    # in general — not answering this specific field. Saving "Yes that's all
+    # correct" as `family_history` is the case_001 bug we're fixing here.
+    # Treat these as "unclear" so the bot re-asks. The bot's re-ask gives
+    # the patient (or simulator) a fresh prompt to give a real answer.
+    #
+    # Approach: tokenize the message; if EVERY token is in the confirmation
+    # vocabulary, it's a pure confirmation phrase with no informational
+    # content for any field. Strings like "Yes please", "Ok sure", "looks
+    # good", "yeah that's all right" all collapse to confirmation-only.
+    _CONFIRMATION_TOKENS = {
+        "yes", "yeah", "yep", "yup", "yess", "ya", "yah",
+        "no", "nope", "nah", "none",  # handled later — see _NEGATIVE_ANSWER_RE
+        "ok", "okay", "okey", "kk",
+        "sure", "alright", "fine", "good", "great", "perfect", "excellent",
+        "right", "correct", "all", "everything", "that", "thats", "that's",
+        "is", "looks", "look", "sounds", "sound", "seems",
+        "please", "thanks", "thank", "you", "ty",
+        "confirm", "confirmed", "confirms",
+        "go", "ahead", "continue", "proceed", "next",
+        "i", "me", "my", "we",
+        "and", "or", "with", "to", "so",
+        "it",
+    }
+    # Strip punctuation, lower, split
+    _bare = re.sub(r"[^\w\s']", " ", msg.lower())
+    _tokens = [t for t in _bare.split() if t]
+    if _tokens and all(t in _CONFIRMATION_TOKENS for t in _tokens):
+        # Pure confirmation phrase — but if it's actually a "no" answer
+        # (e.g. just "no" or "nope"), let the negative branch below handle it.
+        if not _NEGATIVE_ANSWER_RE.match(msg):
+            return "unclear"
+
+    # A "no/none" answer is ALWAYS a complete answer for every field —
+    # every field in this system is a yes/no-or-describe question.
+    if _NEGATIVE_ANSWER_RE.match(msg):
+        return "answered"
+
+    # Very short non-answers ("hi", "ok", "?") are unclear
+    if len(msg) < 2:
+        return "unclear"
+
+    # If patient is clearly talking about booking/their complaint instead
+    # of answering, mark off-topic so we can redirect without burning a turn
+    # as if they tried to answer.
+    if _OFFTOPIC_HINT_RE.search(msg) and len(msg.split()) <= 6:
+        return "offtopic"
+
+    _GREETING_ONLY_RE = re.compile(
+        r"^\s*(hi+|hey+|hello+|salam|assalam)\s*[\.,!?]*\s*$", re.IGNORECASE
+    )
+    if _GREETING_ONLY_RE.match(msg):
+        return "unclear"
+
+    return "answered"
+
+
+# ── Keyword signatures for each history field, used to detect which field
+# the LLM's response actually asked about. Crucial when the LLM drifts away
+# from the directive and asks something other than current_field — without
+# detection, the user's answer gets attributed to the wrong field.
+_FIELD_QUESTION_KEYWORDS: dict[str, list[str]] = {
+    "chronic_conditions": [
+        "chronic", "existing health condition", "any health condition",
+        "diabetes", "blood pressure", "asthma", "thyroid", "heart disease",
+        "ongoing condition", "long-term condition", "any condition you're managing",
+        "conditions you have",
+    ],
+    "medications": [
+        "medication", "medicines", "currently taking", "any meds",
+        "any pills", "on any drugs", "prescribed",
+    ],
+    "drug_allergies": [
+        "allerg", "allergic to medication", "allergic to any medicine",
+        "drug allerg", "penicillin", "aspirin", "react to any medicine",
+        "reaction to medicine", "reaction to drug",
+    ],
+    "general_allergies": [
+        "allergies to food", "food allerg", "pollen", "dust", "animal fur",
+        "pet allerg", "environmental", "any other allergies", "other allerg",
+        "seasonal allerg",
+    ],
+    "family_history": [
+        "family history", "run in your family", "runs in your family",
+        "in the family", "family member", "parents have", "relatives have",
+        "heredit", "genetic",
+    ],
+    "smoking_status": [
+        "smoke", "smoking", "tobacco", "cigarette", "cigar", "vape",
+        "vaping", "chewing tobacco",
+    ],
+    "menstrual_history": [
+        "menstrual", "period", "cycle", "menstruation",
+    ],
+    "lmp_date": [
+        "last menstrual period", "last period", "lmp",
+    ],
+    "pregnancy_status": [
+        "pregnant", "pregnancy", "expecting",
+    ],
+    "obstetric_history": [
+        "previous pregnan", "prior pregnan", "deliveries", "delivery", "c-section",
+        "cesarean",
+    ],
+    "fall_history": [
+        "fall", "fallen", "balance problem", "trip and fall",
+    ],
+    "vaccination_status": [
+        "vaccin", "vaccinat", "shots", "immuniz",
+    ],
+}
+
+# Words that strongly signal "we're moving past history" — i.e. the LLM
+# transitioned away from collecting history and started the complaint phase.
+# Detecting this lets us advance the step rather than re-asking history.
+_COMPLAINT_TRANSITION_KEYWORDS: list[str] = [
+    "what brings you in", "what brings you here", "reason for your visit",
+    "main reason", "main concern", "what's wrong", "what is the problem",
+    "what's the problem", "what's bothering you", "what seems to be the problem",
+    "symptoms or concerns", "how can i help you today",
+]
+
+
+def _detect_field_in_question(text: str) -> str | None:
+    """
+    Scan an AI response to figure out which history field it actually asked
+    about. Returns the field name, or None if no specific field signature
+    was found.
+
+    Used to reconcile LLM drift: if the LLM is supposed to be asking about
+    `medications` (per directive) but its response is actually a question
+    about `chronic_conditions`, we update the field pointer to match what
+    the patient saw — so the patient's next reply gets attributed correctly.
+
+    SCORING SCOPE: only the LAST sentence ending in '?' is scored. The
+    preamble usually acknowledges the previous answer ("no family history —
+    noted!") which would otherwise contaminate the score for the actual
+    current question ("do you smoke?"). If no '?' is present, fall back to
+    the trailing third of the text.
+    """
+    if not text:
+        return None
+
+    # Extract just the last question. The LLM's structure is almost always
+    # "[ack of previous answer]. [next question]?" — scoring everything
+    # makes the previous-answer ack outweigh the actual question.
+    questions = re.findall(r"[^.!?\n]+\?", text)
+    if questions:
+        target = questions[-1].lower()
+    else:
+        # No '?' — fall back to the last ~third of text where a question
+        # phrased as a statement most likely sits.
+        tail_start = max(0, len(text) - max(60, len(text) // 3))
+        target = text[tail_start:].lower()
+
+    best_field: str | None = None
+    best_score = 0
+    for field, keywords in _FIELD_QUESTION_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in target)
+        if score > best_score:
+            best_score = score
+            best_field = field
+    return best_field if best_score > 0 else None
+
+
+def _is_complaint_transition(text: str) -> bool:
+    """True if the AI response is asking the patient about their complaint
+    rather than collecting more history (i.e. the LLM thinks history is done)."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(kw in low for kw in _COMPLAINT_TRANSITION_KEYWORDS)
+
+
+
+
+
+def _enforce_history_field_limits(ctx: dict, messages: list | None = None) -> None:
     """
     Per-field turn limit. Tracks how many turns have elapsed while
-    required_history_fields[0] is the current field. After 3 turns
-    without a save, force-saves "not provided" and removes the field.
+    required_history_fields[0] is the current field. After the limit,
+    runs the batch parser scoped to JUST this field on the conversation
+    (the "rethink" step) — saves whatever value the parser finds, or
+    "not provided" if it finds nothing. Then advances.
 
-    This prevents the model staying on one field forever without saving,
-    while still allowing the auto-save to resolve it naturally first.
-    The per-turn counter resets whenever auto-save successfully clears
-    a field (see _try_auto_save_history_field).
+    Passing `messages` is optional but strongly recommended — without it
+    the rethink can't run and we fall back to the old "not provided"
+    behaviour.
     """
     required = ctx.get("required_history_fields")
     if not required:
@@ -328,15 +596,40 @@ def _enforce_history_field_limits(ctx: dict) -> None:
     if turn < _MAX_TURNS_PER_HISTORY_FIELD:
         return
 
-    # ── Force-advance ─────────────────────────────────────────────────────────
-    print(f"⏭️  [HistoryGate] '{current_field}' hit {_MAX_TURNS_PER_HISTORY_FIELD}-turn limit — force-advancing")
+    # ── RETHINK before force-advancing ────────────────────────────────────────
+    # Patient has had `_MAX_TURNS_PER_HISTORY_FIELD` chances to answer this
+    # field. Before defaulting to "not provided", look at what they ACTUALLY
+    # said in the conversation — they may well have answered, just in a way
+    # the per-turn classifier didn't recognise (or via a field-drift where
+    # the LLM was asking about something else). Run the batch parser scoped
+    # to JUST this field on the conversation transcript. If it finds a real
+    # value → save that. If not → "not provided" (legacy behaviour).
+    print(f"⏭️  [HistoryGate] '{current_field}' hit {_MAX_TURNS_PER_HISTORY_FIELD}-turn limit — rethinking before save")
     patient_id = ctx.get("patient", {}).get("id")
     _DEMO = {"age", "gender", "marital_status"}
+
+    extracted_value: str | None = None
+    if messages and current_field not in _DEMO:
+        try:
+            parsed = _parse_history_with_llm(list(messages), [current_field])
+            v = parsed.get(current_field)
+            if v and str(v).strip() and str(v).strip().lower() not in {
+                "null", "none mentioned", "not mentioned", "n/a", "not provided"
+            }:
+                extracted_value = str(v).strip()[:300]
+                print(f"   🧠 [Rethink] Parser found value for '{current_field}': {extracted_value[:60]!r}")
+            else:
+                print(f"   🧠 [Rethink] Parser found nothing for '{current_field}' — will save 'not provided'")
+        except Exception as e:
+            print(f"   ⚠️  [Rethink] parser failed: {e}")
+
+    save_value = extracted_value if extracted_value else "not provided"
+
     if patient_id and current_field not in _DEMO:
         try:
             from agents.mcp_tools import save_patient_history as _sph
-            _sph.invoke({"patient_id": patient_id, current_field: "not provided"})
-            print(f"   → Force-saved '{current_field}'='not provided'")
+            _sph.invoke({"patient_id": patient_id, current_field: save_value})
+            print(f"   → Saved '{current_field}'='{save_value[:60]}'")
         except Exception as e:
             print(f"   ⚠️  Force-save failed: {e}")
 
@@ -344,121 +637,456 @@ def _enforce_history_field_limits(ctx: dict) -> None:
     skipped = ctx.setdefault("skipped_history_fields", [])
     if current_field in reqs:
         reqs.remove(current_field)
-    if current_field not in skipped:
+    # Only count as "skipped" if we genuinely couldn't extract anything
+    if not extracted_value and current_field not in skipped:
         skipped.append(current_field)
+    # If we DID extract, add to collected list instead
+    if extracted_value:
+        coll = ctx.setdefault("collected_this_session", [])
+        if current_field not in coll:
+            coll.append(current_field)
     ctx["required_history_fields"] = reqs
     counts[current_field] = 0
+    # Reset the "question shown" marker so the next field's question gets
+    # freshly tracked by the classifier instead of carrying over stale state
+    # from the field we just force-advanced past.
+    ctx["history_question_asked_for"] = None
+    if not reqs:
+        ctx["history_pending_confirmation"] = True
+        print("   ✅ [HistoryGate] last field force-advanced — all fields done, flagging confirm")
     print(f"   Skipped: {skipped}  |  Remaining: {reqs}")
 
 
 
 def _compute_triage_dimensions(complaint: str, ctx: dict) -> list[tuple[str, str]]:
     """
-    Compute the ordered list of (dimension_key, question_text) for this triage session.
-    Called once on the first triage turn and cached in ctx['triage_dimensions'].
-
-    Priority: red_flag → duration → character → severity → associated → complaint_specific
-    At most 6 dimensions. Condition-specific branch replaces generic modifying-factors.
-
-    SPECIAL CASE: routine / checkup / screening / follow-up visits are NOT symptomatic.
-    OLDCARTS makes no sense for them — patient gets confused by "how long have you had
-    this?" / "is it sharp or dull?" when there is no symptom. For these, ask one
-    intent-clarifying question and complete triage.
+    Returns ordered (dimension_key, question_text) pairs for MedGemma to ask.
+    All questions are complaint-specific — no generic "sharp or dull?" for insomnia.
+    Red flag questions are also tailored — no "are you bleeding?" for a sleep problem.
     """
-    c     = complaint.lower()
-    p     = ctx.get("patient", {})
-    hist  = (ctx.get("patient_history_data") or "").lower()
-    age   = p.get("age")
-    g     = (p.get("gender") or "").lower()
-    m     = (p.get("marital_status") or "").lower()
+    c       = complaint.lower()
+    p       = ctx.get("patient", {})
+    hist    = (ctx.get("patient_history_data") or "").lower()
+    age_raw = p.get("age")
+    age     = int(age_raw) if age_raw and str(age_raw).isdigit() else None
+    g       = (p.get("gender") or "").lower()
+    m       = (p.get("marital_status") or "").lower()
     female  = g in ("female", "f", "woman", "girl")
     married = m == "married"
 
-    # ── SPECIAL CASE: Routine / preventive / non-symptomatic visit ───────────
-    # Detect these BEFORE building OLDCARTS dimensions. One brief question only.
-    _ROUTINE_KW = (
-        "routine", "checkup", "check-up", "check up", "screening",
-        "follow-up", "follow up", "followup", "annual", "yearly",
-        "preventive", "preventative", "physical exam", "wellness",
-        "well visit", "general checkup", "general check",
-    )
-    if any(kw in c for kw in _ROUTINE_KW):
-        return [(
-            "routine_intent",
-            "Just to confirm — is there any specific concern you'd like the doctor "
-            "to look at during this visit, or is this purely a routine check?",
-        )]
+    def _has(kw): return kw in hist
+    def _is(*kws): return any(k in c for k in kws)
 
-    def _has(kw: str) -> bool:
-        return kw in hist
+    # ── Routine / preventive visit ────────────────────────────────────────────
+    _ROUTINE = ("routine", "checkup", "check-up", "check up", "screening",
+                "follow-up", "follow up", "followup", "annual", "yearly",
+                "preventive", "preventative", "physical exam", "wellness")
+    if any(k in c for k in _ROUTINE):
+        return [("routine_intent",
+                 "Just to confirm — is there a specific concern you'd like the doctor "
+                 "to look at, or is this purely a routine check?")]
 
-    dims: list[tuple[str, str]] = []
+    # ────────────────────────────────────────────────────────────────────────────
+    # COMPLAINT GROUPS — each returns a full 5-6 question set
+    # ────────────────────────────────────────────────────────────────────────────
 
-    # ── 1. Red flag (complaint-specific) ─────────────────────────────────────
-    if any(w in c for w in ("chest", "heart", "pressure", "tightness")):
-        dims.append(("red_flag",
-            "Are you also experiencing sweating, pain in your left arm or jaw, "
-            "or difficulty breathing?"))
-    elif any(w in c for w in ("head", "headache")):
-        dims.append(("red_flag",
-            "Is this the worst headache of your life, or do you have any sudden "
-            "weakness, facial drooping, or slurred speech?"))
-    elif any(w in c for w in ("breath", "breathing", "shortness")):
-        dims.append(("red_flag",
-            "Are you able to speak in full sentences, and are your lips "
-            "and fingertips a normal colour?"))
-    elif any(w in c for w in ("abdomen", "stomach", "belly", "abdominal")):
-        dims.append(("red_flag",
-            "Is the pain so severe you cannot touch your abdomen, or have you "
-            "noticed any blood in your stool or vomit?"))
-    else:
-        dims.append(("red_flag",
-            "Are you experiencing any severe chest pain, difficulty breathing, "
-            "sudden confusion, or uncontrolled bleeding?"))
+    # ── SLEEP / INSOMNIA ──────────────────────────────────────────────────────
+    if _is("insomnia", "sleep", "can't sleep", "cant sleep", "not sleeping",
+            "sleepless", "trouble sleeping", "sleep problem"):
+        dims = [
+            ("red_flag",
+             "Have you been having any thoughts of harming yourself, "
+             "or are you experiencing extreme anxiety or panic at night?"),
+            ("duration",
+             "How long have you been having trouble sleeping?"),
+            ("character",
+             "Is the problem falling asleep, staying asleep through the night, "
+             "or waking up too early and not being able to go back to sleep?"),
+            ("severity",
+             "How many hours of sleep are you getting on average, "
+             "and how is it affecting you during the day?"),
+            ("associated",
+             "Have you noticed changes in your mood, concentration, or energy levels? "
+             "Any low mood or anxiety?"),
+            ("specific",
+             "Are you going through any stressful events, using screens late at night, "
+             "or consuming caffeine in the evenings?"),
+        ]
+        return dims
 
-    # ── 2. Duration ──────────────────────────────────────────────────────────
-    dims.append(("duration",
-        "How long have you had this, and did it come on suddenly or gradually?"))
+    # ── HEADACHE / MIGRAINE ───────────────────────────────────────────────────
+    if _is("headache", "head pain", "migraine", "head ache"):
+        dims = [
+            ("red_flag",
+             "Is this the worst headache of your life, or do you have sudden weakness, "
+             "facial drooping, or slurred speech alongside it?"),
+            ("duration",
+             "How long does each headache last, and how often are you getting them?"),
+            ("character",
+             "Where is the pain — one side, both sides, or behind your eyes? "
+             "Does it throb or feel more like pressure?"),
+            ("severity",
+             "On a scale of 1 to 10, how bad is it right now?"),
+            ("associated",
+             "Do you have nausea, sensitivity to light or noise, or any visual changes?"),
+            ("specific",
+             "What seems to trigger it — stress, certain foods, screen time, "
+             "or does it come on randomly?"),
+        ]
+        return dims
 
-    # ── 3. Character ─────────────────────────────────────────────────────────
-    dims.append(("character",
-        "How would you describe it — sharp, dull, burning, throbbing, "
-        "or more of a pressure feeling?"))
+    # ── SORE THROAT ───────────────────────────────────────────────────────────
+    if _is("sore throat", "throat pain", "throat", "swallowing", "tonsil"):
+        dims = [
+            ("red_flag",
+             "Is your throat so swollen it is hard to breathe or open your mouth fully?"),
+            ("duration",
+             "How many days have you had the sore throat?"),
+            ("character",
+             "Is the pain constant or mainly when you swallow? "
+             "Any white patches or pus at the back of your throat?"),
+            ("severity",
+             "On a scale of 1 to 10, how painful is it?"),
+            ("associated",
+             "Do you have fever, runny nose, cough, or swollen glands in your neck?"),
+            ("specific",
+             "Has anyone around you been sick recently, and have you been in cold weather "
+             "or air conditioning a lot?"),
+        ]
+        return dims
 
-    # ── 4. Severity ──────────────────────────────────────────────────────────
-    dims.append(("severity",
-        "On a scale of 1 to 10, how severe is it right now?"))
+    # ── FEVER ─────────────────────────────────────────────────────────────────
+    if _is("fever", "temperature", "hot", "chills", "sweating", "sweats"):
+        dims = [
+            ("red_flag",
+             "How high is the fever? Have you had a seizure, stiff neck, "
+             "or a new rash along with it?"),
+            ("duration",
+             "How many days have you had the fever, and is it constant or coming and going?"),
+            ("severity",
+             "What is the highest temperature you have recorded? "
+             "Are you able to eat and drink?"),
+            ("associated",
+             "Do you have a cough, sore throat, body aches, headache, or stomach pain?"),
+            ("specific",
+             "Have you recently traveled anywhere, or been in close contact with someone who was sick?"),
+        ]
+        return dims
 
-    # ── 5. Associated symptoms ───────────────────────────────────────────────
-    dims.append(("associated",
-        "Are you experiencing anything else alongside this — "
-        "fever, nausea, vomiting, dizziness, or other symptoms?"))
+    # ── COUGH ─────────────────────────────────────────────────────────────────
+    if _is("cough", "coughing", "phlegm", "mucus"):
+        dims = [
+            ("red_flag",
+             "Have you coughed up any blood?"),
+            ("duration",
+             "How long have you had this cough — days or weeks?"),
+            ("character",
+             "Is it a dry cough or does it bring up mucus? "
+             "If mucus, what colour — clear, yellow, green, or brown?"),
+            ("severity",
+             "Is it affecting your sleep or making it hard to breathe?"),
+            ("associated",
+             "Do you have fever, runny nose, chest pain, or shortness of breath?"),
+            ("specific",
+             "Do you smoke, and have you been around anyone who is sick or been in dusty environments?"),
+        ]
+        return dims
 
-    # ── 6. Complaint + condition-specific (highest relevant one) ─────────────
-    if _has("diabetes") and any(w in c for w in ("dizzy", "dizziness", "faint", "weak", "shak")):
-        dims.append(("complaint_specific",
-            "When did you last check your blood sugar, and did you take your "
-            "diabetes medication today?"))
-    elif (_has("hypertension") or _has("blood pressure")) and any(w in c for w in ("head", "headache", "dizzy", "vision")):
-        dims.append(("complaint_specific",
-            "Have you taken your blood pressure medication today, and have you "
-            "noticed any changes in your vision?"))
-    elif (_has("heart") or _has("cardiac")) and any(w in c for w in ("chest", "breath", "palpitat")):
-        dims.append(("complaint_specific",
-            "Does the discomfort spread to your arm, jaw, or back?"))
-    elif _has("asthma") and any(w in c for w in ("breath", "wheeze", "cough")):
-        dims.append(("complaint_specific",
-            "Have you used your rescue inhaler today, and if so how many times?"))
-    elif female and married and any(w in c for w in ("abdomen", "stomach", "pelvic", "pelvis")):
-        dims.append(("complaint_specific",
-            "Is there any possibility you could be pregnant?"))
-    elif age and int(age) >= 60 and any(w in c for w in ("fall", "dizzy", "balance", "weak")):
-        dims.append(("complaint_specific",
-            "Have you had any recent falls, and are you steady on your feet?"))
-    else:
-        dims.append(("modifying_factors",
-            "Does anything make it better or worse — rest, movement, "
-            "eating, or a certain position?"))
+    # ── CHEST PAIN ────────────────────────────────────────────────────────────
+    if _is("chest", "chest pain", "heart", "palpitat", "tightness"):
+        dims = [
+            ("red_flag",
+             "Are you also experiencing sweating, pain spreading to your left arm or jaw, "
+             "or severe difficulty breathing?"),
+            ("duration",
+             "How long have you been having this — is it constant or does it come and go?"),
+            ("character",
+             "Is the pain sharp and stabbing, dull and heavy, tight like pressure, "
+             "or more of a burning sensation?"),
+            ("severity",
+             "On a scale of 1 to 10, how bad is it right now?"),
+            ("associated",
+             "Do you have shortness of breath, dizziness, nausea, or fast heartbeat?"),
+            ("specific",
+             "Does it get worse with deep breathing, movement, or lying flat?"),
+        ]
+        return dims
+
+    # ── SHORTNESS OF BREATH ───────────────────────────────────────────────────
+    if _is("breath", "breathing", "shortness", "wheezing", "wheeze"):
+        dims = [
+            ("red_flag",
+             "Can you speak in full sentences right now, "
+             "and are your lips or fingertips a normal colour?"),
+            ("duration",
+             "How long have you been having this and did it come on suddenly or gradually?"),
+            ("character",
+             "Is it constant or does it come in episodes? "
+             "Do you wheeze or hear a whistling sound when you breathe?"),
+            ("severity",
+             "How many steps can you walk before you feel short of breath?"),
+            ("associated",
+             "Do you have chest pain, cough, fever, or swelling in your legs?"),
+            ("specific",
+             "What makes it worse — exercise, lying flat, cold air, or dust?"),
+        ]
+        return dims
+
+    # ── STOMACH / ABDOMINAL ───────────────────────────────────────────────────
+    if _is("stomach", "abdomen", "abdominal", "belly", "gastric", "nausea",
+            "vomit", "diarrhea", "diarrhoea", "loose motion", "constipat"):
+        dims = [
+            ("red_flag",
+             "Have you noticed any blood in your stool or vomit, "
+             "or is the pain so severe you cannot touch your stomach?"),
+            ("duration",
+             "How long have you been having this, and is it getting better or worse?"),
+            ("character",
+             "Where exactly is the pain — upper, lower, or all over? "
+             "Is it crampy, sharp, dull, or burning?"),
+            ("severity",
+             "On a scale of 1 to 10, how bad is the pain?"),
+            ("associated",
+             "Do you have nausea, vomiting, diarrhea, fever, or bloating?"),
+            ("specific",
+             "Does it come on after eating, and have you eaten anything unusual recently?"),
+        ]
+        return dims
+
+    # ── BACK PAIN ─────────────────────────────────────────────────────────────
+    if _is("back pain", "back ache", "backache", "spine", "lower back"):
+        dims = [
+            ("red_flag",
+             "Do you have any numbness or weakness in your legs, "
+             "or difficulty controlling your bladder or bowels?"),
+            ("duration",
+             "How long have you had back pain, and did it start after an injury or lifting?"),
+            ("character",
+             "Where exactly — upper, middle, or lower back? "
+             "Does the pain shoot down into your leg or stay in the back?"),
+            ("severity",
+             "On a scale of 1 to 10, and does it stop you from walking or standing?"),
+            ("associated",
+             "Any fever, or is it worse when you cough or lean forward?"),
+            ("specific",
+             "Does walking, sitting, lying flat, or stretching make it better or worse?"),
+        ]
+        return dims
+
+    # ── JOINT / MUSCLE PAIN ───────────────────────────────────────────────────
+    if _is("joint", "knee", "shoulder", "elbow", "wrist", "ankle", "hip",
+            "arthritis", "muscle", "body ache", "body pain"):
+        dims = [
+            ("red_flag",
+             "Is the joint red, hot, and very swollen — it may be infected?"),
+            ("duration",
+             "How long has the pain been there, and did it start after an injury?"),
+            ("character",
+             "Which joint or area exactly? Is it stiff in the morning, "
+             "and does it click or swell?"),
+            ("severity",
+             "On a scale of 1 to 10, and can you move it normally?"),
+            ("associated",
+             "Have other joints been affected, and do you have fever or skin rash?"),
+            ("specific",
+             "Does movement help or make it worse, and does it get worse at night?"),
+        ]
+        return dims
+
+    # ── SKIN / RASH ───────────────────────────────────────────────────────────
+    if _is("skin", "rash", "itch", "itching", "hives", "allerg", "acne",
+            "pimple", "spot", "mark", "burn", "blister"):
+        dims = [
+            ("red_flag",
+             "Is it spreading very rapidly over your body, "
+             "or do you have any swelling in your throat or difficulty breathing?"),
+            ("duration",
+             "How long have you had this skin issue?"),
+            ("character",
+             "What does it look like — red patches, raised bumps, blisters, or flat spots? "
+             "Is it itchy, painful, or just visible?"),
+            ("severity",
+             "How much of your body is affected, and is it getting bigger?"),
+            ("associated",
+             "Did you start any new medication, food, soap, or detergent recently? Any fever?"),
+            ("specific",
+             "Does it itch more at night, or after contact with certain things like fabric or jewellery?"),
+        ]
+        return dims
+
+    # ── ANXIETY / STRESS / MENTAL HEALTH ─────────────────────────────────────
+    if _is("anxiety", "stress", "panic", "mental", "depress", "mood",
+            "worried", "nervous", "fear", "phobia"):
+        dims = [
+            ("red_flag",
+             "Are you having any thoughts of harming yourself or others?"),
+            ("duration",
+             "How long have you been feeling this way?"),
+            ("character",
+             "Is it constant or does it come in episodes? "
+             "Do you get physical symptoms like racing heart, chest tightness, or sweating?"),
+            ("severity",
+             "How much is it affecting your daily life — work, sleep, relationships?"),
+            ("associated",
+             "Have you had any changes in sleep, appetite, or energy? "
+             "Are you avoiding places or situations because of it?"),
+            ("specific",
+             "Did something specific trigger this, or did it build up gradually over time?"),
+        ]
+        return dims
+
+    # ── EYE PROBLEMS ─────────────────────────────────────────────────────────
+    if _is("eye", "vision", "blurry", "blur", "red eye", "itchy eye"):
+        dims = [
+            ("red_flag",
+             "Did you have any sudden loss of vision, severe eye pain, "
+             "or a blow or injury to the eye?"),
+            ("duration",
+             "How long have you had this eye problem?"),
+            ("character",
+             "Is it redness, blurry vision, discharge, itching, or pain? One eye or both?"),
+            ("severity",
+             "Is your vision affected — can you read or see normally?"),
+            ("associated",
+             "Any headache, sensitivity to light, or recent cold or flu?"),
+            ("specific",
+             "Do you wear contact lenses, and have you been in a dusty or smoky environment?"),
+        ]
+        return dims
+
+    # ── EAR PROBLEMS ─────────────────────────────────────────────────────────
+    if _is("ear", "hearing", "deaf", "tinnitus", "ringing", "ear pain", "earache"):
+        dims = [
+            ("red_flag",
+             "Do you have sudden complete hearing loss, severe vertigo, "
+             "or discharge from the ear?"),
+            ("duration",
+             "How long have you had this ear problem?"),
+            ("character",
+             "Is it pain, ringing, blocked feeling, or hearing loss? One ear or both?"),
+            ("severity",
+             "On a scale of 1 to 10 for pain, and is your hearing affected?"),
+            ("associated",
+             "Any recent cold, sore throat, swimming, or earwax buildup?"),
+            ("specific",
+             "Does it get worse when you swallow or yawn?"),
+        ]
+        return dims
+
+    # ── URINARY ───────────────────────────────────────────────────────────────
+    if _is("urine", "urinary", "burning urine", "frequent urination",
+            "uti", "bladder", "kidney"):
+        dims = [
+            ("red_flag",
+             "Is there blood in your urine, or do you have severe pain in your back or side?"),
+            ("duration",
+             "How long have you had this problem?"),
+            ("character",
+             "Is it burning when you urinate, going too frequently, difficulty starting, "
+             "or a feeling you can't empty your bladder?"),
+            ("severity",
+             "How much is it affecting you — are you going more than every hour?"),
+            ("associated",
+             "Do you have fever, lower abdominal pain, or unusual discharge?"),
+            ("specific",
+             "Have you been drinking enough water, and has this happened to you before?"),
+        ]
+        return dims
+
+    # ── DIABETES-RELATED ─────────────────────────────────────────────────────
+    if _is("sugar", "diabetes", "glucose", "blood sugar"):
+        dims = [
+            ("red_flag",
+             "Are you feeling confused, shaking, sweating, or extremely weak right now?"),
+            ("duration",
+             "How long have you been having this issue with your blood sugar?"),
+            ("character",
+             "Is your sugar running too high, too low, or are you unsure?"),
+            ("severity",
+             "What reading did you get the last time you checked?"),
+            ("associated",
+             "Have you changed your diet, missed medication, or been under more stress recently?"),
+            ("specific",
+             "Are you experiencing increased thirst, frequent urination, or blurry vision?"),
+        ]
+        return dims
+
+    # ── DIZZINESS / VERTIGO ───────────────────────────────────────────────────
+    if _is("dizzy", "dizziness", "vertigo", "balance", "spinning",
+            "lightheaded", "faint", "fainting"):
+        dims = [
+            ("red_flag",
+             "Did the dizziness come on very suddenly, and do you have severe headache, "
+             "double vision, or weakness in an arm or leg?"),
+            ("duration",
+             "How long have you been feeling dizzy, and is it constant or in episodes?"),
+            ("character",
+             "Does the room feel like it is spinning, or do you feel lightheaded and about to faint?"),
+            ("severity",
+             "Have you fallen because of it, and can you walk normally?"),
+            ("associated",
+             "Do you have nausea, ringing in your ears, or hearing changes?"),
+            ("specific",
+             "Does it come on when you change position — like standing up or turning your head?"),
+        ]
+        return dims
+
+    # ── GENERAL / FATIGUE / WEAKNESS ─────────────────────────────────────────
+    if _is("tired", "fatigue", "weakness", "weak", "energy", "exhausted",
+            "lethargy", "lethargic"):
+        dims = [
+            ("red_flag",
+             "Have you had any unexplained weight loss, night sweats, "
+             "or new lumps anywhere on your body?"),
+            ("duration",
+             "How long have you been feeling this way?"),
+            ("character",
+             "Is it physical tiredness in your muscles, or mental exhaustion and lack of motivation?"),
+            ("severity",
+             "Can you get through your normal daily activities, or are you struggling?"),
+            ("associated",
+             "Any changes in appetite, sleep, mood, or shortness of breath with exertion?"),
+            ("specific",
+             "Have you been under more stress, had a recent illness, or changed your diet?"),
+        ]
+        return dims
+
+    # ── DEFAULT FALLBACK — generic OLDCARTS ───────────────────────────────────
+    # Used only for complaints that don't match any known pattern
+    dims = [
+        ("red_flag",
+         "Are you experiencing any severe chest pain, difficulty breathing, "
+         "sudden confusion, or uncontrolled bleeding?"),
+        ("duration",
+         "How long have you had this, and did it come on suddenly or gradually?"),
+        ("character",
+         "How would you describe it — sharp, dull, burning, throbbing, or pressure?"),
+        ("severity",
+         "On a scale of 1 to 10, how bad is it right now?"),
+        ("associated",
+         "Are you experiencing anything else alongside this — "
+         "fever, nausea, vomiting, or dizziness?"),
+        ("modifying",
+         "Does anything make it better or worse?"),
+    ]
+
+    # Condition-specific 6th question if relevant history found
+    if _has("diabetes") and _is("dizzy", "weak", "shak", "faint"):
+        dims[-1] = ("condition_specific",
+            "When did you last check your blood sugar, and did you take your medication today?")
+    elif (_has("hypertension") or _has("blood pressure")) and _is("head", "dizzy", "vision"):
+        dims[-1] = ("condition_specific",
+            "Have you taken your blood pressure medication today, "
+            "and have you noticed any vision changes?")
+    elif _has("asthma") and _is("breath", "wheeze", "cough"):
+        dims[-1] = ("condition_specific",
+            "Have you used your rescue inhaler today, and if so how many times?")
+    elif female and married and _is("abdomen", "stomach", "pelvic"):
+        dims[-1] = ("condition_specific",
+            "Is there any chance you could be pregnant?")
+    elif age and age >= 60 and _is("fall", "dizzy", "balance"):
+        dims[-1] = ("condition_specific",
+            "Have you had any recent falls, and are you steady on your feet?")
 
     return dims
 
@@ -782,35 +1410,40 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
                     lines.append(f"  3. When complete → call update_patient_demographics(patient_id={pid}, {current_field}=<answer>)")
                     lines.append("  4. Then briefly acknowledge and move to the next field.")
                 else:
-                    # ── HISTORY FIELD: LLM-driven completion via [FIELD_COMPLETE] ─
-                    next_field    = remaining[1] if len(remaining) > 1 else None
-                    next_question = _QUESTION_FOR_FIELD.get(next_field, "") if next_field else ""
-                    lines.append("  RULES (history field — DO NOT CALL ANY TOOL):")
-                    lines.append("  1. Ask the question if not yet asked.")
-                    lines.append("  2. If the answer is unclear or 'yes/yeah/sure' → ask ONE follow-up.")
-                    lines.append("  3. ⛔ DO NOT call save_patient_history — it is NOT bound.")
-                    lines.append("  4. When you have a CLEAR answer: briefly acknowledge,")
-                    lines.append("     ask the NEXT field question in the SAME message,")
-                    lines.append("     then end with [FIELD_COMPLETE]. One round-trip per two fields.")
-                    if next_question:
-                        lines.append(f"  5. NEXT question to ask: \"{next_question}\"")
-                        lines.append("     Examples:")
-                        lines.append(f"       Patient: 'No'          → 'Got it! {next_question} [FIELD_COMPLETE]'")
-                        lines.append(f"       Patient: 'Penicillin'  → 'Noted. {next_question} [FIELD_COMPLETE]'")
-                        lines.append(f"       Patient: 'Dust allergy' → 'Understood. {next_question} [FIELD_COMPLETE]'")
+                    # ── HISTORY FIELD: code owns the field pointer, LLM only phrases ──
+                    # The code (not the LLM) decides when a field is "done" via
+                    # _classify_history_answer(), called BEFORE this directive is
+                    # built. The LLM's ONLY job is to ask/rephrase the CURRENT
+                    # field's question — it never decides what's next.
+                    #
+                    # NOTE: history_question_asked_for is intentionally NOT set
+                    # here. It is set AFTER the LLM call completes — and only
+                    # when the LLM actually produced a text question (not when
+                    # it merely emitted a tool call). Setting it here would
+                    # leak the marker on tool-only passes and cause the next
+                    # classifier check to wrongly accept the user's previous
+                    # answer as if it answered THIS field. (See post-LLM block.)
+                    _redirect = ctx.pop("history_redirect_needed", False)
+
+                    if _redirect:
+                        lines.append("  ⚠️  The patient's last message was off-topic for this question")
+                        lines.append("     (sounded like a complaint or booking request, not an answer).")
+                        lines.append("  YOUR JOB: Acknowledge briefly, then redirect back to THIS question:")
+                        lines.append(f"     QUESTION: \"{question}\"")
+                        lines.append("  Example: 'We'll get to that shortly! First — " + question + "'")
                     else:
-                        lines.append("  5. This is the LAST field — just acknowledge clearly:")
-                        lines.append("       Patient: 'No'    → 'Got it. [FIELD_COMPLETE]'")
-                        lines.append("       Patient: 'Never' → 'Noted. [FIELD_COMPLETE]'")
-                        lines.append("  ⛔ DO NOT ask 'What brings you in today?' or any complaint question.")
-                        lines.append("  ⛔ DO NOT ask about symptoms. The system handles the next step automatically.")
-                        lines.append("  ⛔ Your response must be 1-2 words + [FIELD_COMPLETE]. Nothing more.")
-                    lines.append("  6. Unclear answers (follow-up first, NO marker yet):")
-                    lines.append("       Patient: 'Yes'          → 'Could you tell me which one?'")
-                    lines.append("       Patient: 'I take pills' → 'What kind of pills?'")
-                    lines.append(f"  7. Off-topic: 'I\'ll note that — {question}'")
-                    lines.append("  8. ⛔ Never reply with ONLY '[FIELD_COMPLETE]' — always")
-                    lines.append("     include either the next question or an acknowledgement.")
+                        lines.append("  YOUR ONLY JOB THIS TURN: ask the question below, naturally.")
+                        lines.append(f"     QUESTION: \"{question}\"")
+
+                    lines.append("")
+                    lines.append("  RULES:")
+                    lines.append("  1. Ask ONLY this question. You may rephrase naturally, same meaning.")
+                    lines.append("  2. ⛔ DO NOT ask about any other field. ONLY this one, this turn.")
+                    lines.append("  3. ⛔ DO NOT call any tools.")
+                    lines.append("  4. ⛔ DO NOT emit any bracket tags — the system tracks completion itself.")
+                    lines.append("  5. ⛔ DO NOT ask 'What brings you in today?' yet.")
+                    lines.append("  6. If you already asked this exact question last turn (check history above),")
+                    lines.append("     vary the phrasing slightly rather than repeating verbatim.")
 
                 lines.append(f"  Fields remaining after this: {remaining[1:] or 'none — all done'}")
 
@@ -825,62 +1458,58 @@ def _get_booking_directive(ctx: dict, today: str, tomorrow: str) -> str:
 
     # ── New step: show patient the parsed history, await YES/NO ──────────────
     elif step == "confirm_patient_history":
-        parsed = ctx.get("parsed_history") or {}
-        lines.append("YOUR NEXT ACTION: Show the patient their parsed medical-history record.")
-        lines.append("  ⛔ ABSOLUTE RULES — read carefully:")
-        lines.append("  ⛔ DO NOT call any tools or functions of any kind at this step.")
-        lines.append("  ⛔ DO NOT output `<tool_call>`, `<invoke>`, `<parameter>`, `<|DSML|>`,")
-        lines.append("     `tool_calls`, `save_medical_history`, `save_patient_history`,")
-        lines.append("     JSON blocks, code fences, or ANY function-call-like syntax.")
-        lines.append("  ⛔ The system has already saved everything. The database write happens")
-        lines.append("     PROGRAMMATICALLY in Python when the patient replies YES — you do NOT")
-        lines.append("     and CANNOT trigger it from here. Trying to call save_patient_history")
-        lines.append("     would CORRUPT the record. Just speak to the patient as plain text.")
+        # Build the render set from every source we have: the classifier
+        # writes raw answers into last_saved_history, the batch parser writes
+        # cleaned values into parsed_history, and demographics live on the
+        # patient record. Merge in precedence order so we never render an
+        # empty bullet list (which is what caused case_001's "summary not
+        # shown → empty save" failure).
+        parsed       = ctx.get("parsed_history") or {}
+        last_saved   = ctx.get("last_saved_history") or {}
+        patient      = ctx.get("patient") or {}
+        _DEMO        = ("age", "gender", "marital_status")
+        _HIST_ORDER  = [
+            "chronic_conditions", "medications", "drug_allergies", "general_allergies",
+            "family_history", "smoking_status", "menstrual_history", "lmp_date",
+            "pregnancy_status", "obstetric_history", "fall_history", "vaccination_status",
+        ]
+        render: dict = {}
+        # Demographics first (source of truth: patient record)
+        for f in _DEMO:
+            v = patient.get(f)
+            if v is not None and str(v).strip():
+                render[f] = v
+        # History: parsed value if available, otherwise raw classifier save
+        for f in _HIST_ORDER:
+            v = parsed.get(f) or last_saved.get(f)
+            if v and str(v).strip():
+                render[f] = v
+
+        lines.append("YOUR NEXT ACTION: Show the patient their medical-history record.")
+        lines.append("  ⛔ DO NOT call any tools at this step.")
+        lines.append("  ⛔ DO NOT output `<tool_call>`, `<|DSML|>`, JSON, or any function-call syntax.")
+        lines.append("  ⛔ The orchestrator handles the database write PROGRAMMATICALLY on YES.")
         lines.append("")
-        lines.append("  Reply with ONLY this plain-text format (no other content, no markdown")
-        lines.append("  fences, no tool calls, no JSON):")
-        lines.append("")
+        lines.append("  Format the record exactly like this (one bullet per non-empty field):")
         lines.append("    📋 Here's the medical history I've gathered:")
-
-        _DEMO = {"age", "gender", "marital_status"}
         rendered_any = False
-        # Render non-demographic fields first (the medical content)
-        for fld, val in parsed.items():
-            if fld in _DEMO:
+        for fld, val in render.items():
+            v = str(val).strip()
+            if not v:
                 continue
-            if val and str(val).strip() and str(val).strip().lower() != "none":
-                lines.append(f"      • {fld.replace('_', ' ').title()}: {val}")
-                rendered_any = True
-            elif val and str(val).strip().lower() == "none":
-                # Still show "none" explicitly — patient should know nothing
-                # was missed, just confirmed-absent.
-                lines.append(f"      • {fld.replace('_', ' ').title()}: None")
-                rendered_any = True
-        # Then demographics for context
-        for fld in ("age", "gender", "marital_status"):
-            val = parsed.get(fld)
-            if val and str(val).strip():
-                lines.append(f"      • {fld.replace('_', ' ').title()}: {val}")
-                rendered_any = True
-
+            label = fld.replace("_", " ").title()
+            if v.lower() == "none":
+                lines.append(f"      • {label}: None")
+            else:
+                lines.append(f"      • {label}: {v}")
+            rendered_any = True
         if not rendered_any:
-            # Defensive — should never happen after the safety-net parser runs,
-            # but if it does, tell the LLM to just move forward without showing
-            # an empty record (the patient would be confused).
-            lines.append("      • (no specific history recorded)")
-            lines.append("")
-            lines.append("  ⚠️  No structured fields available — just say:")
-            lines.append("    'Thanks! I have your details on file. Shall we continue?'")
-            lines.append("    and wait for YES/NO.")
-        else:
-            lines.append("")
-            lines.append("  Then ask: 'Is this correct? (yes / no — and tell me what to change)'")
-
+            # Defensive — should never happen now that we merge from all sources.
+            lines.append("      • (no specific history recorded this session)")
         lines.append("")
-        lines.append("  Behaviour on patient reply:")
-        lines.append("  • YES → orchestrator saves to DB programmatically. Do NOT save yourself.")
-        lines.append("  • NO + correction → orchestrator re-parses. Just acknowledge their correction.")
-        lines.append("  • Anything else → repeat the record briefly and ask yes/no again.")
+        lines.append("  Then ask: 'Is this correct? (yes / no — and tell me what to change)'")
+        lines.append("  On YES → orchestrator saves to DB programmatically.")
+        lines.append("  On NO + correction → just acknowledge; orchestrator re-parses with corrections.")
 
     # ── GUARD: only trigger triage when step is collect_patient AND flag is unset.
     elif not ctx.get("triage_completed") and step == "collect_patient":
@@ -1634,11 +2263,13 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
             reqs    = ctx.get("required_history_fields") or []
             coll    = ctx.get("collected_this_session", [])
             skipped = ctx.get("skipped_history_fields", [])
+            saved_now = ctx.setdefault("last_saved_history", {})
             for field in _HISTORY_FIELDS:
                 if tool_args.get(field) is not None:
                     if field in reqs:    reqs.remove(field)
                     if field in skipped: skipped.remove(field)
                     if field not in coll: coll.append(field)
+                    saved_now[field] = tool_args[field]
             ctx["required_history_fields"] = reqs
             ctx["collected_this_session"]   = coll
             ctx["skipped_history_fields"]   = skipped
@@ -1647,6 +2278,10 @@ def _extract_from_tool_result(tool_name: str, tool_args: dict, result_str: str, 
             for field in _HISTORY_FIELDS:
                 if tool_args.get(field) is not None:
                     counts[field] = 0
+            # Refresh the patient_history_data blob so MedGemma + the conditional
+            # follow-up gates see the values we just saved instead of the stale
+            # "No medical history on file" snapshot from session start.
+            _refresh_patient_history_blob(ctx)
             changed = True
             print(f"   → history saved; required_history_fields remaining: {reqs}")
 
@@ -2267,45 +2902,6 @@ def _try_auto_save_demographic(ctx: dict, msg: str, session_id: str) -> None:
         print(f"⚠️  [AutoSave] Failed: {e}")
 
 
-def _history_fields_to_extract(ctx: dict) -> list[str]:
-    """
-    Determine which non-demographic history fields the parser should try to
-    extract from the conversation.
-
-    Robust to two LLM-quirk failure modes:
-      1. LLM forgot to emit [FIELD_COMPLETE] markers → collected_this_session
-         is empty / partial.
-      2. LLM force-advanced past fields without saving → required_history_fields
-         is empty.
-
-    Resolution strategy (union, then minus demographics):
-      • collected_this_session  (fields the LLM explicitly marked complete)
-      • required_history_fields (fields still on the queue right now)
-      • _compute_required_history_fields(...) re-derived for the patient
-        (deterministic, based on age/gender/marital_status — gives the full
-        set of fields that SHOULD have been collected this session)
-
-    This way even if the LLM walked through every question without ever
-    emitting [FIELD_COMPLETE], we still know which fields the conversation
-    covered and can hand them to the batch parser.
-    """
-    _DEMO = {"age", "gender", "marital_status"}
-    fields: set[str] = set()
-    fields.update(ctx.get("collected_this_session", []) or [])
-    fields.update(ctx.get("required_history_fields", []) or [])
-    try:
-        derived = _compute_required_history_fields(
-            ctx.get("patient", {}) or {},
-            ctx.get("patient_history_data"),
-        )
-        fields.update(derived or [])
-    except Exception as e:
-        print(f"⚠️  [HistoryFields] _compute_required_history_fields failed: {e}")
-    fields.difference_update(_DEMO)
-    # Preserve a sensible order (alphabetical is fine — parser doesn't care)
-    return sorted(fields)
-
-
 def _parse_history_with_llm(messages: list, fields_to_extract: list[str]) -> dict:
     """
     Batch-extract structured medical history from a conversation.
@@ -2571,12 +3167,88 @@ def supervisor_node(state: ConversationState) -> dict:
     # Must run BEFORE the directive is built so the directive reflects any
     # force-advance that happened this turn.
     if ctx.get("step") == "collect_patient_history":
-        _enforce_history_field_limits(ctx)
+        _enforce_history_field_limits(ctx, raw_messages)
         save_booking_context(session_id, ctx)
 
     # ── Chat memory: persist user message + retrieve relevant past context ────
     patient_id    = ctx["patient"].get("id")
     last_user_msg = _last_human_text(raw_messages)
+
+    # ── CODE-DRIVEN history field advancement ──────────────────────────────────
+    # This is the single source of truth for "is the current history field
+    # answered" — NOT the LLM. Previously the LLM was asked to track this via
+    # bracket tags ([FIELD_COMPLETE]/[HISTORY_COMPLETE]) which frequently drifted
+    # out of sync with what field the code thought was active, causing the bot
+    # to loop on one field while talking about something else.
+    #
+    # Runs only when we're mid-history AND the patient has actually sent a
+    # message answering the CURRENT field (not the first turn arriving at
+    # this field, where there's nothing to classify yet).
+    #
+    # SAME-MESSAGE GUARD: also skip if this exact user message has already
+    # been classified for any field this session. Prevents double-counting
+    # when supervisor re-enters in the same logical turn (after a tool call).
+    _already_classified = (
+        last_user_msg
+        and ctx.get("last_classified_user_msg") == last_user_msg
+    )
+    if (ctx.get("step") == "collect_patient_history"
+            and ctx.get("required_history_fields")
+            and ctx.get("history_question_asked_for")  # we've shown this field's Q at least once
+            and last_user_msg
+            and not _already_classified):
+
+        current_field  = ctx["required_history_fields"][0]
+        already_shown  = ctx["history_question_asked_for"] == current_field
+        classification = _classify_history_answer(current_field, last_user_msg)
+
+        print(f"🔬 [HistoryClassify] field='{current_field}'  "
+              f"answer='{last_user_msg[:40]}'  → {classification}")
+
+        if already_shown and classification == "answered":
+            # Save it (demographics go via update_patient_demographics elsewhere;
+            # for history fields we save the raw answer text directly here).
+            _DEMO_FIELDS = {"age", "gender", "marital_status"}
+            if current_field not in _DEMO_FIELDS and patient_id:
+                try:
+                    from agents.mcp_tools import save_patient_history as _sph
+                    _sph.invoke({"patient_id": patient_id, current_field: last_user_msg})
+                    print(f"   💾 [HistoryClassify] saved {current_field}='{last_user_msg[:50]}'")
+                    # Stash for the patient_history_data refresh below
+                    ctx.setdefault("last_saved_history", {})[current_field] = last_user_msg
+                except Exception as e:
+                    print(f"   ⚠️  [HistoryClassify] save failed: {e}")
+
+            # Advance the field pointer
+            reqs = list(ctx.get("required_history_fields") or [])
+            if current_field in reqs:
+                reqs.remove(current_field)
+            ctx["required_history_fields"] = reqs
+            collected = ctx.setdefault("collected_this_session", [])
+            if current_field not in collected:
+                collected.append(current_field)
+            ctx["history_field_turn_count"] = ctx.get("history_field_turn_count", {})
+            ctx["history_field_turn_count"].pop(current_field, None)
+            ctx["history_question_asked_for"] = None  # reset for next field
+            ctx["last_classified_user_msg"]   = last_user_msg  # same-msg guard
+
+            if not reqs:
+                # All fields done — move straight to confirmation, no LLM signal needed
+                ctx["history_pending_confirmation"] = True
+                print("   ✅ [HistoryClassify] all fields collected → confirm_patient_history")
+            _refresh_patient_history_blob(ctx)
+            _advance_step(ctx)
+            save_booking_context(session_id, ctx)
+
+        elif already_shown and classification == "offtopic":
+            # Patient mentioned something else (complaint/booking) — store as
+            # complaint hint if it looks medical, then we'll redirect back to
+            # the SAME field via the directive (current_field pointer unchanged).
+            print(f"   ↩️  [HistoryClassify] off-topic — will redirect back to '{current_field}'")
+            ctx["history_redirect_needed"]  = True
+            ctx["last_classified_user_msg"] = last_user_msg  # same-msg guard
+            save_booking_context(session_id, ctx)
+        # "unclear" → do nothing, let the LLM ask a natural follow-up this turn
     if last_user_msg:
         store_message(session_id, patient_id, "user", last_user_msg)
     relevant_history = search_relevant(patient_id, last_user_msg) if patient_id and last_user_msg else ""
@@ -2662,9 +3334,10 @@ def supervisor_node(state: ConversationState) -> dict:
             and not ctx.get("parsed_history_built")):
 
         _DEMO = {"age", "gender", "marital_status"}
-        # Use the deterministic field list — robust to LLM skipping FIELD_COMPLETE.
-        # See _history_fields_to_extract docstring for the union strategy.
-        history_fields = _history_fields_to_extract(ctx)
+        history_fields = [
+            f for f in ctx.get("collected_this_session", [])
+            if f not in _DEMO
+        ]
 
         parse_attempts = ctx.get("history_parse_attempts", 0) + 1
         ctx["history_parse_attempts"] = parse_attempts
@@ -2741,8 +3414,10 @@ def supervisor_node(state: ConversationState) -> dict:
         if _CORRECTION_RE.search(last_user_msg):
             attempts = ctx.get("history_reparse_attempts", 0)
             _DEMO = {"age", "gender", "marital_status"}
-            # Same robustness: don't rely solely on collected_this_session.
-            history_fields = _history_fields_to_extract(ctx)
+            history_fields = [
+                f for f in ctx.get("collected_this_session", [])
+                if f not in _DEMO
+            ]
             if history_fields and attempts < 3:
                 print(f"📋 [HistoryReparse] Patient signalled correction "
                       f"(attempt {attempts + 1}/3) — re-running parser with full conversation")
@@ -2770,52 +3445,6 @@ def supervisor_node(state: ConversationState) -> dict:
                 print(f"⚠️  [HistoryReparse] Hit 3-attempt cap — letting LLM handle "
                       f"this turn conversationally without re-parse")
 
-    # ── Safety net: if we arrived at confirm_patient_history with an empty
-    # parsed_history record, run the parser NOW. This is the last line of
-    # defense — happens when either:
-    #   (a) the FieldFallback path advanced the step but the parser failed
-    #   (b) some other path set history_pending_confirmation+parsed_history_built
-    #       without populating parsed_history
-    # Without this, the directive renders an empty bullet list and the LLM
-    # hallucinates a save tool call to compensate.
-    if (ctx.get("step") == "confirm_patient_history"
-            and not ctx.get("history_confirmed")
-            and not ctx.get("history_safety_parse_done")):
-
-        parsed_existing = ctx.get("parsed_history") or {}
-        _DEMO = {"age", "gender", "marital_status"}
-        has_non_demo = any(
-            k not in _DEMO and v is not None and str(v).strip()
-            for k, v in parsed_existing.items()
-        )
-        if not has_non_demo:
-            print("🛟 [HistorySafetyNet] confirm_patient_history reached with empty "
-                  "parsed_history — running parser as last resort")
-            history_fields = _history_fields_to_extract(ctx)
-            parsed_fields: dict = {}
-            if history_fields:
-                try:
-                    parsed_fields = _parse_history_with_llm(
-                        list(state.get("messages", [])),
-                        history_fields,
-                    )
-                except Exception as e:
-                    print(f"⚠️  [HistorySafetyNet] parser raised: {e}")
-                    parsed_fields = {}
-
-            parsed = ctx.setdefault("parsed_history", {})
-            for k, v in parsed_fields.items():
-                parsed[k] = v
-            # Mirror demographics
-            for demo_key in ("age", "gender", "marital_status"):
-                v = ctx.get("patient", {}).get(demo_key)
-                if v is not None and v != "":
-                    parsed[demo_key] = v
-            ctx["history_safety_parse_done"] = True
-            print(f"🛟 [HistorySafetyNet] parsed_history populated with "
-                  f"{len(parsed)} keys: {list(parsed.keys())}")
-            save_booking_context(session_id, ctx)
-
     # ── Confirm-step handler: programmatic YES advances the flow ──────────────
     # During confirm_patient_history we show the patient the parsed record and
     # ask them to confirm. On YES we (a) do the single batch save of all
@@ -2824,9 +3453,21 @@ def supervisor_node(state: ConversationState) -> dict:
     # AI confirmation message so the patient isn't left hanging. We do this
     # BEFORE the LLM call so the model doesn't accidentally re-ask the
     # confirmation question or hallucinate the save.
+    # Double-fire guard: when the classifier just advanced us INTO
+    # confirm_patient_history on this same user message (e.g. patient said
+    # "Yes that's all correct" while still on the last history field — the
+    # classifier saved that as the field value AND now the YES handler
+    # would also fire), block the confirm-save from running on the same
+    # message. The patient should see the summary first and confirm next
+    # turn. See the case_001 "Yes that's all correct" → empty save log.
+    _classifier_consumed_this_msg = (
+        last_user_msg
+        and ctx.get("last_classified_user_msg") == last_user_msg
+    )
     if (ctx.get("step") == "confirm_patient_history"
             and last_user_msg
-            and _YES_RE.search(last_user_msg)):
+            and _YES_RE.search(last_user_msg)
+            and not _classifier_consumed_this_msg):
         print("✅ [HistoryConfirm] Patient confirmed history record — running batch save")
 
         parsed     = ctx.get("parsed_history") or {}
@@ -2839,32 +3480,6 @@ def supervisor_node(state: ConversationState) -> dict:
             k: v for k, v in parsed.items()
             if k not in _DEMO and v is not None and str(v).strip()
         }
-
-        # ── LAST-CHANCE PARSE on YES with empty payload ───────────────────────
-        # If the patient said YES but we somehow have nothing to save, run the
-        # parser one more time. Better than silently saving an empty record.
-        if patient_id and not history_payload and not ctx.get("history_yes_reparse_done"):
-            print("🛟 [HistoryConfirm] Empty payload at YES — last-chance parser run")
-            ctx["history_yes_reparse_done"] = True
-            history_fields = _history_fields_to_extract(ctx)
-            if history_fields:
-                try:
-                    parsed_fields = _parse_history_with_llm(
-                        list(state.get("messages", [])),
-                        history_fields,
-                    )
-                    if parsed_fields:
-                        for k, v in parsed_fields.items():
-                            parsed[k] = v
-                        history_payload = {
-                            k: v for k, v in parsed.items()
-                            if k not in _DEMO and v is not None and str(v).strip()
-                        }
-                        print(f"🛟 [HistoryConfirm] Last-chance parse recovered "
-                              f"{len(history_payload)} field(s)")
-                except Exception as e:
-                    print(f"⚠️  [HistoryConfirm] Last-chance parse failed: {e}")
-
         if patient_id and history_payload:
             try:
                 from agents.mcp_tools import save_patient_history as _sph
@@ -2872,6 +3487,10 @@ def supervisor_node(state: ConversationState) -> dict:
                 if "saved successfully" in str(result).lower():
                     print(f"✅ [HistoryConfirm] Batch saved {len(history_payload)} fields: "
                           f"{list(history_payload.keys())}")
+                    # Stash for blob refresh
+                    saved_now = ctx.setdefault("last_saved_history", {})
+                    for k, v in history_payload.items():
+                        saved_now[k] = v
                 else:
                     print(f"⚠️  [HistoryConfirm] Batch save returned unexpected result: {result}")
             except Exception as e:
@@ -2879,6 +3498,11 @@ def supervisor_node(state: ConversationState) -> dict:
         else:
             print(f"⚠️  [HistoryConfirm] Nothing to save (patient_id={patient_id}, "
                   f"fields={len(history_payload)})")
+
+        # Refresh blob with the final state — this is the last save in the
+        # history phase, after which we hand off to triage/MedGemma which
+        # reads patient_history_data.
+        _refresh_patient_history_blob(ctx)
 
         ctx["history_pending_confirmation"] = False
         ctx["history_confirmed"] = True
@@ -2979,163 +3603,74 @@ SPECIAL TAGS (output these exact strings when needed):
         print("🧹 [Supervisor] Stripped <think> block from response")
         response = AIMessage(content=cleaned_content, tool_calls=getattr(response, "tool_calls", None) or [])
 
-    # ── Strip hallucinated DSML / inline tool-call markup ─────────────────────
-    # Qwen 32B on Groq occasionally outputs DeepSeek-style tool calls AS PLAIN
-    # TEXT (the `<｜DSML｜>` markup, sometimes mixed with `<tool_call>` tags
-    # or fenced JSON). This leaks garbled syntax to the WhatsApp user and
-    # the tool never actually runs because LangChain doesn't see it as a
-    # real tool_call.
-    #
-    # Strategy: HARD STOP at the first sign of tool-call markup. Once the
-    # model starts hallucinating tool syntax, everything that follows is
-    # garbage — preamble like "Alright, let me save your..." is kept, the
-    # markup and everything after it is deleted. If the cleaned result is
-    # too short to be useful, substitute a clean step-appropriate message.
-    raw_content_2 = str(response.content)
-    _DSML_HARD_STOP = re.compile(
-        r"[<\[]?[｜\|]+\s*DSML[\s\S]*$"
-        r"|<\s*\|\s*[A-Za-z]{2,8}\s*\|[\s\S]*$"
-        r"|<\s*/?\s*tool_calls?\b[\s\S]*$"
-        r"|<\s*/?\s*invoke\b[\s\S]*$"
-        r"|<\s*/?\s*parameter\b[\s\S]*$"
-        r"|```\s*(?:tool_code|tool_calls?|function_call)\b[\s\S]*$",
-        re.IGNORECASE,
-    )
-    stripped_dsml = _DSML_HARD_STOP.sub("", raw_content_2)
-    was_stripped  = stripped_dsml != raw_content_2
-
-    if was_stripped:
-        # Only collapse whitespace when we actually cut something — otherwise
-        # we'd squash the newline-formatted bullet lists in normal responses.
-        cleaned_dsml = re.sub(r"[ \t]+", " ", stripped_dsml).strip()
-        cleaned_dsml = re.sub(r"\n{3,}", "\n\n", cleaned_dsml)
-
-        print("🧹 [Supervisor] Stripped hallucinated DSML/tool-call markup from response")
-        # If stripping left only the "Alright, let me save..." preamble (or
-        # nothing), substitute a clean step-appropriate message so the
-        # patient never sees fragments or a "let me save" promise that won't
-        # actually happen as the model expects.
-        is_save_preamble = bool(
-            re.match(
-                r"^\s*(alright|ok(ay)?|sure|now|first|let me|i'?ll)\s*[,!.\-]*\s*"
-                r"(let me\s+)?(save|store|record|put|update|persist)\b",
-                cleaned_dsml, re.IGNORECASE,
-            )
-        )
-        if len(cleaned_dsml) < 10 or is_save_preamble:
-            cur_step = ctx.get("step", "")
-            if cur_step == "confirm_patient_history":
-                cleaned_dsml = (
-                    "Let me show you what I've recorded — please confirm if everything looks right."
-                )
-            else:
-                cleaned_dsml = "One moment please."
-            print(f"🧹 [Supervisor] Substituted clean message for step={cur_step!r}")
-        response = AIMessage(
-            content   = cleaned_dsml,
-            tool_calls= getattr(response, "tool_calls", None) or [],
-        )
-
     response_text         = str(response.content)
     extracted_symptom     = state.get("extracted_symptom")
     triage_active         = state.get("triage_active") or False
     interaction_completed = state.get("interaction_completed") or False
 
-    # ── FALLBACK: LLM skipped [FIELD_COMPLETE] and went straight to complaint ──
-    # The LLM sometimes collects all history fields in one conversational pass
-    # without emitting [FIELD_COMPLETE] tags. When it then asks "What brings
-    # you in today?" the fields are answered in context but not recorded.
-    # Detect this and force-trigger the batch parser so we don't skip confirmation.
-    _COMPLAINT_Q_RE = re.compile(
-        r"(what brings you in|what('?s| is) (the reason|your reason|your concern)|"
-        r"what symptoms|what('?s| is) (wrong|bothering|the problem)|"
-        r"how can (i|we) help you today|reason for (your )?visit)",
-        re.IGNORECASE,
-    )
+    # ── POST-LLM marker + drift reconciliation ──────────────────────────────
+    # Set history_question_asked_for ONLY when the LLM actually produced a
+    # text question to the patient. Tool-only responses (response.content
+    # empty / tool_calls present) must NOT set the marker — otherwise the
+    # NEXT classifier pass would wrongly accept the user's PREVIOUS answer
+    # as the answer to this field. This was the off-by-one that was eating
+    # "Single" as the answer to chronic_conditions.
+    #
+    # Also: if the LLM drifted (asked about a different field than the
+    # directive specified), update current_field to match what the patient
+    # actually saw — otherwise we attribute their next reply to the wrong
+    # field. This is how the cascading "stuck on medications while LLM is
+    # already asking about smoking" failures happen.
     if (ctx.get("step") == "collect_patient_history"
             and ctx.get("required_history_fields")
-            and not ctx.get("history_pending_confirmation")
-            and _COMPLAINT_Q_RE.search(response_text)):
-        print("⚠️  [FieldFallback] LLM asked complaint question while fields remain — "
-              "running batch parse now (LLM skipped [FIELD_COMPLETE])")
+            and response_text.strip()
+            and not getattr(response, "tool_calls", None)):
 
-        # ── CRITICAL: Run the parser inline BEFORE advancing the step ─────────
-        # Without this, parsed_history stays empty and the next turn's
-        # confirm_patient_history directive shows the patient an empty record.
-        # The parser block at line ~2579 only fires when step is still
-        # collect_patient_history — but we're about to advance past that.
-        history_fields = _history_fields_to_extract(ctx)
-        parsed_fields: dict = {}
-        if history_fields:
-            print(f"📋 [FieldFallback→HistoryParse] Extracting {len(history_fields)} fields "
-                  f"from conversation: {history_fields}")
-            try:
-                parsed_fields = _parse_history_with_llm(
-                    list(state.get("messages", [])),
-                    history_fields,
-                )
-            except Exception as e:
-                print(f"⚠️  [FieldFallback→HistoryParse] parser raised: {e}")
-                parsed_fields = {}
+        required_now   = list(ctx.get("required_history_fields") or [])
+        current_field  = required_now[0] if required_now else None
+        _DEMO          = {"age", "gender", "marital_status"}
 
-        parsed = ctx.setdefault("parsed_history", {})
-        for k, v in parsed_fields.items():
-            parsed[k] = v
-        # Mirror demographics into parsed_history for the confirmation render
-        for demo_key in ("age", "gender", "marital_status"):
-            v = ctx.get("patient", {}).get(demo_key)
-            if v is not None and v != "":
-                parsed[demo_key] = v
-        ctx["parsed_history_built"] = True
-        ctx["history_pending_confirmation"] = True
-        ctx["required_history_fields"] = []   # clear so _advance_step proceeds
-        ctx["history_parse_attempts"] = ctx.get("history_parse_attempts", 0) + 1
-        print(f"📋 [FieldFallback→HistoryParse] parsed_history now has "
-              f"{len(parsed)} keys: {list(parsed.keys())}")
+        # Did the LLM jump to a complaint question? Then history is over
+        # (from the LLM's POV) — let the rest of the supervisor handle the
+        # transition, but don't set a history marker for this turn.
+        if _is_complaint_transition(response_text):
+            print("🔭 [PostLLM] LLM transitioned to complaint phase — no history marker set")
 
-        _advance_step(ctx)
-        save_booking_context(session_id, ctx)
-        # Replace the complaint question with a hold message — confirmation first
-        response = AIMessage(
-            content   = "Thank you! Let me just confirm what I've noted before we proceed.",
-            tool_calls= [],
-        )
+        elif current_field and current_field not in _DEMO:
+            # Try to detect which field the LLM actually asked about
+            detected = _detect_field_in_question(response_text)
 
-    # ── [FIELD_COMPLETE] handler — LLM-driven field advancement ────────────────
-    # During collect_patient_history (history-fields phase), the directive
-    # instructs the LLM to emit [FIELD_COMPLETE] whenever it has a clear
-    # answer for the current field. This replaces brittle regex on the
-    # patient's message — the LLM has full context and can correctly handle
-    # multi-turn answers, "no X but yes Y", corrections, etc.
-    if "[FIELD_COMPLETE]" in response_text and ctx.get("step") == "collect_patient_history":
-        required = ctx.get("required_history_fields") or []
-        if required:
-            current_field = required[0]
-            _DEMO = {"age", "gender", "marital_status"}
-            if current_field not in _DEMO:
-                reqs = list(required)
-                reqs.remove(current_field)
-                ctx["required_history_fields"] = reqs
-                coll = ctx.setdefault("collected_this_session", [])
-                if current_field not in coll:
-                    coll.append(current_field)
-                counts = ctx.setdefault("history_field_turn_count", {})
-                counts[current_field] = 0
-                print(f"📝 [FieldComplete] LLM signalled '{current_field}' is complete — advanced")
-                if not reqs:
-                    ctx["history_pending_confirmation"] = True
-                    print(f"📋 [FieldComplete] All history fields done — flagging for batch parse")
+            if detected and detected != current_field and detected in required_now:
+                # Drift: LLM asked about a DIFFERENT field that's still pending.
+                # Move it to position 0 so the patient's next reply is
+                # classified for the field they actually saw.
+                print(f"🔭 [PostLLM] LLM drifted — directive said '{current_field}' "
+                      f"but response asked about '{detected}'. Realigning pointer.")
+                required_now.remove(detected)
+                required_now.insert(0, detected)
+                ctx["required_history_fields"] = required_now
+                current_field = detected
+
+            if current_field and current_field not in _DEMO:
+                # NOW set the marker — the patient is actually being asked
+                # this field's question.
+                ctx["history_question_asked_for"] = current_field
+                print(f"🔭 [PostLLM] history_question_asked_for = '{current_field}'")
                 save_booking_context(session_id, ctx)
-            else:
-                print(f"⚠️  [FieldComplete] LLM emitted marker for demographic field "
-                      f"'{current_field}' — ignored (demographics use update_patient_demographics)")
-        # Strip the marker from the response — patient should never see it
-        cleaned = re.sub(r"\[FIELD_COMPLETE\]", "", response_text).strip()
+
+    # ── [FIELD_COMPLETE]/[HISTORY_COMPLETE] markers are now IGNORED ──────────
+    # Field completion is decided entirely in code (_classify_history_answer,
+    # called earlier this turn) — not by the LLM emitting tags. If the LLM
+    # emits these tags out of habit/training, just strip them silently so
+    # they never leak to the patient. No state changes happen here anymore.
+    if ("[FIELD_COMPLETE]" in response_text or "[HISTORY_COMPLETE]" in response_text):
+        cleaned = re.sub(r"\[FIELD_COMPLETE\]|\[HISTORY_COMPLETE\]", "", response_text).strip()
         response = AIMessage(
-            content   = cleaned,
+            content   = cleaned or "Got it!",
             tool_calls= getattr(response, "tool_calls", None) or [],
         )
         response_text = cleaned
+        print("🧹 [Supervisor] Stripped legacy completion tag (field state is code-driven now)")
 
     _HISTORY_STEPS = {"collect_patient_history", "confirm_patient_history"}
     if "[SYMPTOM_LOGGED:" in response_text and ctx.get("step") not in _HISTORY_STEPS:

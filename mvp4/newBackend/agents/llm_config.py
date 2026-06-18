@@ -9,7 +9,7 @@ import os
 
 _PROVIDER    = os.getenv("LLM_PROVIDER",   "groq").strip().lower()
 _GROQ_MODEL  = os.getenv("GROQ_MODEL",     "qwen/qwen3-32b").strip()
-_DS_MODEL    = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip()
+_DS_MODEL    = "deepseek-v4-flash".strip()
 
 print(f"🤖 [LLMConfig] Provider='{_PROVIDER}'  "
       f"model='{_DS_MODEL if _PROVIDER == 'deepseek' else _GROQ_MODEL}'")
@@ -27,6 +27,8 @@ def get_llm(temperature: float = 0.1):
             temperature=0,
             api_key=key,
             base_url="https://api.deepseek.com",
+            # Lower max_tokens prevents the model rambling into tool-format leaks
+            max_tokens=800,
         )
     else:
         from langchain_groq import ChatGroq
